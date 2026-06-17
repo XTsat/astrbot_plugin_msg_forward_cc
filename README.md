@@ -105,6 +105,7 @@
 | `dc` | `discord` | Discord |
 
 > 省略平台时默认为 `default`。平台简写或群号后加 `s` 表示私聊。
+> 超过 3 个字母的平台名直接作为完整平台标识使用，不会走简写映射（如 `aiocqhttp`、`wechatpadpro`）
 >
 > 用法示例：
 > - `#mf bindraw qq 654321 wx 123456` → QQ 群 654321 → 微信 123456

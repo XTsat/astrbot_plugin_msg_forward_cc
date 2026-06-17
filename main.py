@@ -246,7 +246,11 @@ class MsgForward(star.Star):
             plat_key = plat_lower[:-1] if plat_lower.endswith("s") else plat_lower
             if not plat_key or plat_key == "default":
                 plat_key = "default"
-            platform = PLATFORM_MAP.get(plat_key, plat_key)
+            # 大于 3 个字母的平台名直接作为完整平台标识使用（如 aiocqhttp、wechatpadpro）
+            if len(plat_key) > 3:
+                platform = plat_key
+            else:
+                platform = PLATFORM_MAP.get(plat_key, plat_key)
             # 兼容在 ID 末尾加 s 表示私聊（如 #mf bindraw 654321 123456s）
             if uid.endswith("s") and msg_type == "GroupMessage" and plat_lower == plat_key:
                 msg_type = "FriendMessage"
