@@ -5,7 +5,7 @@
 本插件理论上适用于任意 AstrBot 支持的平台（如 QQ、微信、Telegram、Discord 等）。
 
 > **许可证：AGPL-3.0**  
-> 本插件在 AstrBot（AGPL）基础上开发，因此以 AGPL 开源。
+> 本插件在 AstrBot（AGPL）基础上开发，因此以 AGPL 开源。  
 > 本插件基于 [Siaospeed/astrbot_plugin_msg_transfer](https://github.com/Siaospeed/astrbot_plugin_msg_transfer) 修改而来，添加了WebUI配置, 支持对转发规则设置来源信息显示状态。
 
 ---

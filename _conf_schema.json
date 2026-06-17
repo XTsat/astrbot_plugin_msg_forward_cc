@@ -43,10 +43,16 @@
             "options": ["inherit", "off", "blacklist", "whitelist"]
           },
           "filter_patterns": {
-            "description": "过滤规则列表（留空=继承全局设置）",
+            "description": "过滤规则列表",
             "type": "list",
-            "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写）",
+            "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
             "default": []
+          },
+          "cooldown_seconds": {
+            "description": "转发冷却时间（秒）",
+            "type": "int",
+            "hint": "仅对本规则生效。转发一次后在该秒数内不再重复转发。0 或不填则继承全局默认值。",
+            "default": 0
           }
         }
       }
@@ -103,5 +109,11 @@
     "type": "text",
     "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
     "default": ""
+  },
+  "default_cooldown_seconds": {
+    "description": "默认转发冷却时间（秒）",
+    "type": "int",
+    "hint": "新建转发规则时的默认冷却间隔。转发一次后在该秒数内不再重复转发同一规则。每条规则可单独覆盖。",
+    "default": 0
   }
 }

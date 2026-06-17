@@ -1,6 +1,7 @@
 import json
 import re
 import secrets
+import time
 from pathlib import Path
 
 import astrbot.api.star as star
@@ -107,6 +108,9 @@ class MsgForward(star.Star):
 
         self.store = MsgForwardStore(self.pending_file)
 
+        # 冷却计时器：key = "source_umo|target_umo"，value = 冷却结束时间戳
+        self._cooldowns: dict[str, float] = {}
+
     def _format_origin_header(self, event: AstrMessageEvent, umo: str) -> str:
         try:
             _, msg_type, conversation_id = umo.split(":", 2)
@@ -178,8 +182,10 @@ class MsgForward(star.Star):
             "#mf hide <编号>   切换规则来源信息显示/隐藏\n"
             "#mf hidelist      列出当前会话规则的来源信息状态\n"
             "#mf hidelistall   列出所有规则的来源信息状态\n"
-            "#mf filter        查看当前过滤配置\n"
-            "#mf help          显示此帮助"
+            "#mf filter        查看当前过滤与冷却配置\n"
+            "#mf help          显示此帮助\n\n"
+            "冷却转发：在规则配置中设置 cooldown_seconds > 0\n"
+            "转发一次后在该时间内不会再次转发，避免刷屏。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -294,7 +300,9 @@ class MsgForward(star.Star):
         lines = [f"📜 当前会话({source_umo}) 的规则："]
         for idx, r in matched:
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
-            lines.append(f"#{idx} {r['source_umo']} → {r['target_umo']} {hide_status}")
+            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
+            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
+            lines.append(f"#{idx} {r['source_umo']} → {r['target_umo']} {hide_status} {cd_str}".strip())
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -386,8 +394,10 @@ class MsgForward(star.Star):
         lines = ["📜 所有转发规则："]
         for idx, r in enumerate(rules, start=1):
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
+            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
+            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
             lines.append(
-                f"#{idx} {r.get('source_umo', '?')} → {r.get('target_umo', '?')} {hide_status}"
+                f"#{idx} {r.get('source_umo', '?')} → {r.get('target_umo', '?')} {hide_status} {cd_str}".strip()
             )
         yield event.plain_result("\n".join(lines))
 
@@ -430,6 +440,17 @@ class MsgForward(star.Star):
 
         if not has_per_rule:
             lines.append("（所有规则使用全局过滤配置）")
+
+        # 显示冷却配置
+        default_cd = self.config.get("default_cooldown_seconds", 0)
+        cd_desc = f"{default_cd}s" if int(default_cd) > 0 else "关闭"
+        lines.append(f"\n📋 转发冷却：全局默认 ❄{cd_desc}")
+        for idx, r in enumerate(rules, start=1):
+            cd = r.get("cooldown_seconds")
+            if cd is not None and int(cd) > 0:
+                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | ❄{cd}s")
+            elif cd is not None and int(cd) == 0:
+                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | ❄关闭")
 
         yield event.plain_result("\n".join(lines))
 
@@ -502,14 +523,28 @@ class MsgForward(star.Star):
                 return
 
             message_chain = event.get_messages()
+            now = time.time()
 
-            for rule in rules:
+            for idx, rule in enumerate(rules):
                 target = rule.get("target_umo")
                 if not target:
                     continue
                 # 逐规则过滤检查
                 if not self._should_forward(event, rule):
                     continue
+
+                # 冷却检查
+                cooldown_sec = rule.get("cooldown_seconds")
+                if cooldown_sec is None:
+                    cooldown_sec = self.config.get("default_cooldown_seconds", 0)
+                cooldown_sec = int(cooldown_sec) if cooldown_sec else 0
+
+                if cooldown_sec > 0:
+                    cd_key = f"{source_umo}|{target}"
+                    cd_end = self._cooldowns.get(cd_key, 0)
+                    if now < cd_end:
+                        continue
+
                 try:
                     if rule.get("hide_header", False):
                         new_chain = message_chain
@@ -518,6 +553,9 @@ class MsgForward(star.Star):
                         header += "\n\n\u200b"
                         new_chain = [Plain(text=header)] + message_chain
                     await self.context.send_message(target, event.chain_result(new_chain))
+                    # 转发成功后设置冷却
+                    if cooldown_sec > 0:
+                        self._cooldowns[cd_key] = now + cooldown_sec
                 except ValueError as e:
                     logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                 except Exception as e:
