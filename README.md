@@ -57,6 +57,7 @@
 ### `platform_name_map` 默认值
 ```json
 {
+   "default": "默认",
   "aiocqhttp": "QQ",
   "wechatpadpro": "微信",
   "telegram": "Telegram",
@@ -97,13 +98,20 @@
 ### `mf bindraw` 平台简写映射
 | 简写 | 完整平台名 | 对应平台 |
 |------|-----------|---------|
+| `df` | `default` | 默认 |
 | `qq` | `aiocqhttp` | QQ |
 | `wx` | `wechatpadpro` | 微信 |
 | `tg` | `telegram` | Telegram |
 | `dc` | `discord` | Discord |
 
-> 用法示例：`#mf bindraw qq 654321 wx 123456` → 将 QQ 群 654321 的消息转发到微信 123456
-> 平台简写后加 `s` 表示私聊，如 `#mf bindraw qq 114514 wxs 123456` → 将 QQ 群 114514 转发给微信私聊 123456
+> 省略平台时默认为 `default`。平台简写或群号后加 `s` 表示私聊。
+>
+> 用法示例：
+> - `#mf bindraw qq 654321 wx 123456` → QQ 群 654321 → 微信 123456
+> - `#mf bindraw 654321 wx 123456` → 默认群 654321 → 微信 123456（省略源平台）
+> - `#mf bindraw s 123456 654321` → 默认私聊 123456 → 默认群 654321（省略源平台单独 s）
+> - `#mf bindraw 654321s 123456` → 默认私聊 654321 → 默认群 123456（群号后加 s）
+> - `#mf bindraw qq 114514 wxs 123456` → QQ 群 114514 → 微信私聊 123456（平台后加 s）
 
 ---
 

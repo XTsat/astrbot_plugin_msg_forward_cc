@@ -63,6 +63,7 @@
     "type": "object",
     "hint": "自定义各平台在来源信息中的显示名称。未配置的平台将使用其原始名称。",
     "default": {
+      "default": "默认",
       "aiocqhttp": "QQ",
       "wechatpadpro": "微信",
       "telegram": "Telegram",
@@ -73,6 +74,11 @@
         "description": "aiocqhttp（QQ）",
         "type": "string",
         "default": "QQ"
+      },
+      "default": {
+        "description": "default（默认平台）",
+        "type": "string",
+        "default": "默认"
       },
       "wechatpadpro": {
         "description": "wechatpadpro（微信）",

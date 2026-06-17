@@ -124,6 +124,7 @@ class MsgForward(star.Star):
 
         # 平台友好名称（从配置读取，合并默认值）
         default_map = {
+            "default": "默认",
             "aiocqhttp": "QQ",
             "wechatpadpro": "微信",
             "telegram": "Telegram",
@@ -174,8 +175,10 @@ class MsgForward(star.Star):
             "📋 MsgForward 帮助\n\n"
             "#mf add           创建一则转发绑定请求\n"
             "#mf bind <绑定码>     接受一则转发绑定请求\n"
-            "#mf bindraw <源平台> <源ID> <目标平台> <目标ID>\n"
-            "                  直接创建转发绑定，平台简写：qq/wx/tg/dc，加s为私聊\n"
+            "#mf bindraw [源平台] <源ID> [目标平台] <目标ID>\n"
+            "                  直接创建转发绑定，省略默认平台为default。平台简写：df/qq/wx/tg/dc，加s为私聊\n"
+            "                  例：#mf bindraw 654321 wx 123456\n"
+            "                  例：#mf bindraw dfs 114514 wx 123456s（私聊）\n"
             "#mf del <编号>    删除一条转发规则\n"
             "#mf list          列出当前会话的转发规则（含群号）\n"
             "#mf listall       列出所有转发规则\n"
@@ -230,6 +233,7 @@ class MsgForward(star.Star):
     async def cmd_bindraw(self, event: AstrMessageEvent, args: str = ""):
         """直接创建转发绑定（格式：#mf bindraw 平台 群号 平台 群号）"""
         PLATFORM_MAP = {
+            "df": "default",
             "qq": "aiocqhttp",
             "wx": "wechatpadpro",
             "tg": "telegram",
@@ -240,15 +244,35 @@ class MsgForward(star.Star):
             plat_lower = plat.lower()
             msg_type = "FriendMessage" if plat_lower.endswith("s") else "GroupMessage"
             plat_key = plat_lower[:-1] if plat_lower.endswith("s") else plat_lower
+            if not plat_key or plat_key == "default":
+                plat_key = "default"
             platform = PLATFORM_MAP.get(plat_key, plat_key)
+            # 兼容在 ID 末尾加 s 表示私聊（如 #mf bindraw 654321 123456s）
+            if uid.endswith("s") and msg_type == "GroupMessage" and plat_lower == plat_key:
+                msg_type = "FriendMessage"
+                uid = uid[:-1]
             return f"{platform}:{msg_type}:{uid}"
 
         try:
-            parts = (args or "").strip().split()
-            if len(parts) != 4:
-                yield event.plain_result("❌ 格式错误，用法：#mf bindraw 平台 群号 平台 群号\n例：#mf bindraw qq 654321 wx 123456")
+            raw = (event.message_str or "").strip()
+            idx = raw.lower().find("bindraw")
+            args_str = raw[idx + len("bindraw"):].strip() if idx != -1 else (args or "")
+            parts = args_str.split()
+            if len(parts) == 2:
+                src_plat, dst_plat = "default", "default"
+                src_id, dst_id = parts[0], parts[1]
+            elif len(parts) == 3:
+                if parts[0].isdigit():
+                    src_plat = "default"
+                    src_id, dst_plat, dst_id = parts
+                else:
+                    src_plat, src_id, dst_id = parts
+                    dst_plat = "default"
+            elif len(parts) == 4:
+                src_plat, src_id, dst_plat, dst_id = parts
+            else:
+                yield event.plain_result("❌ 格式错误，用法：#mf bindraw [源平台] 源ID [目标平台] 目标ID\n例：#mf bindraw 654321 wx 123456（省略源平台=default）")
                 return
-            src_plat, src_id, dst_plat, dst_id = parts
             source_umo = build_umo(src_plat, src_id)
             target_umo = build_umo(dst_plat, dst_id)
             hide_header = self.config.get("default_hide_header", False)
