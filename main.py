@@ -12,7 +12,7 @@ from astrbot.api import AstrBotConfig
 
 import string
 
-from astrbot.core.message.components import Plain, Image, Record, Video, File
+from astrbot.core.message.components import At, Plain, Image, Record, Video, File
 
 
 # ------------------------
@@ -61,6 +61,34 @@ async def _prepare_chain_for_forward(chain):
         else:
             prepared.append(comp)
     return prepared
+
+
+def _sanitize_chain_for_forward(chain):
+    """转发前清洗 @ 提及组件：只保留 @全体（all）与纯数字目标。
+
+    跨会话转发时，源会话的 @ 目标（QQ号 / openid / uid）在目标会话通常无法解析；
+    若原样透传，目标平台（如 OneBot/NapCat）会用空 uid 查询群成员，
+    内核调用超时导致整个转发失败（retcode=1200 invoke timeout）。
+    空目标直接丢弃；非数字目标（如 openid、"qq_official"）降级为纯文本 @昵称。"""
+    if not chain:
+        return chain
+    cleaned = []
+    for comp in chain:
+        if not isinstance(comp, At):
+            cleaned.append(comp)
+            continue
+        qq = getattr(comp, "qq", None)
+        qq_str = str(qq).strip() if qq is not None else ""
+        if qq_str == "all" or (qq_str.isdigit() and qq_str != "0"):
+            cleaned.append(comp)
+            continue
+        name = (getattr(comp, "name", "") or "").strip()
+        if name:
+            cleaned.append(Plain(text=f"@{name}"))
+            logger.info(f"⚠️ 转发时 @ 目标({qq_str!r})无法解析，已降级为文本 @{name}")
+        else:
+            logger.warning(f"⚠️ 转发时丢弃无效的 @ 目标: {qq_str!r}")
+    return cleaned
 
 
 def load_json(path: Path) -> dict:
@@ -154,6 +182,35 @@ class MsgForward(star.Star):
         # 冷却计时器：key = "source_umo|target_umo"，value = 冷却结束时间戳
         self._cooldowns: dict[str, float] = {}
 
+        # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
+        self._migrate_legacy_umo_lists()
+
+    def _migrate_legacy_umo_lists(self):
+        """把旧版 list 类型存储的 source_umo / target_umo 迁移为每行一条的 text。
+
+        旧版 schema 中这两个字段是 list 类型，存量规则里可能是 ["umo1", "umo2"] 数组；
+        现 schema 为 text（每行一条），AstrBot 在 WebUI 保存时校验会因 list 值报
+        「期望是 string, 得到了 list」导致无法保存。这里在启动时一次性转换并持久化。
+        """
+        try:
+            rules = self.config.get("rules", [])
+            if not isinstance(rules, list) or not rules:
+                return
+            changed = False
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                for key in ("source_umo", "target_umo"):
+                    val = rule.get(key)
+                    if isinstance(val, list):
+                        rule[key] = "\n".join(str(x).strip() for x in val if str(x).strip())
+                        changed = True
+            if changed:
+                self.config.save_config()
+                logger.info("✅ 已将旧版列表格式的 source_umo/target_umo 迁移为每行一条的文本格式")
+        except Exception as e:
+            logger.warning(f"⚠️ UMO 字段迁移失败（不影响正常运行）：{e}")
+
     def _format_origin_header(self, event: AstrMessageEvent, umo: str) -> str:
         try:
             _, msg_type, conversation_id = umo.split(":", 2)
@@ -169,9 +226,24 @@ class MsgForward(star.Star):
         default_map = {
             "default": "默认",
             "aiocqhttp": "QQ",
-            "wechatpadpro": "微信",
+            "qq_official": "QQ官方机器人",
+            "qq_official_webhook": "QQ官方机器人(Webhook)",
             "telegram": "Telegram",
+            "weixin_oc": "个人微信",
+            "wecom": "企业微信",
+            "weixin_official_account": "微信公众号",
+            "lark": "飞书",
+            "dingtalk": "钉钉",
             "discord": "Discord",
+            "kook": "KOOK",
+            "slack": "Slack",
+            "vocechat": "VoceChat",
+            "line": "LINE",
+            "satori": "Satori",
+            "matrix": "Matrix",
+            "mattermost": "Mattermost",
+            "misskey": "Misskey",
+            "wecom_ai_bot": "企微AI机器人",
         }
         platform_map = self.config.get("platform_name_map", {}) or {}
         default_map.update(platform_map)
@@ -203,6 +275,31 @@ class MsgForward(star.Star):
 
         return header
 
+    @staticmethod
+    def _umo_list(rule: dict, key: str) -> list:
+        """把规则中的 UMO 字段统一归一化为列表。
+
+        兼容三种存储格式：text 按行拆分（每行一条）、list 列表、单字符串。"""
+        val = rule.get(key)
+        if not val:
+            return []
+        if isinstance(val, str):
+            # 单字符串或多行 text 均按行拆分（单个 UMO 无换行，拆出单项）
+            return [x.strip() for x in val.splitlines() if x.strip()]
+        if isinstance(val, list):
+            return [str(x).strip() for x in val if str(x).strip()]
+        return []
+
+    @staticmethod
+    def _rule_name(rule: dict) -> str:
+        """规则展示名称：优先取自定义备注 remark，留空则回退为 source_umo → target_umo。"""
+        remark = (rule.get("remark") or "").strip()
+        if remark:
+            return remark
+        src = ", ".join(MsgForward._umo_list(rule, "source_umo")) or "?"
+        dst = ", ".join(MsgForward._umo_list(rule, "target_umo")) or "?"
+        return f"{src} → {dst}"
+
     async def initialize(self):
         logger.info("MsgForward plugin init OK")
 
@@ -216,20 +313,21 @@ class MsgForward(star.Star):
         """显示帮助信息"""
         yield event.plain_result(
             "📋 MsgForward 帮助\n\n"
-            "#mf add           创建一则转发绑定请求\n"
-            "#mf bind <绑定码>     接受一则转发绑定请求\n"
-            "#mf bindraw [源平台] <源ID> [目标平台] <目标ID>\n"
+            "/mf add           创建一则转发绑定请求\n"
+            "/mf bind <绑定码>     接受一则转发绑定请求\n"
+            "/mf bindraw [源平台] <源ID> [目标平台] <目标ID>\n"
             "                  直接创建转发绑定，省略默认平台为default。平台简写：df/qq/wx/tg/dc，加s为私聊\n"
-            "                  例：#mf bindraw 654321 wx 123456\n"
-            "                  例：#mf bindraw dfs 114514 wx 123456s（私聊）\n"
-            "#mf del <编号>    删除一条转发规则\n"
-            "#mf list          列出当前会话的转发规则（含群号）\n"
-            "#mf listall       列出所有转发规则\n"
-            "#mf hide <编号>   切换规则来源信息显示/隐藏\n"
-            "#mf hidelist      列出当前会话规则的来源信息状态\n"
-            "#mf hidelistall   列出所有规则的来源信息状态\n"
-            "#mf filter        查看当前过滤与冷却配置\n"
-            "#mf help          显示此帮助\n\n"
+            "                  例：/mf bindraw 654321 wx 123456\n"
+            "                  例：/mf bindraw dfs 114514 wx 123456s（私聊）\n"
+            "/mf del <编号>    删除一条转发规则\n"
+            "/mf list          列出当前会话的转发规则（含群号）\n"
+            "/mf listall       列出所有转发规则\n"
+            "/mf hide <编号>   切换规则来源信息显示/隐藏\n"
+            "/mf toggle <编号>  启用/停用一条转发规则\n"
+            "/mf hidelist      列出当前会话规则的来源信息状态\n"
+            "/mf hidelistall   列出所有规则的来源信息状态\n"
+            "/mf filter        查看当前过滤与冷却配置\n"
+            "/mf help          显示此帮助\n\n"
             "冷却转发：在规则配置中设置 cooldown_seconds > 0\n"
             "转发一次后在该时间内不会再次转发，避免刷屏。"
         )
@@ -244,7 +342,7 @@ class MsgForward(star.Star):
 
         yield event.plain_result(
             f"📌 已创建绑定请求\n"
-            f"请在目标会话执行：#mf bind {code}"
+            f"请在目标会话执行：/mf bind {code}"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -259,9 +357,11 @@ class MsgForward(star.Star):
             rules = list(self.config.get("rules", []))
             rules.append({
                 "__template_key": "rule",
+                "remark": f"规则 #{len(rules) + 1}",
                 "source_umo": source_umo,
                 "target_umo": target_umo,
                 "hide_header": hide_header,
+                "enabled": True,
             })
             self.config["rules"] = rules
             self.config.save_config()
@@ -274,11 +374,11 @@ class MsgForward(star.Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("bindraw")
     async def cmd_bindraw(self, event: AstrMessageEvent, args: str = ""):
-        """直接创建转发绑定（格式：#mf bindraw 平台 群号 平台 群号）"""
+        """直接创建转发绑定（格式：/mf bindraw 平台 群号 平台 群号）"""
         PLATFORM_MAP = {
             "df": "default",
             "qq": "aiocqhttp",
-            "wx": "wechatpadpro",
+            "wx": "weixin_oc",
             "tg": "telegram",
             "dc": "discord",
         }
@@ -289,12 +389,12 @@ class MsgForward(star.Star):
             plat_key = plat_lower[:-1] if plat_lower.endswith("s") else plat_lower
             if not plat_key or plat_key == "default":
                 plat_key = "default"
-            # 大于 3 个字母的平台名直接作为完整平台标识使用（如 aiocqhttp、wechatpadpro）
+            # 大于 3 个字母的平台名直接作为完整平台标识使用（如 aiocqhttp、weixin_oc）
             if len(plat_key) > 3:
                 platform = plat_key
             else:
                 platform = PLATFORM_MAP.get(plat_key, plat_key)
-            # 兼容在 ID 末尾加 s 表示私聊（如 #mf bindraw 654321 123456s）
+            # 兼容在 ID 末尾加 s 表示私聊（如 /mf bindraw 654321 123456s）
             if uid.endswith("s") and msg_type == "GroupMessage" and plat_lower == plat_key:
                 msg_type = "FriendMessage"
                 uid = uid[:-1]
@@ -318,7 +418,7 @@ class MsgForward(star.Star):
             elif len(parts) == 4:
                 src_plat, src_id, dst_plat, dst_id = parts
             else:
-                yield event.plain_result("❌ 格式错误，用法：#mf bindraw [源平台] 源ID [目标平台] 目标ID\n例：#mf bindraw 654321 wx 123456（省略源平台=default）")
+                yield event.plain_result("❌ 格式错误，用法：/mf bindraw [源平台] 源ID [目标平台] 目标ID\n例：/mf bindraw 654321 wx 123456（省略源平台=default）")
                 return
             source_umo = build_umo(src_plat, src_id)
             target_umo = build_umo(dst_plat, dst_id)
@@ -327,9 +427,11 @@ class MsgForward(star.Star):
             rules = list(self.config.get("rules", []))
             rules.append({
                 "__template_key": "rule",
+                "remark": f"规则 #{len(rules) + 1}",
                 "source_umo": source_umo,
                 "target_umo": target_umo,
                 "hide_header": hide_header,
+                "enabled": True,
             })
             self.config["rules"] = rules
             self.config.save_config()
@@ -342,7 +444,7 @@ class MsgForward(star.Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("del")
     async def cmd_del(self, event: AstrMessageEvent, rid: str):
-        """删除一条转发规则（规则编号从 #mf list 查看）"""
+        """删除一条转发规则（规则编号从 /mf list 查看）"""
         try:
             rules = list(self.config.get("rules", []))
             idx = int(rid) - 1
@@ -353,7 +455,7 @@ class MsgForward(star.Star):
             self.config["rules"] = rules
             self.config.save_config()
             yield event.plain_result(
-                f"🗑️ 已删除规则 #{rid}\n{removed.get('source_umo')} → {removed.get('target_umo')}"
+                f"🗑️ 已删除规则 #{rid}（{self._rule_name(removed)}）"
             )
         except Exception as e:
             yield event.plain_result(f"❌ 删除失败: {e}")
@@ -363,17 +465,19 @@ class MsgForward(star.Star):
         """列出与当前会话相关的所有转发规则"""
         source_umo = str(event.unified_msg_origin)
         rules = self.config.get("rules", [])
-        matched = [(idx, r) for idx, r in enumerate(rules, start=1) if r.get("source_umo") == source_umo]
+        matched = [(idx, r) for idx, r in enumerate(rules, start=1)
+                   if source_umo in MsgForward._umo_list(r, "source_umo")]
         if not matched:
             yield event.plain_result(f"📭 当前会话 {source_umo} 没有规则")
             return
 
         lines = [f"📜 当前会话({source_umo}) 的规则："]
         for idx, r in matched:
+            en_status = "🟢" if r.get("enabled", True) else "⛔"
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
             cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
             cd_str = f"❄{cd}s" if int(cd) > 0 else ""
-            lines.append(f"#{idx} {r['source_umo']} → {r['target_umo']} {hide_status} {cd_str}".strip())
+            lines.append(f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str}".strip())
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -393,7 +497,28 @@ class MsgForward(star.Star):
             self.config.save_config()
 
             status = "隐藏" if not current else "显示"
-            yield event.plain_result(f"✅ 规则 #{rid} 来源信息已{status}")
+            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）来源信息已{status}")
+        except Exception as e:
+            yield event.plain_result(f"❌ 操作失败：{e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mf.command("toggle")
+    async def cmd_toggle(self, event: AstrMessageEvent, rid: str):
+        """切换规则的启用状态（启用/停用）"""
+        try:
+            rules = list(self.config.get("rules", []))
+            idx = int(rid) - 1
+            if idx < 0 or idx >= len(rules):
+                yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+                return
+
+            current = rules[idx].get("enabled", True)
+            rules[idx]["enabled"] = not current
+            self.config["rules"] = rules
+            self.config.save_config()
+
+            status = "已启用" if not current else "已停用"
+            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）{status}")
         except Exception as e:
             yield event.plain_result(f"❌ 操作失败：{e}")
 
@@ -402,7 +527,8 @@ class MsgForward(star.Star):
         """列出当前会话规则的来源信息显示状态（允许：显示来源，禁止：隐藏来源）"""
         source_umo = str(event.unified_msg_origin)
         rules = self.config.get("rules", [])
-        matched = [(idx, r) for idx, r in enumerate(rules, start=1) if r.get("source_umo") == source_umo]
+        matched = [(idx, r) for idx, r in enumerate(rules, start=1)
+                   if source_umo in MsgForward._umo_list(r, "source_umo")]
         if not matched:
             yield event.plain_result("📭 当前会话没有规则")
             return
@@ -412,9 +538,9 @@ class MsgForward(star.Star):
 
         for idx, r in matched:
             if r.get("hide_header", False):
-                blocked.append(f"#{idx} {r['source_umo']} → {r['target_umo']}")
+                blocked.append(f"#{idx} {self._rule_name(r)}")
             else:
-                allowed.append(f"#{idx} {r['source_umo']} → {r['target_umo']}")
+                allowed.append(f"#{idx} {self._rule_name(r)}")
 
         lines = [f"📋 当前会话({source_umo}) 来源信息状态："]
         if allowed:
@@ -440,9 +566,9 @@ class MsgForward(star.Star):
 
         for idx, r in enumerate(rules, start=1):
             if r.get("hide_header", False):
-                blocked.append(f"#{idx} {r['source_umo']} → {r['target_umo']}")
+                blocked.append(f"#{idx} {self._rule_name(r)}")
             else:
-                allowed.append(f"#{idx} {r['source_umo']} → {r['target_umo']}")
+                allowed.append(f"#{idx} {self._rule_name(r)}")
 
         lines = ["📋 所有规则来源信息状态："]
         if allowed:
@@ -464,11 +590,12 @@ class MsgForward(star.Star):
 
         lines = ["📜 所有转发规则："]
         for idx, r in enumerate(rules, start=1):
+            en_status = "🟢" if r.get("enabled", True) else "⛔"
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
             cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
             cd_str = f"❄{cd}s" if int(cd) > 0 else ""
             lines.append(
-                f"#{idx} {r.get('source_umo', '?')} → {r.get('target_umo', '?')} {hide_status} {cd_str}".strip()
+                f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str}".strip()
             )
         yield event.plain_result("\n".join(lines))
 
@@ -502,7 +629,7 @@ class MsgForward(star.Star):
                     lines.append(f"\n📋 规则级过滤（共 {len(rules)} 条规则）：")
                     has_per_rule = True
                 rm_text = {"off": "关闭", "blacklist": "黑名单", "whitelist": "白名单"}.get(rfm, "继承全局") if rfm != "inherit" else "继承全局"
-                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | {rm_text}")
+                lines.append(f"  #{idx} | {self._rule_name(r)} | {rm_text}")
                 if rfp:
                     for j, item in enumerate(rfp, start=1):
                         tp, val = MsgForward._parse_filter_item(str(item))
@@ -519,9 +646,9 @@ class MsgForward(star.Star):
         for idx, r in enumerate(rules, start=1):
             cd = r.get("cooldown_seconds")
             if cd is not None and int(cd) > 0:
-                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | ❄{cd}s")
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ❄{cd}s")
             elif cd is not None and int(cd) == 0:
-                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | ❄关闭")
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
 
         yield event.plain_result("\n".join(lines))
 
@@ -584,26 +711,46 @@ class MsgForward(star.Star):
                     if isinstance(item, dict) and item.get("rule", "").strip()]
         return []
 
+    def _should_download_media(self, rule: dict) -> bool:
+        """判断某条规则是否需要在发送前先把媒体下载到本地。
+
+        规则显式设置为 true/false 时按规则值决定；inherit（或未设置）时继承全局配置。
+        兼容旧版 bool 存储（True/False）。"""
+        val = rule.get("download_media_before_send")
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            if val == "true":
+                return True
+            if val == "false":
+                return False
+            # "inherit" 或其他值 → 继承全局
+        return bool(self.config.get("download_media_before_send", False))
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def forward_message(self, event: AstrMessageEvent):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            rules = [r for r in self.config.get("rules", []) if r.get("source_umo") == source_umo]
+            rules = [r for r in self.config.get("rules", [])
+                     if source_umo in MsgForward._umo_list(r, "source_umo")]
             if not rules:
                 return
 
             raw_chain = event.get_messages()
-            # 跨设备转发时媒体组件的 file 路径常不可达，启用此选项会先下载到本机再转发。
-            if self.config.get("download_media_before_send", False):
-                message_chain = await _prepare_chain_for_forward(raw_chain)
-            else:
-                message_chain = raw_chain
+            # 清洗无效的 @ 提及，避免目标平台用空 uid 查询群成员导致超时（retcode=1200）
+            sanitized_chain = _sanitize_chain_for_forward(raw_chain)
+            # 跨设备转发时媒体组件的 file 路径常不可达；对开启「发送前下载媒体」的规则
+            # 惰性预处理一次，供所有开启该选项的规则复用（不重复下载）。
+            prepared_chain = None
             now = time.time()
 
             for idx, rule in enumerate(rules):
-                target = rule.get("target_umo")
-                if not target:
+                targets = MsgForward._umo_list(rule, "target_umo")
+                if not targets:
+                    continue
+                # 规则启用开关：关闭的规则直接跳过（默认启用，兼容旧版规则）
+                if not rule.get("enabled", True):
                     continue
                 # 逐规则过滤检查
                 if not self._should_forward(event, rule):
@@ -615,27 +762,38 @@ class MsgForward(star.Star):
                     cooldown_sec = self.config.get("default_cooldown_seconds", 0)
                 cooldown_sec = int(cooldown_sec) if cooldown_sec else 0
 
-                if cooldown_sec > 0:
-                    cd_key = f"{source_umo}|{target}"
-                    cd_end = self._cooldowns.get(cd_key, 0)
-                    if now < cd_end:
-                        continue
+                # 逐规则决定是否在发送前本地化媒体（惰性构建，一次构建多条规则复用）
+                if self._should_download_media(rule):
+                    if prepared_chain is None:
+                        prepared_chain = await _prepare_chain_for_forward(sanitized_chain)
+                    message_chain = prepared_chain
+                else:
+                    message_chain = sanitized_chain
 
-                try:
-                    if rule.get("hide_header", False):
-                        new_chain = message_chain
-                    else:
-                        header = self._format_origin_header(event, source_umo)
-                        header += "\n\n\u200b"
-                        new_chain = [Plain(text=header)] + message_chain
-                    await self.context.send_message(target, event.chain_result(new_chain))
-                    # 转发成功后设置冷却
+                # 构造消息链一次，供该规则的所有目标复用
+                if rule.get("hide_header", False):
+                    new_chain = message_chain
+                else:
+                    header = self._format_origin_header(event, source_umo)
+                    header += "\n\n\u200b"
+                    new_chain = [Plain(text=header)] + message_chain
+
+                # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
+                for target in targets:
                     if cooldown_sec > 0:
-                        self._cooldowns[cd_key] = now + cooldown_sec
-                except ValueError as e:
-                    logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
-                except Exception as e:
-                    logger.error(f"❌ 转发失败: {e}")
+                        cd_key = f"{source_umo}|{target}"
+                        cd_end = self._cooldowns.get(cd_key, 0)
+                        if now < cd_end:
+                            continue
+                    try:
+                        await self.context.send_message(target, event.chain_result(new_chain))
+                        # 转发成功后设置冷却
+                        if cooldown_sec > 0:
+                            self._cooldowns[cd_key] = now + cooldown_sec
+                    except ValueError as e:
+                        logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
+                    except Exception as e:
+                        logger.error(f"❌ 转发失败: {e}")
 
         except Exception as e:
             logger.error(f"❌ 转发逻辑异常: {e}")

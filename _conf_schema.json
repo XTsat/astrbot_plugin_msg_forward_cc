@@ -13,20 +13,31 @@
     "templates": {
       "rule": {
         "name": "转发规则",
-        "hint": "source_umo 为消息来源会话，target_umo 为目标会话。",
-        "display_item": "source_umo",
+        "display_item": "remark",
         "hide_hint_in_list": true,
         "items": {
-          "source_umo": {
-            "description": "源 UMO",
+          "enabled": {
+            "description": "启用此规则",
+            "type": "bool",
+            "hint": "关闭后此规则暂时停用，规则保留但不再转发消息。可通过 /mf toggle 或 WebUI 随时切换。",
+            "default": true
+          },
+          "remark": {
+            "description": "名称",
             "type": "string",
-            "hint": "消息来源会话标识。GroupMessage（群聊）或 FriendMessage（私聊）。例如 aiocqhttp:GroupMessage:654321",
+            "hint": "自定义备注，作为该规则的展示名称。",
+            "default": ""
+          },
+          "source_umo": {
+            "description": "源 UMO 列表",
+            "type": "text",
+            "hint": "消息来源会话标识，每行一条，可填多个（任一命中即触发转发）。GroupMessage（群聊）或 FriendMessage（私聊）。例如 aiocqhttp:GroupMessage:123456",
             "default": ""
           },
           "target_umo": {
-            "description": "目标 UMO",
-            "type": "string",
-            "hint": "消息目标会话标识。GroupMessage（群聊）或 FriendMessage（私聊）。例如 wechatpadpro:GroupMessage:123456",
+            "description": "目标 UMO 列表",
+            "type": "text",
+            "hint": "消息目标会话标识，每行一条，可填多个，消息将转发到列表中的每个会话。GroupMessage（群聊）或 FriendMessage（私聊）。例如 aiocqhttp:GroupMessage:654321",
             "default": ""
           },
           "hide_header": {
@@ -53,47 +64,15 @@
             "type": "int",
             "hint": "仅对本规则生效。转发一次后在该秒数内不再重复转发。0 或不填则继承全局默认值。",
             "default": 0
+          },
+          "download_media_before_send": {
+            "description": "发送媒体前先下载到本地",
+            "type": "string",
+            "hint": "仅对本规则生效。inherit=继承全局设置；true=强制开启；false=强制关闭。",
+            "default": "inherit",
+            "options": ["inherit", "true", "false"]
           }
         }
-      }
-    }
-  },
-  "platform_name_map": {
-    "description": "平台名称映射",
-    "type": "object",
-    "hint": "自定义各平台在来源信息中的显示名称。未配置的平台将使用其原始名称。",
-    "default": {
-      "default": "默认",
-      "aiocqhttp": "QQ",
-      "wechatpadpro": "微信",
-      "telegram": "Telegram",
-      "discord": "Discord"
-    },
-    "items": {
-      "aiocqhttp": {
-        "description": "aiocqhttp（QQ）",
-        "type": "string",
-        "default": "QQ"
-      },
-      "default": {
-        "description": "default（默认平台）",
-        "type": "string",
-        "default": "默认"
-      },
-      "wechatpadpro": {
-        "description": "wechatpadpro（微信）",
-        "type": "string",
-        "default": "微信"
-      },
-      "telegram": {
-        "description": "Telegram",
-        "type": "string",
-        "default": "Telegram"
-      },
-      "discord": {
-        "description": "Discord",
-        "type": "string",
-        "default": "Discord"
       }
     }
   },
@@ -127,5 +106,134 @@
     "type": "bool",
     "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
     "default": false
+  },
+  "platform_name_map": {
+    "description": "平台名称映射",
+    "type": "object",
+    "hint": "自定义各平台在来源信息中的显示名称。未配置的平台将使用其原始名称。",
+    "default": {
+      "default": "默认",
+      "aiocqhttp": "QQ",
+      "qq_official": "QQ官方机器人",
+      "qq_official_webhook": "QQ官方机器人(Webhook)",
+      "telegram": "Telegram",
+      "weixin_oc": "个人微信",
+      "wecom": "企业微信",
+      "weixin_official_account": "微信公众号",
+      "lark": "飞书",
+      "dingtalk": "钉钉",
+      "discord": "Discord",
+      "kook": "KOOK",
+      "slack": "Slack",
+      "vocechat": "VoceChat",
+      "line": "LINE",
+      "satori": "Satori",
+      "matrix": "Matrix",
+      "mattermost": "Mattermost",
+      "misskey": "Misskey",
+      "wecom_ai_bot": "企微AI机器人"
+    },
+    "items": {
+      "default": {
+        "description": "default（默认平台）",
+        "type": "string",
+        "default": "默认"
+      },
+      "aiocqhttp": {
+        "description": "aiocqhttp（QQ/OneBot V11）",
+        "type": "string",
+        "default": "QQ"
+      },
+      "qq_official": {
+        "description": "qq_official（QQ官方机器人）",
+        "type": "string",
+        "default": "QQ官方机器人"
+      },
+      "qq_official_webhook": {
+        "description": "qq_official_webhook（QQ官方机器人 Webhook）",
+        "type": "string",
+        "default": "QQ官方机器人(Webhook)"
+      },
+      "telegram": {
+        "description": "telegram（Telegram）",
+        "type": "string",
+        "default": "Telegram"
+      },
+      "weixin_oc": {
+        "description": "weixin_oc（个人微信）",
+        "type": "string",
+        "default": "个人微信"
+      },
+      "wecom": {
+        "description": "wecom（企业微信）",
+        "type": "string",
+        "default": "企业微信"
+      },
+      "weixin_official_account": {
+        "description": "weixin_official_account（微信公众号）",
+        "type": "string",
+        "default": "微信公众号"
+      },
+      "lark": {
+        "description": "lark（飞书）",
+        "type": "string",
+        "default": "飞书"
+      },
+      "dingtalk": {
+        "description": "dingtalk（钉钉）",
+        "type": "string",
+        "default": "钉钉"
+      },
+      "discord": {
+        "description": "discord（Discord）",
+        "type": "string",
+        "default": "Discord"
+      },
+      "kook": {
+        "description": "kook（KOOK）",
+        "type": "string",
+        "default": "KOOK"
+      },
+      "slack": {
+        "description": "slack（Slack）",
+        "type": "string",
+        "default": "Slack"
+      },
+      "vocechat": {
+        "description": "vocechat（VoceChat）",
+        "type": "string",
+        "default": "VoceChat"
+      },
+      "line": {
+        "description": "line（LINE）",
+        "type": "string",
+        "default": "LINE"
+      },
+      "satori": {
+        "description": "satori（Satori）",
+        "type": "string",
+        "default": "Satori"
+      },
+      "matrix": {
+        "description": "matrix（Matrix）",
+        "type": "string",
+        "default": "Matrix"
+      },
+      "mattermost": {
+        "description": "mattermost（Mattermost）",
+        "type": "string",
+        "default": "Mattermost"
+      },
+      "misskey": {
+        "description": "misskey（Misskey）",
+        "type": "string",
+        "default": "Misskey"
+      },
+      "wecom_ai_bot": {
+        "description": "wecom_ai_bot（企微AI机器人）",
+        "type": "string",
+        "default": "企微AI机器人"
+      }
+    }
   }
 }
