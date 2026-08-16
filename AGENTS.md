@@ -10,9 +10,9 @@
 
 | 文件 | 职责 |
 |------|------|
-| `main.py` | 插件主体，全部逻辑（644 行） |
+| `main.py` | 插件主体，全部逻辑（988 行） |
 | `_conf_schema.json` | WebUI 配置 Schema（131 行） |
-| `metadata.yaml` | 插件元数据（v0.3.0，支持 aiocqhttp/wechatpadpro/telegram/discord） |
+| `metadata.yaml` | 插件元数据（v0.4.1，支持 aiocqhttp/wechatpadpro/telegram/discord） |
 | `README.md` | 中文文档 |
 | `LICENSE` | AGPL-3.0 |
 | `logo.png` | 插件图标 |
@@ -29,7 +29,12 @@
 ### 1. 工具函数
 
 - `_rebuild_media_component(comp)`：媒体组件重下载到本进程临时目录，用 `fromFileSystem` 重建，解决跨会话转发时源端临时路径不可达（ENOENT）问题；失败时降级为 `Plain` 占位文本。Video 会清空 cover（源平台临时路径跨进程不可达）；File 保留原文件名（兼容旧版签名，TypeError 时回退）
-- `_prepare_chain_for_forward(chain)`：转发前对 Image/Record/Video/File 逐组件本地化，返回新链
+- `_prepare_chain_for_forward(chain)`：转发前对 Image/Record/Video/File 逐组件本地化，返回新链（走 AstrBot 核心 download_file，正常网络）
+- `_extract_remote_url(comp)`：返回组件引用的远程 http(s) URL；本地文件/base64/data URI 返回 None。注意 File 组件的 `.file` 是 property（异步上下文访问会触发同步下载），对 File 只检查 `.url` 与 `.file_`
+- `_download_url_to_local(comp, url)`：把远程媒体下载到本地临时目录；内部先走正常网络（AF_UNSPEC）、失败再改用强制 IPv4（AF_INET），规避核心 download_file 的 `Cannot connect ... [None]`（aiohttp#9447）问题；两次都失败抛异常由调用方降级
+- `_guess_media_ext(comp, url, content_type)`：按 Content-Type → URL 后缀 → 组件类型确定临时文件后缀
+- `_rebuild_from_local_path(comp, path)`：按本地路径重建组件（File 无 `fromFileSystem`，改用 `File(name=..., file=...)`）
+- `_prepare_chain_fallback(chain)`：转发失败后的兜底链，仅本地化远程 URL 媒体（用 `_download_url_to_local`），失败降级占位文本
 - `load_json` / `save_json`：健壮的文件读写，带详细错误日志（FileNotFoundError/JSONDecodeError/OSError 分类处理）
 - `gen_code(n=6)`：用 `secrets` 生成绑定码（小写字母+数字）
 
@@ -65,9 +70,10 @@
 - 匹配 source_umo 相同的所有规则，逐规则：
   1. `_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
   2. 冷却检查（规则 `cooldown_seconds` 优先，否则 `default_cooldown_seconds`；冷却期内跳过）
-  3. 构造消息链：`hide_header` 为 true 直接透传；否则前置来源头（末尾加 `\n\n\u200b` 零宽空格避免连续换行问题）
-  4. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳
-- `download_media_before_send` 开启时先走 `_prepare_chain_for_forward`
+  3. 主链：默认透传 `sanitized_chain`（正常网络，媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
+  4. 构造消息链：`hide_header` 为 true 直接透传；否则前置来源头（末尾加 `\n\n\u200b` 零宽空格避免连续换行问题）
+  5. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳
+  6. 失败自动降级：发送失败且消息含远程 URL 媒体时，用 `_prepare_chain_fallback` 本地化后重试一次；仍失败记录错误
 - 异常分类记录日志（ValueError = 非法 session 字符串），单规则失败不影响其他规则
 
 ### 6. 过滤系统
@@ -95,6 +101,8 @@
 - 冷却表是纯内存的，重启后冷却状态丢失（不持久化）
 - 转发对同一 source 的规则是循环顺序执行，无并发锁；存储层注释「无锁简化」
 - 媒体转发默认不下载（`download_media_before_send=false`），跨设备转发提示找不到文件时才开启
+- 媒体失败自动降级：转发默认透传（正常网络），发送失败且含远程 URL 媒体时用 `_prepare_chain_fallback` 本地化后重试一次（下载器内部先正常网络、失败再 IPv4）；下载仍失败降级为占位文本
+- 自定义下载器把媒体写入系统临时目录 `msg_forward_cc_media` 子目录，暂不做清理（与 AstrBot 自身临时文件行为一致）
 
 ## 开发约束
 
@@ -105,4 +113,4 @@
 - 配置文件改动后必须调用 `self.config.save_config()`
 - 回复消息统一用 `yield event.plain_result(...)`
 - 权限控制：管理类命令加 `@filter.permission_type(filter.PermissionType.ADMIN)`
-- 不引入新依赖，纯标准库（json/re/secrets/time/pathlib/string）+ AstrBot API
+- 不引入新依赖，纯标准库（json/re/secrets/time/pathlib/string/tempfile/ssl/socket/urllib）+ AstrBot API；`aiohttp` / `certifi` 在 `_download_url_to_local` 内惰性 import（AstrBot 运行时已自带，仅用于兜底媒体下载，import 失败时降级为占位文本，不影响其余功能）

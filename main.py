@@ -1,8 +1,13 @@
 import json
+import os
 import re
 import secrets
+import ssl
+import string
+import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import astrbot.api.star as star
 from astrbot.api.event import filter, AstrMessageEvent
@@ -10,14 +15,152 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-import string
-
 from astrbot.core.message.components import At, Plain, Image, Record, Video, File
 
 
 # ------------------------
 # 工具与数据路径
 # ------------------------
+
+
+# 远程媒体 Content-Type → 落盘后缀映射（自定义下载器据此确定临时文件后缀）
+_MIME_EXT_MAP = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/svg+xml": ".svg",
+    "audio/amr": ".amr",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/silk": ".silk",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/mp4": ".m4a",
+    "video/mp4": ".mp4",
+    "video/mpeg": ".mpg",
+    "video/quicktime": ".mov",
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+}
+
+# 兜底：按组件类型确定后缀
+_DEFAULT_MEDIA_EXT = {
+    Image: ".jpg",
+    Record: ".amr",
+    Video: ".mp4",
+    File: ".bin",
+}
+
+_VALID_URL_EXT = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+    ".amr", ".mp3", ".wav", ".silk", ".ogg", ".flac", ".m4a",
+    ".mp4", ".mov", ".mpg", ".mpeg", ".pdf", ".zip", ".bin",
+}
+
+
+def _comp_type_name(comp) -> str:
+    """返回组件的可读类型名，用于日志与占位文本。"""
+    return getattr(getattr(comp, "type", None), "value", None) or type(comp).__name__
+
+
+def _extract_remote_url(comp) -> str | None:
+    """返回组件引用的远程 http(s) URL；本地文件 / base64 / data URI 返回 None。
+
+    注意：File 组件的 `.file` 是 property，在异步上下文访问会触发同步下载并报
+    警告，因此对 File 只检查 `.url` 与 `.file_`。
+    """
+    url = getattr(comp, "url", None)
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        return url
+    if isinstance(comp, File):
+        file_ref = getattr(comp, "file_", None)
+    else:
+        file_ref = getattr(comp, "file", None)
+    if isinstance(file_ref, str) and file_ref.startswith(("http://", "https://")):
+        return file_ref
+    return None
+
+
+def _guess_media_ext(comp, url: str, content_type: str) -> str:
+    """根据 Content-Type / URL 后缀 / 组件类型确定临时文件后缀。"""
+    mime = (content_type or "").split(";")[0].strip().lower()
+    ext = _MIME_EXT_MAP.get(mime)
+    if ext:
+        return ext
+    url_ext = Path(urlparse(url).path).suffix.lower()
+    if url_ext in _VALID_URL_EXT:
+        return url_ext
+    for comp_type, default in _DEFAULT_MEDIA_EXT.items():
+        if isinstance(comp, comp_type):
+            return default
+    return ".bin"
+
+
+async def _download_url_to_local(comp, url: str) -> str:
+    """把远程媒体下载到本地临时目录，返回本地路径。
+
+    先用正常网络（aiohttp 默认 AF_UNSPEC / happy eyeballs）尝试，失败后改用强制
+    IPv4（AF_INET）重试，规避宿主机 IPv6 无默认路由 / DNS no-data 时 aiohttp 报
+    `Cannot connect ... ssl:default [None]`（aio-libs/aiohttp#9447）的问题。
+    两次都失败则抛异常，由调用方降级为占位文本。
+    """
+    try:
+        import aiohttp
+    except ImportError as e:
+        raise RuntimeError("aiohttp 不可用，无法本地化媒体") from e
+
+    try:
+        import certifi
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ssl_context = ssl.create_default_context()
+
+    import socket
+
+    async def _fetch(connector):
+        async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
+            async with session.get(url, timeout=120) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                return await resp.read(), content_type
+
+    # 先正常网络（默认 AF_UNSPEC），失败再强制 IPv4
+    try:
+        data, content_type = await _fetch(aiohttp.TCPConnector(ssl=ssl_context))
+    except Exception as e:
+        logger.warning(f"⚠️ 正常网络下载媒体失败（{e}），改用强制 IPv4 重试")
+        data, content_type = await _fetch(
+            aiohttp.TCPConnector(ssl=ssl_context, family=socket.AF_INET)
+        )
+
+    suffix = _guess_media_ext(comp, url, content_type)
+    tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _rebuild_from_local_path(comp, local_path: str):
+    """按本地文件路径重建组件（fromFileSystem）。"""
+    if isinstance(comp, Image):
+        return Image.fromFileSystem(local_path)
+    if isinstance(comp, Record):
+        return Record.fromFileSystem(local_path)
+    if isinstance(comp, Video):
+        # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达
+        return Video.fromFileSystem(local_path)
+    if isinstance(comp, File):
+        # File 组件无 fromFileSystem 静态方法，直接用构造函数按本地路径重建，
+        # 保留原文件名方便目标平台显示。
+        name = getattr(comp, "name", None) or ""
+        return File(name=name, file=local_path)
+    return comp
 
 
 async def _rebuild_media_component(comp):
@@ -58,6 +201,33 @@ async def _prepare_chain_for_forward(chain):
     for comp in chain:
         if isinstance(comp, (Image, Record, Video, File)):
             prepared.append(await _rebuild_media_component(comp))
+        else:
+            prepared.append(comp)
+    return prepared
+
+
+async def _prepare_chain_fallback(chain):
+    """把远程 URL 媒体下载到本地（内部先正常网络、失败再 IPv4），作为转发失败后的兜底链。
+
+    仅处理引用远程 http(s) URL 的媒体组件（图片/语音/视频/文件），下载失败降级为
+    Plain 占位文本；本地文件/base64 与非媒体组件原样保留。与 _prepare_chain_for_forward
+    的区别：后者走 AstrBot 核心 download_file，本函数自带「正常网络 → 强制 IPv4」的
+    兜底下载器，用于规避宿主机 IPv6 无默认路由 / DNS no-data 时核心 download_file
+    连接远程源报 `Cannot connect ... ssl:default [None]`（aio-libs/aiohttp#9447）的问题。
+    """
+    if not chain:
+        return chain
+    prepared = []
+    for comp in chain:
+        remote_url = _extract_remote_url(comp) if isinstance(comp, (Image, Record, Video, File)) else None
+        if remote_url:
+            comp_type = _comp_type_name(comp)
+            try:
+                local_path = await _download_url_to_local(comp, remote_url)
+                prepared.append(_rebuild_from_local_path(comp, local_path))
+            except Exception as e:
+                logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
+                prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
         else:
             prepared.append(comp)
     return prepared
@@ -740,8 +910,7 @@ class MsgForward(star.Star):
             raw_chain = event.get_messages()
             # 清洗无效的 @ 提及，避免目标平台用空 uid 查询群成员导致超时（retcode=1200）
             sanitized_chain = _sanitize_chain_for_forward(raw_chain)
-            # 跨设备转发时媒体组件的 file 路径常不可达；对开启「发送前下载媒体」的规则
-            # 惰性预处理一次，供所有开启该选项的规则复用（不重复下载）。
+            # 开启 download_media_before_send 的规则本地化链，惰性构建一次供多条规则复用
             prepared_chain = None
             now = time.time()
 
@@ -762,7 +931,8 @@ class MsgForward(star.Star):
                     cooldown_sec = self.config.get("default_cooldown_seconds", 0)
                 cooldown_sec = int(cooldown_sec) if cooldown_sec else 0
 
-                # 逐规则决定是否在发送前本地化媒体（惰性构建，一次构建多条规则复用）
+                # 主消息链：默认透传（正常网络，媒体交给目标端自行处理）；
+                # 开启 download_media_before_send 时，发送前先本地化（原逻辑不变）。
                 if self._should_download_media(rule):
                     if prepared_chain is None:
                         prepared_chain = await _prepare_chain_for_forward(sanitized_chain)
@@ -770,13 +940,15 @@ class MsgForward(star.Star):
                 else:
                     message_chain = sanitized_chain
 
-                # 构造消息链一次，供该规则的所有目标复用
-                if rule.get("hide_header", False):
-                    new_chain = message_chain
-                else:
-                    header = self._format_origin_header(event, source_umo)
-                    header += "\n\n\u200b"
-                    new_chain = [Plain(text=header)] + message_chain
+                # 来源头（hide_header 时为空，不前置）
+                header_text = ""
+                if not rule.get("hide_header", False):
+                    header_text = self._format_origin_header(event, source_umo) + "\n\n\u200b"
+                new_chain = message_chain if not header_text else [Plain(text=header_text)] + message_chain
+
+                # 是否含远程 URL 媒体（决定失败时是否值得本地化后重试）
+                has_remote_media = any(_extract_remote_url(c) for c in sanitized_chain)
+                fallback_chain = None
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
@@ -793,7 +965,21 @@ class MsgForward(star.Star):
                     except ValueError as e:
                         logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                     except Exception as e:
-                        logger.error(f"❌ 转发失败: {e}")
+                        # 自动降级：先用正常网络（上面已尝试），失败后把远程媒体下载到
+                        # 本地（下载器内部也是先正常网络、失败再 IPv4）再重试一次；仍失败才记录错误。
+                        if has_remote_media:
+                            if fallback_chain is None:
+                                localized = await _prepare_chain_fallback(sanitized_chain)
+                                fallback_chain = localized if not header_text else [Plain(text=header_text)] + localized
+                            try:
+                                await self.context.send_message(target, event.chain_result(fallback_chain))
+                                logger.warning(f"⚠️ 转发首次失败（{e}），已本地化媒体后重试成功")
+                                if cooldown_sec > 0:
+                                    self._cooldowns[cd_key] = now + cooldown_sec
+                            except Exception as e2:
+                                logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e2}")
+                        else:
+                            logger.error(f"❌ 转发失败: {e}")
 
         except Exception as e:
             logger.error(f"❌ 转发逻辑异常: {e}")
