@@ -71,6 +71,18 @@
             "hint": "仅对本规则生效。inherit=继承全局设置；true=强制开启；false=强制关闭。",
             "default": "inherit",
             "options": ["inherit", "true", "false"]
+          },
+          "use_proxy": {
+            "description": "媒体下载是否走代理",
+            "type": "bool",
+            "hint": "仅对本规则生效。关闭则直连；开启后 proxy_url 留空走 AstrBot 自带代理（系统环境变量），填写则走该代理地址。",
+            "default": false
+          },
+          "proxy_url": {
+            "description": "媒体下载代理地址",
+            "type": "string",
+            "hint": "仅 use_proxy 开启时生效。留空走 AstrBot 自带代理；填写则走该地址（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）。",
+            "default": ""
           }
         }
       }

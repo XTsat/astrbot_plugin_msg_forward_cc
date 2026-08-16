@@ -100,13 +100,14 @@ def _guess_media_ext(comp, url: str, content_type: str) -> str:
     return ".bin"
 
 
-async def _download_url_to_local(comp, url: str) -> str:
+async def _download_url_to_local(comp, url: str, use_proxy: bool = False, proxy_url: str | None = None) -> str:
     """把远程媒体下载到本地临时目录，返回本地路径。
 
     先用正常网络（aiohttp 默认 AF_UNSPEC / happy eyeballs）尝试，失败后改用强制
     IPv4（AF_INET）重试，规避宿主机 IPv6 无默认路由 / DNS no-data 时 aiohttp 报
     `Cannot connect ... ssl:default [None]`（aio-libs/aiohttp#9447）的问题。
-    两次都失败则抛异常，由调用方降级为占位文本。
+    代理三态：use_proxy=False 直连；use_proxy=True 且 proxy_url 空走系统代理（环境变量）；
+    use_proxy=True 且 proxy_url 非空走该代理地址。两次都失败则抛异常，由调用方降级为占位文本。
     """
     try:
         import aiohttp
@@ -121,9 +122,17 @@ async def _download_url_to_local(comp, url: str) -> str:
 
     import socket
 
+    # 代理三态：关→直连；开且无地址→系统代理（读环境变量）；开且有地址→指定代理
+    if not use_proxy:
+        trust_env, proxy = False, None
+    elif proxy_url:
+        trust_env, proxy = False, proxy_url
+    else:
+        trust_env, proxy = True, None
+
     async def _fetch(connector):
-        async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
-            async with session.get(url, timeout=120) as resp:
+        async with aiohttp.ClientSession(trust_env=trust_env, connector=connector) as session:
+            async with session.get(url, proxy=proxy, timeout=120) as resp:
                 resp.raise_for_status()
                 content_type = resp.headers.get("Content-Type", "")
                 return await resp.read(), content_type
@@ -206,7 +215,7 @@ async def _prepare_chain_for_forward(chain):
     return prepared
 
 
-async def _prepare_chain_fallback(chain):
+async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str | None = None):
     """把远程 URL 媒体下载到本地（内部先正常网络、失败再 IPv4），作为转发失败后的兜底链。
 
     仅处理引用远程 http(s) URL 的媒体组件（图片/语音/视频/文件），下载失败降级为
@@ -214,6 +223,7 @@ async def _prepare_chain_fallback(chain):
     的区别：后者走 AstrBot 核心 download_file，本函数自带「正常网络 → 强制 IPv4」的
     兜底下载器，用于规避宿主机 IPv6 无默认路由 / DNS no-data 时核心 download_file
     连接远程源报 `Cannot connect ... ssl:default [None]`（aio-libs/aiohttp#9447）的问题。
+    代理三态：use_proxy=False 直连；use_proxy=True 且 proxy_url 空走系统代理；非空走该地址。
     """
     if not chain:
         return chain
@@ -223,7 +233,7 @@ async def _prepare_chain_fallback(chain):
         if remote_url:
             comp_type = _comp_type_name(comp)
             try:
-                local_path = await _download_url_to_local(comp, remote_url)
+                local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
                 prepared.append(_rebuild_from_local_path(comp, local_path))
             except Exception as e:
                 logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
@@ -948,6 +958,9 @@ class MsgForward(star.Star):
 
                 # 是否含远程 URL 媒体（决定失败时是否值得本地化后重试）
                 has_remote_media = any(_extract_remote_url(c) for c in sanitized_chain)
+                # 规则级代理三态：use_proxy 关→直连；开且 proxy_url 空→系统代理；开且非空→该地址
+                use_proxy = bool(rule.get("use_proxy", False))
+                proxy_url = (rule.get("proxy_url") or "").strip() or None
                 fallback_chain = None
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
@@ -969,7 +982,7 @@ class MsgForward(star.Star):
                         # 本地（下载器内部也是先正常网络、失败再 IPv4）再重试一次；仍失败才记录错误。
                         if has_remote_media:
                             if fallback_chain is None:
-                                localized = await _prepare_chain_fallback(sanitized_chain)
+                                localized = await _prepare_chain_fallback(sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url)
                                 fallback_chain = localized if not header_text else [Plain(text=header_text)] + localized
                             try:
                                 await self.context.send_message(target, event.chain_result(fallback_chain))

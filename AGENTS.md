@@ -31,10 +31,10 @@
 - `_rebuild_media_component(comp)`：媒体组件重下载到本进程临时目录，用 `fromFileSystem` 重建，解决跨会话转发时源端临时路径不可达（ENOENT）问题；失败时降级为 `Plain` 占位文本。Video 会清空 cover（源平台临时路径跨进程不可达）；File 保留原文件名（兼容旧版签名，TypeError 时回退）
 - `_prepare_chain_for_forward(chain)`：转发前对 Image/Record/Video/File 逐组件本地化，返回新链（走 AstrBot 核心 download_file，正常网络）
 - `_extract_remote_url(comp)`：返回组件引用的远程 http(s) URL；本地文件/base64/data URI 返回 None。注意 File 组件的 `.file` 是 property（异步上下文访问会触发同步下载），对 File 只检查 `.url` 与 `.file_`
-- `_download_url_to_local(comp, url)`：把远程媒体下载到本地临时目录；内部先走正常网络（AF_UNSPEC）、失败再改用强制 IPv4（AF_INET），规避核心 download_file 的 `Cannot connect ... [None]`（aiohttp#9447）问题；两次都失败抛异常由调用方降级
+- `_download_url_to_local(comp, url, use_proxy=False, proxy_url=None)`：把远程媒体下载到本地临时目录；内部先走正常网络（AF_UNSPEC）、失败再改用强制 IPv4（AF_INET），规避核心 download_file 的 `Cannot connect ... [None]`（aiohttp#9447）问题；代理三态——use_proxy 关→直连，开且 proxy_url 空→走系统代理（trust_env=True），开且非空→走该地址（trust_env=False）；两次都失败抛异常由调用方降级
 - `_guess_media_ext(comp, url, content_type)`：按 Content-Type → URL 后缀 → 组件类型确定临时文件后缀
 - `_rebuild_from_local_path(comp, path)`：按本地路径重建组件（File 无 `fromFileSystem`，改用 `File(name=..., file=...)`）
-- `_prepare_chain_fallback(chain)`：转发失败后的兜底链，仅本地化远程 URL 媒体（用 `_download_url_to_local`），失败降级占位文本
+- `_prepare_chain_fallback(chain, use_proxy=False, proxy_url=None)`：转发失败后的兜底链，仅本地化远程 URL 媒体（用 `_download_url_to_local`，代理三态同上），失败降级占位文本
 - `load_json` / `save_json`：健壮的文件读写，带详细错误日志（FileNotFoundError/JSONDecodeError/OSError 分类处理）
 - `gen_code(n=6)`：用 `secrets` 生成绑定码（小写字母+数字）
 
@@ -93,6 +93,7 @@
 - `filter_mode`（string，off）、`filter_patterns`（text，每行一条）
 - `default_cooldown_seconds`（int，0）
 - `download_media_before_send`（bool，false）：发送前媒体先下载到本地
+- `rules[].use_proxy`（bool，false）+ `rules[].proxy_url`（string，空）：规则级媒体下载代理三态——use_proxy 关→直连；开且 proxy_url 空→走 AstrBot 自带代理（系统环境变量）；开且非空→走该地址（如 `http://127.0.0.1:7890`）
 
 ## 已知设计细节与注意点
 
