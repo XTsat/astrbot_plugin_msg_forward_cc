@@ -65,6 +65,12 @@
             "hint": "仅对本规则生效。转发一次后在该秒数内不再重复转发。0 或不填则继承全局默认值。",
             "default": 0
           },
+          "queue_interval_seconds": {
+            "description": "发送队列间隔（秒）",
+            "type": "int",
+            "hint": "仅对本规则生效。开启后，匹配本规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条（不丢消息）。0 或不填则继承全局默认值。",
+            "default": 0
+          },
           "download_media_before_send": {
             "description": "发送媒体前先下载到本地",
             "type": "string",
@@ -111,6 +117,18 @@
     "description": "默认转发冷却时间（秒）",
     "type": "int",
     "hint": "新建转发规则时的默认冷却间隔。转发一次后在该秒数内不再重复转发同一规则。每条规则可单独覆盖。",
+    "default": 0
+  },
+  "default_queue_interval_seconds": {
+    "description": "默认发送队列间隔（秒）",
+    "type": "int",
+    "hint": "新建转发规则时的默认队列间隔。开启后，匹配规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条。0 或关闭则立即转发。每条规则可单独覆盖。",
+    "default": 0
+  },
+  "queue_max_size": {
+    "description": "发送队列最大长度",
+    "type": "int",
+    "hint": "队列中允许积压的最大消息数。0 或不填则不限制。达到上限后新消息将被丢弃（记录警告日志），队列中的消息不受影响。",
     "default": 0
   },
   "download_media_before_send": {
