@@ -1,6 +1,6 @@
 name: astrbot_plugin_msg_forward_cc # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: 跨平台消息转发 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: 修改自 Siaospeed 版本，提供 Web 管理和消息控制支持。用于在不同聊天平台及群聊之间转发与同步消息，也可用于全自动搬屎（搬史、搬石） # 插件简短描述
+desc: 在不同聊天平台及群聊之间自动转发与同步消息 # 插件简短描述
 version: v0.4.3 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: XTsat # 作者
 repo: https://github.com/XTsat/astrbot_plugin_msg_forward_cc # 插件的仓库地址
@@ -30,8 +30,13 @@ tags:                                      # （可选）标签列表，用于�
   - 消息转发
   - 跨平台
   - 群聊桥接
+  - 聊天
   - 消息
   - 同步
   - 转发
   - 过滤
   - 工具
+  - 搬屎
+  - 搬史
+  - 搬石
+  
