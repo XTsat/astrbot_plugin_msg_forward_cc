@@ -23,6 +23,7 @@
 - **规则启停**：每条规则可独立启用/停用，停用后规则保留但不再转发（WebUI 开关或 `/mf toggle`）。
 - **消息过滤**：全局与规则级两层过滤（off/blacklist/whitelist），支持关键词与正则。
 - **转发冷却**：全局默认与规则级冷却时间，避免刷屏。
+- **发送队列**：全局默认与规则级队列间隔，匹配消息进入队列后每隔设定时间转发一条。
 - **媒体转发（失败自动降级）**：发送失败时自动下载远程媒体到本地重试。
 
 ### 🚀 快速开始
@@ -71,6 +72,7 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 | `hide_header` | 是否隐藏来源信息头 |
 | `filter_mode` | 过滤模式（inherit=继承全局） |
 | `filter_patterns` | 过滤规则列表（留空=继承全局），每项 `regex:表达式` 或关键词 |
+| `queue_interval_seconds` | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `download_media_before_send` | 是否在发送媒体前先下载到本地（inherit=继承全局） |
 | `use_proxy` | 媒体下载是否走代理（关闭直连；开启后地址留空走 AstrBot 自带代理，填写则走该地址） |
 | `proxy_url` | 媒体下载代理地址（仅 `use_proxy` 开启时生效，如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`） |
@@ -192,6 +194,8 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `filter_mode` | string | `off` | 消息过滤模式：off/blacklist/whitelist |
 | `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，否则=关键词） |
 | `default_cooldown_seconds` | int | `0` | 默认转发冷却时间（秒），每条规则可单独覆盖 |
+| `default_queue_interval_seconds` | int | `0` | 默认发送队列间隔（秒），开启后消息进入队列每隔该秒数转发一条，每条规则可单独覆盖 |
+| `queue_max_size` | int | `0` | 发送队列最大长度，0=不限制；达到上限后新消息被丢弃（记录日志），队列中已有的消息不受影响 |
 | `download_media_before_send` | bool | `false` | 发送前先将媒体下载到本地，跨设备转发找不到文件时开启，每条规则可单独覆盖 |
 
 #### `rules` 每条规则包含
@@ -206,6 +210,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `filter_mode` | string | 过滤模式（inherit=继承全局），支持 inherit/off/blacklist/whitelist |
 | `filter_patterns` | list | 过滤规则列表（留空=继承全局），每项格式：`regex:表达式` 或 关键词 |
 | `cooldown_seconds` | int | 转发冷却时间（秒），0 或不填则继承全局默认值 |
+| `queue_interval_seconds` | int | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `download_media_before_send` | string | 是否在发送媒体前先下载到本地（inherit=继承全局），支持 inherit/true/false |
 
 #### `platform_name_map` 默认值

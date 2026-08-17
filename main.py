@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
 from astrbot.core.message.components import At, Plain, Image, Record, Video, File
+from astrbot.core.message.message_event_result import MessageEventResult
 
 
 # ------------------------
@@ -362,6 +364,11 @@ class MsgForward(star.Star):
         # 冷却计时器：key = "source_umo|target_umo"，value = 冷却结束时间戳
         self._cooldowns: dict[str, float] = {}
 
+        # 发送队列：FIFO 队列，队列间隔 > 0 时消息不立即转发，而是由后台 worker
+        # 每隔设定秒数依次发送一条（与「冷却」的丢弃语义互补）
+        self._send_queue: asyncio.Queue = asyncio.Queue()
+        self._queue_worker_task: asyncio.Task | None = None
+
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
 
@@ -481,6 +488,7 @@ class MsgForward(star.Star):
         return f"{src} → {dst}"
 
     async def initialize(self):
+        self._queue_worker_task = asyncio.create_task(self._queue_worker())
         logger.info("MsgForward plugin init OK")
 
     @filter.command_group("mf")
@@ -509,7 +517,9 @@ class MsgForward(star.Star):
             "/mf filter        查看当前过滤与冷却配置\n"
             "/mf help          显示此帮助\n\n"
             "冷却转发：在规则配置中设置 cooldown_seconds > 0\n"
-            "转发一次后在该时间内不会再次转发，避免刷屏。"
+            "转发一次后在该时间内不会再次转发，避免刷屏。\n\n"
+            "发送队列：在规则配置中设置 queue_interval_seconds > 0\n"
+            "匹配的消息进入队列，每隔该秒数转发一条。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -657,7 +667,9 @@ class MsgForward(star.Star):
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
             cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
             cd_str = f"❄{cd}s" if int(cd) > 0 else ""
-            lines.append(f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str}".strip())
+            qi = self._queue_interval_for(r)
+            qi_str = f"⏳{qi}s" if qi > 0 else ""
+            lines.append(f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str} {qi_str}".strip())
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -774,8 +786,10 @@ class MsgForward(star.Star):
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
             cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
             cd_str = f"❄{cd}s" if int(cd) > 0 else ""
+            qi = self._queue_interval_for(r)
+            qi_str = f"⏳{qi}s" if qi > 0 else ""
             lines.append(
-                f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str}".strip()
+                f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str} {qi_str}".strip()
             )
         yield event.plain_result("\n".join(lines))
 
@@ -829,6 +843,19 @@ class MsgForward(star.Star):
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄{cd}s")
             elif cd is not None and int(cd) == 0:
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
+
+        # 显示发送队列配置
+        default_qi = self.config.get("default_queue_interval_seconds", 0)
+        qi_desc = f"{default_qi}s" if int(default_qi) > 0 else "关闭"
+        max_size = int(self.config.get("queue_max_size", 0) or 0)
+        max_desc = f"（上限 {max_size} 条）" if max_size > 0 else "（无上限）"
+        lines.append(f"\n📋 发送队列：全局默认 ⏳{qi_desc}{max_desc}")
+        for idx, r in enumerate(rules, start=1):
+            qi = r.get("queue_interval_seconds")
+            if qi is not None and int(qi) > 0:
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ⏳{qi}s")
+            elif qi is not None and int(qi) == 0:
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ⏳关闭")
 
         yield event.plain_result("\n".join(lines))
 
@@ -907,6 +934,92 @@ class MsgForward(star.Star):
             # "inherit" 或其他值 → 继承全局
         return bool(self.config.get("download_media_before_send", False))
 
+    def _queue_interval_for(self, rule: dict) -> int:
+        """解析某条规则生效的发送队列间隔（秒）。
+
+        规则未设置（键不存在）时继承全局 default_queue_interval_seconds；
+        显式设置为 0 时关闭队列（立即转发），语义与冷却字段一致。"""
+        val = rule.get("queue_interval_seconds")
+        if val is None:
+            val = self.config.get("default_queue_interval_seconds", 0)
+        try:
+            return int(val) if val else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _enqueue_send(self, target: str, result: MessageEventResult, interval: int,
+                      sanitized_chain, header_text: str, has_remote_media: bool,
+                      use_proxy: bool, proxy_url):
+        """把一次转发任务加入发送队列，交由后台 worker 按间隔依次发送。
+
+        同时保存兜底所需的信息，供发送失败时在 worker 内本地化媒体后重试。
+        若队列已达上限（queue_max_size > 0），则拒绝入队并记录警告。"""
+        max_size = self.config.get("queue_max_size", 0)
+        if max_size > 0 and self._send_queue.qsize() >= max_size:
+            logger.warning(
+                f"⚠️ 发送队列已满（上限 {max_size}），丢弃消息 → {target}"
+            )
+            return
+        self._send_queue.put_nowait({
+            "target": target,
+            "result": result,
+            "interval": max(0, interval),
+            "sanitized_chain": sanitized_chain,
+            "header_text": header_text,
+            "has_remote_media": has_remote_media,
+            "use_proxy": use_proxy,
+            "proxy_url": proxy_url,
+        })
+
+    async def _queue_worker(self):
+        """后台发送队列消费者：逐条发送，每发一条后按该条间隔休眠再发下一条。
+
+        单条消息发送失败（含异常）只记录日志、不影响后续消息；整体用外层兜底，
+        确保 worker 永不因单条消息或意外异常而退出，避免队列永久卡住。"""
+        while True:
+            try:
+                item = await self._send_queue.get()
+                try:
+                    await self._send_queued_item(item)
+                except Exception as e:
+                    logger.error(f"❌ 队列发送异常: {e}")
+                finally:
+                    self._send_queue.task_done()
+                interval = item.get("interval", 0)
+                if interval > 0:
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                # 插件终止（terminate 调用 task.cancel()）时正常退出，其余情况不让 worker 挂掉
+                raise
+            except Exception as e:
+                logger.error(f"❌ 队列 worker 异常，已恢复继续运行: {e!r}")
+                await asyncio.sleep(1)
+
+    async def _send_queued_item(self, item: dict):
+        """发送队列中的单条消息，失败时复用与立即转发一致的本地化兜底逻辑。"""
+        target = item["target"]
+        result = item["result"]
+        try:
+            await self.context.send_message(target, result)
+        except ValueError as e:
+            logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
+        except Exception as e:
+            if item.get("has_remote_media"):
+                try:
+                    localized = await _prepare_chain_fallback(
+                        item["sanitized_chain"],
+                        use_proxy=item["use_proxy"],
+                        proxy_url=item["proxy_url"],
+                    )
+                    fb_chain = localized if not item["header_text"] else \
+                        [Plain(text=item["header_text"])] + localized
+                    await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                    logger.warning(f"⚠️ 队列转发首次失败（{e}），已本地化媒体后重试成功")
+                except Exception as e2:
+                    logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e2}")
+            else:
+                logger.error(f"❌ 队列转发失败: {e}")
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def forward_message(self, event: AstrMessageEvent):
         """主转发逻辑"""
@@ -941,6 +1054,9 @@ class MsgForward(star.Star):
                     cooldown_sec = self.config.get("default_cooldown_seconds", 0)
                 cooldown_sec = int(cooldown_sec) if cooldown_sec else 0
 
+                # 发送队列间隔：> 0 时消息进入队列，由后台 worker 每隔该秒数发送一条
+                queue_interval = self._queue_interval_for(rule)
+
                 # 主消息链：默认透传（正常网络，媒体交给目标端自行处理）；
                 # 开启 download_media_before_send 时，发送前先本地化（原逻辑不变）。
                 if self._should_download_media(rule):
@@ -965,6 +1081,14 @@ class MsgForward(star.Star):
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
+                    # 队列模式：不立即发送，也不做冷却，统一交给后台 worker 按间隔依次转发
+                    if queue_interval > 0:
+                        self._enqueue_send(
+                            target, event.chain_result(new_chain), queue_interval,
+                            sanitized_chain, header_text, has_remote_media,
+                            use_proxy, proxy_url,
+                        )
+                        continue
                     if cooldown_sec > 0:
                         cd_key = f"{source_umo}|{target}"
                         cd_end = self._cooldowns.get(cd_key, 0)
@@ -998,4 +1122,6 @@ class MsgForward(star.Star):
             logger.error(f"❌ 转发逻辑异常: {e}")
 
     async def terminate(self):
+        if self._queue_worker_task is not None:
+            self._queue_worker_task.cancel()
         logger.info("MsgForward plugin terminated")
