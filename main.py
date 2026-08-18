@@ -3,6 +3,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import ssl
 import string
 import tempfile
@@ -245,6 +246,53 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
     return prepared
 
 
+async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: str | None = None):
+    """将消息链中的所有媒体本地化到插件自有临时目录，防止队列延迟后源端文件被清理。
+
+    优先用 AstrBot 核心 convert_to_file_path() 获取本地缓存路径（适配器层已缓存，
+    通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到 msg_forward_cc_media
+    自有目录，确保队列延迟后仍可访问。
+    """
+    if not chain:
+        return chain
+    prepared = []
+    tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for comp in chain:
+        if not isinstance(comp, (Image, Record, Video, File)):
+            prepared.append(comp)
+            continue
+        comp_type = _comp_type_name(comp)
+        try:
+            # 用 AstrBot 核心获取本地路径（适配器层已缓存，通常很快）
+            local_path = await comp.convert_to_file_path()
+            if local_path and os.path.isfile(local_path):
+                suffix = Path(local_path).suffix or ""
+                fd, dest = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
+                os.close(fd)
+                shutil.copy2(local_path, dest)
+                prepared.append(_rebuild_from_local_path(comp, dest))
+                continue
+        except Exception:
+            pass  # convert_to_file_path 失败，尝试远程 URL
+
+        # 回退：远程 URL 下载
+        remote_url = _extract_remote_url(comp)
+        if remote_url:
+            try:
+                local_path = await _download_url_to_local(comp, remote_url, use_proxy, proxy_url)
+                prepared.append(_rebuild_from_local_path(comp, local_path))
+                continue
+            except Exception as e:
+                logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
+                prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
+                continue
+
+        logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），无法获取文件，将以占位文本代替")
+        prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
+    return prepared
+
+
 def _sanitize_chain_for_forward(chain):
     """转发前清洗 @ 提及组件：只保留 @全体（all）与纯数字目标。
 
@@ -368,6 +416,7 @@ class MsgForward(star.Star):
         # 每隔设定秒数依次发送一条（与「冷却」的丢弃语义互补）
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._queue_worker_task: asyncio.Task | None = None
+        self._cleanup_task: asyncio.Task | None = None
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
@@ -489,6 +538,10 @@ class MsgForward(star.Star):
 
     async def initialize(self):
         self._queue_worker_task = asyncio.create_task(self._queue_worker())
+        # 启动时清理所有队列媒体缓存
+        self._cleanup_old_media()
+        # 启动定期清理任务
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
         logger.info("MsgForward plugin init OK")
 
     @filter.command_group("mf")
@@ -1000,6 +1053,7 @@ class MsgForward(star.Star):
 
         第一层降级：用 AstrBot 核心 downloader（convert_to_file_path）重新本地化所有
         媒体组件，覆盖因队列延迟导致源端临时文件路径/短效 URL 过期的问题；
+        超时保护（45s）防止 downloader 挂死阻塞队列；
         第二层降级：对远程 URL 媒体用裸 aiohttp 下载（_prepare_chain_fallback）兜底。"""
         target = item["target"]
         result = item["result"]
@@ -1010,11 +1064,32 @@ class MsgForward(star.Star):
         except Exception as e:
             # 第一层降级：AstrBot 核心重新本地化所有媒体（覆盖本地临时路径过期）
             try:
-                prepared = await _prepare_chain_for_forward(item["sanitized_chain"])
+                prepared = await asyncio.wait_for(
+                    _prepare_chain_for_forward(item["sanitized_chain"]),
+                    timeout=45,
+                )
                 fb_chain = prepared if not item["header_text"] else \
                     [Plain(text=item["header_text"])] + prepared
                 await self.context.send_message(target, MessageEventResult(chain=fb_chain))
                 logger.warning(f"⚠️ 队列转发首次失败（{e}），已重新本地化媒体后重试成功")
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ 队列转发：媒体本地化超时（45s），进入远程 URL 兜底")
+                # 第二层降级：远程 URL 媒体
+                if item.get("has_remote_media"):
+                    try:
+                        localized = await _prepare_chain_fallback(
+                            item["sanitized_chain"],
+                            use_proxy=item["use_proxy"],
+                            proxy_url=item["proxy_url"],
+                        )
+                        fb_chain = localized if not item["header_text"] else \
+                            [Plain(text=item["header_text"])] + localized
+                        await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                        logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
+                    except Exception as e3:
+                        logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
+                else:
+                    logger.error(f"❌ 队列转发失败: 媒体本地化超时且无远程 URL 可兜底")
             except Exception as e2:
                 # 第二层降级：原始兜底，仅处理远程 URL 媒体
                 if item.get("has_remote_media"):
@@ -1032,6 +1107,37 @@ class MsgForward(star.Star):
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
                 else:
                     logger.error(f"❌ 队列转发失败: {e2}")
+
+    def _cleanup_old_media(self):
+        """清理超过保留时间的媒体缓存文件。"""
+        retention_hours = int(self.config.get("queue_media_retention_hours", 0) or 0)
+        if retention_hours <= 0:
+            retention_hours = 24
+        tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+        if not tmp_dir.exists():
+            return
+        cutoff = time.time() - retention_hours * 3600
+        deleted = 0
+        for f in tmp_dir.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                try:
+                    f.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+        if deleted:
+            logger.info(f"🧹 已清理 {deleted} 个过期队列媒体缓存文件")
+
+    async def _periodic_cleanup(self):
+        """每小时清理一次过期媒体缓存。"""
+        while True:
+            try:
+                await asyncio.sleep(3600)
+                self._cleanup_old_media()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def forward_message(self, event: AstrMessageEvent):
@@ -1069,6 +1175,8 @@ class MsgForward(star.Star):
 
                 # 发送队列间隔：> 0 时消息进入队列，由后台 worker 每隔该秒数发送一条
                 queue_interval = self._queue_interval_for(rule)
+                if queue_interval > 0 and not self.config.get("queue_enabled", False):
+                    queue_interval = 0
 
                 # 主消息链：默认透传（正常网络，媒体交给目标端自行处理）；
                 # 开启 download_media_before_send 时，发送前先本地化（原逻辑不变）。
@@ -1094,11 +1202,17 @@ class MsgForward(star.Star):
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
-                    # 队列模式：不立即发送，也不做冷却，统一交给后台 worker 按间隔依次转发
+                    # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
                     if queue_interval > 0:
+                        # 队列模式下必须本地化媒体，防止源端临时文件延迟后被清理
+                        if prepared_chain is None:
+                            prepared_chain = await _prepare_chain_for_queue(
+                                sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url,
+                            )
+                        queue_chain = prepared_chain if not header_text else [Plain(text=header_text)] + prepared_chain
                         self._enqueue_send(
-                            target, event.chain_result(new_chain), queue_interval,
-                            sanitized_chain, header_text, has_remote_media,
+                            target, event.chain_result(queue_chain), queue_interval,
+                            prepared_chain, header_text, has_remote_media,
                             use_proxy, proxy_url,
                         )
                         continue
@@ -1115,21 +1229,29 @@ class MsgForward(star.Star):
                     except ValueError as e:
                         logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                     except Exception as e:
-                        # 自动降级：先用正常网络（上面已尝试），失败后把远程媒体下载到
-                        # 本地（下载器内部也是先正常网络、失败再 IPv4）再重试一次；仍失败才记录错误。
-                        if has_remote_media:
+                        # 第一层降级：AstrBot 核心重新本地化所有媒体
+                        try:
                             if fallback_chain is None:
-                                localized = await _prepare_chain_fallback(sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url)
-                                fallback_chain = localized if not header_text else [Plain(text=header_text)] + localized
-                            try:
-                                await self.context.send_message(target, event.chain_result(fallback_chain))
-                                logger.warning(f"⚠️ 转发首次失败（{e}），已本地化媒体后重试成功")
-                                if cooldown_sec > 0:
-                                    self._cooldowns[cd_key] = now + cooldown_sec
-                            except Exception as e2:
-                                logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e2}")
-                        else:
-                            logger.error(f"❌ 转发失败: {e}")
+                                prepared = await _prepare_chain_for_forward(sanitized_chain)
+                                fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
+                            await self.context.send_message(target, event.chain_result(fallback_chain))
+                            logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
+                            if cooldown_sec > 0:
+                                self._cooldowns[cd_key] = now + cooldown_sec
+                        except Exception as e2:
+                            # 第二层降级：远程 URL 媒体
+                            if has_remote_media:
+                                try:
+                                    localized = await _prepare_chain_fallback(sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url)
+                                    fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
+                                    await self.context.send_message(target, event.chain_result(fb_chain))
+                                    logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
+                                    if cooldown_sec > 0:
+                                        self._cooldowns[cd_key] = now + cooldown_sec
+                                except Exception as e3:
+                                    logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e3}")
+                            else:
+                                logger.error(f"❌ 转发失败: {e2}")
 
         except Exception as e:
             logger.error(f"❌ 转发逻辑异常: {e}")
@@ -1137,4 +1259,6 @@ class MsgForward(star.Star):
     async def terminate(self):
         if self._queue_worker_task is not None:
             self._queue_worker_task.cancel()
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
         logger.info("MsgForward plugin terminated")
