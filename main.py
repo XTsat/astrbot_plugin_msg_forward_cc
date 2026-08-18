@@ -159,60 +159,82 @@ async def _download_url_to_local(comp, url: str, use_proxy: bool = False, proxy_
 
 
 def _rebuild_from_local_path(comp, local_path: str):
-    """按本地文件路径重建组件（fromFileSystem）。"""
+    """按本地文件路径重建组件（fromFileSystem）。
+
+    注意：File/Video 重建时优先使用原始 URL（NapCat 通过 URL 下载），而非本地路径
+    （NapCat 读不到本地路径会报 retcode=1200 '路径不存在'）。
+    本地文件仅作为下载缓存保留在磁盘上。"""
     if isinstance(comp, Image):
         return Image.fromFileSystem(local_path)
     if isinstance(comp, Record):
         return Record.fromFileSystem(local_path)
     if isinstance(comp, Video):
-        # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达
+        # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达；
+        # 优先保留原始 URL，让目标端（NapCat）通过 URL 下载
+        url = getattr(comp, "url", None) or ""
+        if url:
+            return Video(file=url, url=url)
         return Video.fromFileSystem(local_path)
     if isinstance(comp, File):
-        # File 组件无 fromFileSystem 静态方法，直接用构造函数按本地路径重建，
-        # 保留原文件名方便目标平台显示。
+        # File 组件优先使用 URL（NapCat 通过 URL 下载），
+        # 无 URL 时降级为本地路径（从 local_path 缓存重建）
         name = getattr(comp, "name", None) or ""
+        url = getattr(comp, "url", None) or ""
+        if url:
+            return File(name=name, url=url)
         return File(name=name, file=local_path)
     return comp
 
 
-async def _rebuild_media_component(comp):
+async def _rebuild_media_component(comp, use_proxy: bool = False, proxy_url: str | None = None):
     """把媒体组件重新下载到本进程临时目录并以 fromFileSystem 重建。
 
-    解决跨会话转发时，组件内嵌的 file/cover 是源端临时路径、目标端不可达，导致 ENOENT / FileNotFoundError 的问题。失败时退化为 Plain 占位文本。"""
+    解决跨会话转发时，组件内嵌的 file/cover 是源端临时路径、目标端不可达，导致 ENOENT / FileNotFoundError 的问题。
+    注意：File 组件没有 convert_to_file_path()/fromFileSystem()，等价方法是 get_file() 与构造函数 File(name=..., file=...)。
+    如果本地文件不可用（如群文件未下载到本地），尝试从远程 URL 下载。
+    全部失败时退化为 Plain 占位文本，绝不向上抛异常影响整条转发。"""
+    comp_type = _comp_type_name(comp)
+    # 1) 先尝试获取本地文件路径（Image/Record/Video 用 convert_to_file_path；File 用 get_file）
     try:
-        local_path = await comp.convert_to_file_path()
-        if not local_path:
-            return comp
-        if isinstance(comp, Image):
-            return Image.fromFileSystem(local_path)
-        if isinstance(comp, Record):
-            return Record.fromFileSystem(local_path)
-        if isinstance(comp, Video):
-            # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达
-            return Video.fromFileSystem(local_path)
         if isinstance(comp, File):
-            # 保留原文件名（如存在），方便目标平台显示
-            name = getattr(comp, "name", None) or ""
+            # File 组件没有 convert_to_file_path()，等价方法是 get_file()（异步下载并返回本地路径）
+            local_path = await comp.get_file()
+        else:
+            local_path = await comp.convert_to_file_path()
+        if local_path:
             try:
-                return File.fromFileSystem(local_path, name=name) if name else File.fromFileSystem(local_path)
-            except TypeError:
-                # 旧版本 File.fromFileSystem 不接受 name 关键字
-                return File.fromFileSystem(local_path)
-        return comp
+                return _rebuild_from_local_path(comp, local_path)
+            except Exception as e:
+                logger.warning(f"⚠️ 按本地路径重建媒体失败（{comp_type}），尝试远程 URL 下载：{e}")
+        else:
+            logger.warning(f"⚠️ 获取文件路径返回空（{comp_type}），尝试远程 URL 下载")
     except Exception as e:
-        comp_type = getattr(getattr(comp, "type", None), "value", None) or type(comp).__name__
-        logger.warning(f"⚠️ 转发时重下载媒体失败（{comp_type}），将以占位文本代替：{e}")
-        return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
+        logger.warning(f"⚠️ 获取文件路径失败（{comp_type}），尝试远程 URL 下载：{e}")
+
+    # 2) 本地文件不可用，尝试从远程 URL 下载后重建
+    remote_url = _extract_remote_url(comp)
+    if remote_url:
+        try:
+            local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
+            try:
+                return _rebuild_from_local_path(comp, local_path)
+            except Exception as e:
+                logger.warning(f"⚠️ 按下载路径重建媒体失败（{comp_type}），将以占位文本代替：{e}")
+        except Exception as e:
+            logger.warning(f"⚠️ 转发时重下载媒体失败（{comp_type}，本地文件与远程下载均失败），将以占位文本代替：{e}")
+    else:
+        logger.warning(f"⚠️ 转发时重下载媒体失败（{comp_type}，无远程 URL 且本地文件不可用），将以占位文本代替")
+    return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
 
 
-async def _prepare_chain_for_forward(chain):
+async def _prepare_chain_for_forward(chain, use_proxy: bool = False, proxy_url: str | None = None):
     """转发前对消息链做「本地化」预处理，返回新的可安全跨会话发送的链。"""
     if not chain:
         return chain
     prepared = []
     for comp in chain:
         if isinstance(comp, (Image, Record, Video, File)):
-            prepared.append(await _rebuild_media_component(comp))
+            prepared.append(await _rebuild_media_component(comp, use_proxy=use_proxy, proxy_url=proxy_url))
         else:
             prepared.append(comp)
     return prepared
@@ -232,15 +254,29 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
         return chain
     prepared = []
     for comp in chain:
-        remote_url = _extract_remote_url(comp) if isinstance(comp, (Image, Record, Video, File)) else None
-        if remote_url:
-            comp_type = _comp_type_name(comp)
-            try:
-                local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
-                prepared.append(_rebuild_from_local_path(comp, local_path))
-            except Exception as e:
-                logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
-                prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
+        if isinstance(comp, (Image, Record, Video, File)):
+            remote_url = _extract_remote_url(comp)
+            if remote_url:
+                comp_type = _comp_type_name(comp)
+                try:
+                    local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
+                    prepared.append(_rebuild_from_local_path(comp, local_path))
+                except Exception as e:
+                    logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
+                    prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
+            else:
+                # 无远程 URL，尝试本地文件路径兜底（File 用 get_file，其余用 convert_to_file_path）
+                try:
+                    if isinstance(comp, File):
+                        local_path = await comp.get_file()
+                    else:
+                        local_path = await comp.convert_to_file_path()
+                    if local_path:
+                        prepared.append(_rebuild_from_local_path(comp, local_path))
+                    else:
+                        prepared.append(comp)
+                except Exception:
+                    prepared.append(comp)
         else:
             prepared.append(comp)
     return prepared
@@ -265,7 +301,11 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
         comp_type = _comp_type_name(comp)
         try:
             # 用 AstrBot 核心获取本地路径（适配器层已缓存，通常很快）
-            local_path = await comp.convert_to_file_path()
+            # 注意：File 组件没有 convert_to_file_path()，等价方法是 get_file()
+            if isinstance(comp, File):
+                local_path = await comp.get_file()
+            else:
+                local_path = await comp.convert_to_file_path()
             if local_path and os.path.isfile(local_path):
                 suffix = Path(local_path).suffix or ""
                 fd, dest = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
@@ -318,6 +358,39 @@ def _sanitize_chain_for_forward(chain):
             logger.info(f"⚠️ 转发时 @ 目标({qq_str!r})无法解析，已降级为文本 @{name}")
         else:
             logger.warning(f"⚠️ 转发时丢弃无效的 @ 目标: {qq_str!r}")
+    return cleaned
+
+
+def _sanitize_file_chain_for_forward(chain):
+    """清洗 File/Video 组件的本地路径引用，只保留 URL。
+
+    OneBot/NapCat 的 File/Video 组件 `file_`/`file` 常是源端容器内本地路径
+    （如 `/app/llbot/data/temp/...`），透传给目标端后 NapCat 读不到该路径，
+    报 retcode=1200 'rich media transfer failed'；仅保留 `url` 字段让 NapCat 走 URL 下载。
+    无 URL 的本地文件（如 base64/纯路径）原样保留。"""
+    if not chain:
+        return chain
+    cleaned = []
+    for comp in chain:
+        if isinstance(comp, File):
+            url = getattr(comp, "url", None) or ""
+            if url and url.startswith(("http://", "https://")):
+                name = getattr(comp, "name", None) or ""
+                cleaned.append(File(name=name, url=url))
+                continue
+            if not url:
+                name = getattr(comp, "name", None) or ""
+                file_ = getattr(comp, "file_", None) or ""
+                logger.warning(f"⚠️ 群文件 {name!r} 无远程 URL（file_={file_!r}），尝试 API 获取")
+        elif isinstance(comp, Video):
+            url = getattr(comp, "url", None) or ""
+            if url and url.startswith(("http://", "https://")):
+                # 保留 URL，清空本地路径（file 字段设为 url）
+                cleaned.append(Video(file=url, url=url))
+                continue
+            if not url:
+                logger.info(f"ℹ️ 视频无远程 URL（file={getattr(comp, 'file', '')!r}），NapCat 将尝试读取本地路径")
+        cleaned.append(comp)
     return cleaned
 
 
@@ -912,8 +985,80 @@ class MsgForward(star.Star):
 
         yield event.plain_result("\n".join(lines))
 
+    async def _resolve_file_urls(self, event: AstrMessageEvent, chain):
+        """为链中无 URL 的 File 组件尝试从原始 OneBot 消息获取下载 URL。
+
+        通过 `event.message_obj.raw_message` 获取原始 OneBot 消息段中的 `file_id`，
+        调用 `get_group_file_url` API 获取下载 URL，使 File 组件能通过 URL 转发
+        （而非本地路径，NapCat 读不到跨进程的容器内本地路径）。"""
+        umo = str(event.unified_msg_origin)
+        raw_event = getattr(event.message_obj, "raw_message", None)
+        if not raw_event or not isinstance(raw_event, dict):
+            return chain
+
+        raw_segments = raw_event.get("message")
+        if not isinstance(raw_segments, list):
+            return chain
+
+        # 从原始消息段中提取 file_path → url 映射
+        file_url_map = {}
+        for seg in raw_segments:
+            if seg.get("type") != "file":
+                continue
+            data = seg.get("data", {})
+            file_path = data.get("file", "")
+            url = data.get("url", "")
+            if url and url.startswith(("http://", "https://")):
+                file_url_map[file_path] = url
+            elif data.get("file_id"):
+                # 尝试调用 OneBot API 获取下载 URL
+                try:
+                    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
+                    parts = umo.split(":")
+                    group_id = parts[2] if len(parts) >= 3 and parts[1] == "GroupMessage" else None
+                    if not group_id:
+                        continue
+                    for platform in self.context.platform_manager.get_insts():
+                        if isinstance(platform, AiocqhttpAdapter):
+                            ret = await platform.bot.call_action(
+                                action="get_group_file_url",
+                                file_id=data["file_id"],
+                                group_id=group_id,
+                            )
+                            if ret and "url" in ret:
+                                file_url_map[file_path] = ret["url"]
+                                logger.info(f"ℹ️ 通过 get_group_file_url 获取到文件下载 URL")
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"⚠️ 调用 get_group_file_url 失败: {e}")
+
+        if not file_url_map:
+            return chain
+
+        # 替换链中无 URL 的 File 组件（有 URL 的用最新获取的 URL 替换，可能更有效/未过期）
+        cleaned = []
+        for comp in chain:
+            if isinstance(comp, File):
+                name = getattr(comp, "name", None) or ""
+                file_ = getattr(comp, "file_", None) or ""
+                url = getattr(comp, "url", None) or ""
+                if url and url.startswith(("http://", "https://")):
+                    new_url = file_url_map.get(name) or file_url_map.get(file_)
+                    if new_url and new_url != url:
+                        cleaned.append(File(name=name, url=new_url))
+                        continue
+                    cleaned.append(comp)
+                    continue
+                # 用文件名或 file_ 路径匹配（OneBot 消息段 file 字段可能是文件名或路径）
+                matched_url = file_url_map.get(name) or file_url_map.get(file_)
+                if matched_url:
+                    cleaned.append(File(name=name, url=matched_url))
+                    continue
+            cleaned.append(comp)
+        return cleaned
+
     def _should_forward(self, event: AstrMessageEvent, rule: dict = None) -> bool:
-        """根据过滤规则判断是否应该转发此消息，优先使用规则级配置"""
         # 确定生效的过滤模式和规则列表
         if rule:
             fm = rule.get("filter_mode", "inherit")
@@ -1001,7 +1146,7 @@ class MsgForward(star.Star):
             return 0
 
     def _enqueue_send(self, target: str, result: MessageEventResult, interval: int,
-                      sanitized_chain, header_text: str, has_remote_media: bool,
+                      sanitized_chain, header_text: str, has_media: bool,
                       use_proxy: bool, proxy_url):
         """把一次转发任务加入发送队列，交由后台 worker 按间隔依次发送。
 
@@ -1019,7 +1164,7 @@ class MsgForward(star.Star):
             "interval": max(0, interval),
             "sanitized_chain": sanitized_chain,
             "header_text": header_text,
-            "has_remote_media": has_remote_media,
+            "has_media": has_media,
             "use_proxy": use_proxy,
             "proxy_url": proxy_url,
         })
@@ -1075,7 +1220,7 @@ class MsgForward(star.Star):
             except asyncio.TimeoutError:
                 logger.warning(f"⚠️ 队列转发：媒体本地化超时（45s），进入远程 URL 兜底")
                 # 第二层降级：远程 URL 媒体
-                if item.get("has_remote_media"):
+                if item.get("has_media"):
                     try:
                         localized = await _prepare_chain_fallback(
                             item["sanitized_chain"],
@@ -1089,10 +1234,10 @@ class MsgForward(star.Star):
                     except Exception as e3:
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
                 else:
-                    logger.error(f"❌ 队列转发失败: 媒体本地化超时且无远程 URL 可兜底")
+                    logger.error(f"❌ 队列转发失败: 媒体本地化超时且无媒体可兜底")
             except Exception as e2:
                 # 第二层降级：原始兜底，仅处理远程 URL 媒体
-                if item.get("has_remote_media"):
+                if item.get("has_media"):
                     try:
                         localized = await _prepare_chain_fallback(
                             item["sanitized_chain"],
@@ -1152,6 +1297,10 @@ class MsgForward(star.Star):
             raw_chain = event.get_messages()
             # 清洗无效的 @ 提及，避免目标平台用空 uid 查询群成员导致超时（retcode=1200）
             sanitized_chain = _sanitize_chain_for_forward(raw_chain)
+            # 清洗 File 组件的本地路径：NapCat 读不到源端本地路径，仅保留 URL 走下载
+            sanitized_chain = _sanitize_file_chain_for_forward(sanitized_chain)
+            # 为无 URL 的 File 组件尝试从原始 OneBot 消息获取下载 URL（get_group_file_url）
+            sanitized_chain = await self._resolve_file_urls(event, sanitized_chain)
             # 开启 download_media_before_send 的规则本地化链，惰性构建一次供多条规则复用
             prepared_chain = None
             now = time.time()
@@ -1193,8 +1342,8 @@ class MsgForward(star.Star):
                     header_text = self._format_origin_header(event, source_umo) + "\n\n\u200b"
                 new_chain = message_chain if not header_text else [Plain(text=header_text)] + message_chain
 
-                # 是否含远程 URL 媒体（决定失败时是否值得本地化后重试）
-                has_remote_media = any(_extract_remote_url(c) for c in sanitized_chain)
+                # 是否含媒体组件（决定失败时是否值得本地化后重试）
+                has_media = any(isinstance(c, (Image, Record, Video, File)) for c in sanitized_chain)
                 # 规则级代理三态：use_proxy 关→直连；开且 proxy_url 空→系统代理；开且非空→该地址
                 use_proxy = bool(rule.get("use_proxy", False))
                 proxy_url = (rule.get("proxy_url") or "").strip() or None
@@ -1212,7 +1361,7 @@ class MsgForward(star.Star):
                         queue_chain = prepared_chain if not header_text else [Plain(text=header_text)] + prepared_chain
                         self._enqueue_send(
                             target, event.chain_result(queue_chain), queue_interval,
-                            prepared_chain, header_text, has_remote_media,
+                            prepared_chain, header_text, has_media,
                             use_proxy, proxy_url,
                         )
                         continue
@@ -1240,7 +1389,7 @@ class MsgForward(star.Star):
                                 self._cooldowns[cd_key] = now + cooldown_sec
                         except Exception as e2:
                             # 第二层降级：远程 URL 媒体
-                            if has_remote_media:
+                            if has_media:
                                 try:
                                     localized = await _prepare_chain_fallback(sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url)
                                     fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
