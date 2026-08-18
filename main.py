@@ -996,7 +996,11 @@ class MsgForward(star.Star):
                 await asyncio.sleep(1)
 
     async def _send_queued_item(self, item: dict):
-        """发送队列中的单条消息，失败时复用与立即转发一致的本地化兜底逻辑。"""
+        """发送队列中的单条消息，失败时先尝试重新本地化媒体再重试。
+
+        第一层降级：用 AstrBot 核心 downloader（convert_to_file_path）重新本地化所有
+        媒体组件，覆盖因队列延迟导致源端临时文件路径/短效 URL 过期的问题；
+        第二层降级：对远程 URL 媒体用裸 aiohttp 下载（_prepare_chain_fallback）兜底。"""
         target = item["target"]
         result = item["result"]
         try:
@@ -1004,21 +1008,30 @@ class MsgForward(star.Star):
         except ValueError as e:
             logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
         except Exception as e:
-            if item.get("has_remote_media"):
-                try:
-                    localized = await _prepare_chain_fallback(
-                        item["sanitized_chain"],
-                        use_proxy=item["use_proxy"],
-                        proxy_url=item["proxy_url"],
-                    )
-                    fb_chain = localized if not item["header_text"] else \
-                        [Plain(text=item["header_text"])] + localized
-                    await self.context.send_message(target, MessageEventResult(chain=fb_chain))
-                    logger.warning(f"⚠️ 队列转发首次失败（{e}），已本地化媒体后重试成功")
-                except Exception as e2:
-                    logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e2}")
-            else:
-                logger.error(f"❌ 队列转发失败: {e}")
+            # 第一层降级：AstrBot 核心重新本地化所有媒体（覆盖本地临时路径过期）
+            try:
+                prepared = await _prepare_chain_for_forward(item["sanitized_chain"])
+                fb_chain = prepared if not item["header_text"] else \
+                    [Plain(text=item["header_text"])] + prepared
+                await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                logger.warning(f"⚠️ 队列转发首次失败（{e}），已重新本地化媒体后重试成功")
+            except Exception as e2:
+                # 第二层降级：原始兜底，仅处理远程 URL 媒体
+                if item.get("has_remote_media"):
+                    try:
+                        localized = await _prepare_chain_fallback(
+                            item["sanitized_chain"],
+                            use_proxy=item["use_proxy"],
+                            proxy_url=item["proxy_url"],
+                        )
+                        fb_chain = localized if not item["header_text"] else \
+                            [Plain(text=item["header_text"])] + localized
+                        await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                        logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
+                    except Exception as e3:
+                        logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
+                else:
+                    logger.error(f"❌ 队列转发失败: {e2}")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def forward_message(self, event: AstrMessageEvent):
