@@ -46,6 +46,19 @@
             "hint": "开启后转发时不显示来源信息头，消息直接透传。",
             "default": false
           },
+          "image_send_mode": {
+            "description": "图片发送模式",
+            "type": "string",
+            "hint": "direct=直接发送（默认）；merged=仅向底层适配器为 aiocqhttp 的 QQ 群目标把普通图片消息作为原生合并转发发送，支持自定义平台实例 ID；其他目标、文本消息和已有合并消息仍直接发送。",
+            "default": "direct",
+            "options": ["direct", "merged"]
+          },
+          "image_batch_window_seconds": {
+            "description": "图片合并等待时间（秒）",
+            "type": "int",
+            "hint": "仅 image_send_mode=merged 时生效。同一来源、规则和目标在该时间内收到的普通图片会合成一份聊天记录发送。0=立即发送；未设置则继承全局值。",
+            "default": 5
+          },
           "filter_mode": {
             "description": "过滤模式",
             "type": "string",
@@ -89,6 +102,13 @@
             "type": "string",
             "hint": "仅 use_proxy 开启时生效。留空走 AstrBot 自带代理；填写则走该地址（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）。",
             "default": ""
+          },
+          "apng_disguise_mode": {
+            "description": "图片转发失败后用 APNG 伪装图兜底",
+            "type": "string",
+            "hint": "仅对本规则生效。inherit=继承全局设置；on_failure=图片转发失败（含常规降级全部失效）时，自动把图片换成 APNG 伪装图后重发；off=关闭。",
+            "default": "inherit",
+            "options": ["inherit", "on_failure", "off"]
           }
         }
       }
@@ -125,6 +145,12 @@
     "hint": "新建转发规则时的默认队列间隔。开启后，匹配规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条。0 或关闭则立即转发。每条规则可单独覆盖。",
     "default": 0
   },
+  "default_image_batch_window_seconds": {
+    "description": "默认图片合并等待时间（秒）",
+    "type": "int",
+    "hint": "仅合并图片模式生效。同一批图片等待该时间后一次性发送；0=关闭聚合并立即发送。每条规则可单独覆盖。",
+    "default": 5
+  },
   "queue_enabled": {
     "description": "启用发送队列",
     "type": "bool",
@@ -147,6 +173,51 @@
     "description": "发送媒体前先下载到本地",
     "type": "bool",
     "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
+    "default": false
+  },
+  "apng_disguise_mode": {
+    "description": "图片转发失败后用 APNG 伪装图兜底",
+    "type": "string",
+    "hint": "on_failure=图片转发失败（队列/合并转发/本地化重试全部失败）时，自动把图片换成「静态看图显示封面、浏览器或 APNG 播放器显示真图」的伪装 PNG 重发一次；off=关闭。每条规则可单独覆盖。⚠️ 平台若把图片强制转码成静态图，对方只会看到封面。",
+    "default": "on_failure",
+    "options": ["on_failure", "off"]
+  },
+  "apng_disguise_cover_mode": {
+    "description": "伪装图封面",
+    "type": "string",
+    "hint": "white=纯白封面（默认，最不显眼）；custom=使用下方自定义封面图片。",
+    "default": "white",
+    "options": ["white", "custom"]
+  },
+  "apng_disguise_cover_path": {
+    "description": "自定义封面图片路径",
+    "type": "string",
+    "hint": "仅「伪装图封面=自定义」时生效。支持 png/jpg/webp 等常见格式（需要 Pillow，AstrBot 自带）。文件不存在时自动回退纯白封面。",
+    "default": ""
+  },
+  "apng_disguise_cover_fit": {
+    "description": "自定义封面适配方式",
+    "type": "string",
+    "hint": "仅使用自定义封面时生效。pad=等比缩放并留白（默认）；crop=等比缩放填满并居中裁剪。",
+    "default": "pad",
+    "options": ["pad", "crop"]
+  },
+  "apng_disguise_max_edge": {
+    "description": "伪装图真图最长边（像素）",
+    "type": "int",
+    "hint": "0=保持原尺寸（默认）。设置后先把真图缩放到该最长边再伪装，用于压缩体积、降低被平台拦截的概率。",
+    "default": 0
+  },
+  "apng_disguise_loop": {
+    "description": "伪装图播放次数",
+    "type": "int",
+    "hint": "0=无限循环（默认，保证真图常驻画布）；N=播放 N 次。⚠️ 部分客户端在动画播完后会回落到封面图，建议保持 0。",
+    "default": 0
+  },
+  "apng_disguise_send_as_file": {
+    "description": "伪装图按文件发送",
+    "type": "bool",
+    "hint": "关闭时按图片发送（默认，对方无需操作即可看到动画）；开启时改用文件发送，原始字节不会被平台转码，但对方需要下载后用浏览器打开才能看到真图。",
     "default": false
   },
   "platform_name_map": {
