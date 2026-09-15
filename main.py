@@ -17,7 +17,9 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-from astrbot.core.message.components import At, Plain, Image, Record, Video, File
+from astrbot.core.message.components import (
+    At, Plain, Image, Record, Video, File, Forward, Node, Nodes,
+)
 from astrbot.core.message.message_event_result import MessageEventResult
 
 
@@ -64,6 +66,67 @@ _VALID_URL_EXT = {
     ".mp4", ".mov", ".mpg", ".mpeg", ".pdf", ".zip", ".bin",
 }
 
+_FORWARD_MAX_DEPTH = 3
+_FORWARD_MAX_NODES = 50
+_FORWARD_MAX_CONTENT_CHARS = 20000
+_IMAGE_BATCH_MAX_MESSAGES = 20
+
+# APNG 伪装图兜底：图片转发失败后，把图片换成「静态解码器看到封面、APNG 播放器看到真图」
+# 的伪装 PNG 再重发一次（平台若按静态图审核/转码即可放行）。
+_APNG_DISGUISE_MODES = ("off", "on_failure")
+
+
+def _load_apng_disguise_module():
+    """加载同目录的 apng_disguise 模块（兼容包内导入 / 同目录导入 / 按路径加载）。"""
+    try:
+        from . import apng_disguise as module  # AstrBot 以包形式加载插件时
+        return module
+    except Exception:
+        pass
+    try:
+        import apng_disguise as module  # 插件目录已在 sys.path 时
+        return module
+    except Exception:
+        pass
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "msg_forward_cc_apng_disguise",
+            Path(__file__).resolve().with_name("apng_disguise.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        logger.warning(f"⚠️ APNG 伪装模块加载失败，伪装兜底功能不可用：{e}")
+        return None
+
+
+_apng_disguise = _load_apng_disguise_module()
+
+
+def _make_disguised_file(src: str, dest: str, cover_path: str = "",
+                         max_edge: int = 0, loops: int = 0,
+                         cover_fit: str = "pad") -> str:
+    """同步生成伪装 APNG，供 asyncio.to_thread 调用。
+
+    返回 dest；当输入本身已是 APNG（无需二次伪装）时返回空字符串表示跳过。
+    """
+    if _apng_disguise is None:
+        return ""
+    data = Path(src).read_bytes()
+    if _apng_disguise.is_apng(data):
+        return ""
+    return _apng_disguise.write_disguised_apng(
+        src, dest,
+        cover_source=(cover_path or None),
+        max_edge=max(0, int(max_edge or 0)),
+        loops=max(0, int(loops or 0)),
+        cover_fit=cover_fit or "pad",
+        validate=True,
+    )
+
 
 def _comp_type_name(comp) -> str:
     """返回组件的可读类型名，用于日志与占位文本。"""
@@ -103,7 +166,57 @@ def _guess_media_ext(comp, url: str, content_type: str) -> str:
     return ".bin"
 
 
-async def _download_url_to_local(comp, url: str, use_proxy: bool = False, proxy_url: str | None = None) -> str:
+def _ensure_media_cache_dir(cache_dir: Path) -> Path:
+    """创建插件可控的共享媒体缓存目录。"""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.chmod(0o755)
+    return cache_dir
+
+
+def _create_media_cache_file(cache_dir: Path, suffix: str) -> tuple[int, str]:
+    """在共享缓存中创建 NapCat 可读的媒体文件。"""
+    cache_dir = _ensure_media_cache_dir(cache_dir)
+    fd, path = tempfile.mkstemp(suffix=suffix, dir=str(cache_dir))
+    os.chmod(path, 0o644)
+    return fd, path
+
+
+def _copy_media_to_cache(local_path: str, cache_dir: Path) -> str:
+    """将现有媒体复制到共享缓存，避免透传容器私有路径。"""
+    suffix = Path(local_path).suffix or ""
+    fd, dest = _create_media_cache_file(cache_dir, suffix)
+    os.close(fd)
+    try:
+        shutil.copyfile(local_path, dest)
+        os.chmod(dest, 0o644)
+    except Exception:
+        Path(dest).unlink(missing_ok=True)
+        raise
+    return dest
+
+
+def _cleanup_media_cache(cache_dir: Path, retention_hours: int,
+                         now: float | None = None) -> int:
+    """仅清理受控缓存根目录内的过期普通文件。"""
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return 0
+    cutoff = (time.time() if now is None else now) - retention_hours * 3600
+    deleted = 0
+    for path in cache_dir.iterdir():
+        if path.is_file() and path.stat().st_mtime < cutoff:
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                pass
+    return deleted
+
+
+async def _download_url_to_local(comp, url: str, cache_dir: Path,
+                                 use_proxy: bool = False,
+                                 proxy_url: str | None = None) -> str:
     """把远程媒体下载到本地临时目录，返回本地路径。
 
     先用正常网络（aiohttp 默认 AF_UNSPEC / happy eyeballs）尝试，失败后改用强制
@@ -150,30 +263,27 @@ async def _download_url_to_local(comp, url: str, use_proxy: bool = False, proxy_
         )
 
     suffix = _guess_media_ext(comp, url, content_type)
-    tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    fd, path = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    fd, path = _create_media_cache_file(cache_dir, suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(path, 0o644)
+    except Exception:
+        Path(path).unlink(missing_ok=True)
+        raise
     return path
 
 
 def _rebuild_from_local_path(comp, local_path: str):
     """按本地文件路径重建组件（fromFileSystem）。
 
-    注意：File/Video 重建时优先使用原始 URL（NapCat 通过 URL 下载），而非本地路径
-    （NapCat 读不到本地路径会报 retcode=1200 '路径不存在'）。
-    本地文件仅作为下载缓存保留在磁盘上。"""
+    Video 会清空源端封面并使用本地化后的文件；File 保持原有的 URL 优先策略。"""
     if isinstance(comp, Image):
         return Image.fromFileSystem(local_path)
     if isinstance(comp, Record):
         return Record.fromFileSystem(local_path)
     if isinstance(comp, Video):
-        # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达；
-        # 优先保留原始 URL，让目标端（NapCat）通过 URL 下载
-        url = getattr(comp, "url", None) or ""
-        if url:
-            return Video(file=url, url=url)
+        # 源端封面通常是跨进程不可达的临时路径，fromFileSystem 不会复用它。
         return Video.fromFileSystem(local_path)
     if isinstance(comp, File):
         # File 组件优先使用 URL（NapCat 通过 URL 下载），
@@ -186,7 +296,9 @@ def _rebuild_from_local_path(comp, local_path: str):
     return comp
 
 
-async def _rebuild_media_component(comp, use_proxy: bool = False, proxy_url: str | None = None):
+async def _rebuild_media_component(comp, cache_dir: Path,
+                                   use_proxy: bool = False,
+                                   proxy_url: str | None = None):
     """把媒体组件重新下载到本进程临时目录并以 fromFileSystem 重建。
 
     解决跨会话转发时，组件内嵌的 file/cover 是源端临时路径、目标端不可达，导致 ENOENT / FileNotFoundError 的问题。
@@ -203,7 +315,8 @@ async def _rebuild_media_component(comp, use_proxy: bool = False, proxy_url: str
             local_path = await comp.convert_to_file_path()
         if local_path:
             try:
-                return _rebuild_from_local_path(comp, local_path)
+                cached_path = _copy_media_to_cache(local_path, cache_dir)
+                return _rebuild_from_local_path(comp, cached_path)
             except Exception as e:
                 logger.warning(f"⚠️ 按本地路径重建媒体失败（{comp_type}），尝试远程 URL 下载：{e}")
         else:
@@ -215,7 +328,10 @@ async def _rebuild_media_component(comp, use_proxy: bool = False, proxy_url: str
     remote_url = _extract_remote_url(comp)
     if remote_url:
         try:
-            local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
+            local_path = await _download_url_to_local(
+                comp, remote_url, cache_dir,
+                use_proxy=use_proxy, proxy_url=proxy_url,
+            )
             try:
                 return _rebuild_from_local_path(comp, local_path)
             except Exception as e:
@@ -227,20 +343,26 @@ async def _rebuild_media_component(comp, use_proxy: bool = False, proxy_url: str
     return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
 
 
-async def _prepare_chain_for_forward(chain, use_proxy: bool = False, proxy_url: str | None = None):
+async def _prepare_chain_for_forward(chain, cache_dir: Path,
+                                     use_proxy: bool = False,
+                                     proxy_url: str | None = None):
     """转发前对消息链做「本地化」预处理，返回新的可安全跨会话发送的链。"""
     if not chain:
         return chain
     prepared = []
     for comp in chain:
         if isinstance(comp, (Image, Record, Video, File)):
-            prepared.append(await _rebuild_media_component(comp, use_proxy=use_proxy, proxy_url=proxy_url))
+            prepared.append(await _rebuild_media_component(
+                comp, cache_dir, use_proxy=use_proxy, proxy_url=proxy_url,
+            ))
         else:
             prepared.append(comp)
     return prepared
 
 
-async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str | None = None):
+async def _prepare_chain_fallback(chain, cache_dir: Path,
+                                  use_proxy: bool = False,
+                                  proxy_url: str | None = None):
     """把远程 URL 媒体下载到本地（内部先正常网络、失败再 IPv4），作为转发失败后的兜底链。
 
     仅处理引用远程 http(s) URL 的媒体组件（图片/语音/视频/文件），下载失败降级为
@@ -259,7 +381,10 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
             if remote_url:
                 comp_type = _comp_type_name(comp)
                 try:
-                    local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
+                    local_path = await _download_url_to_local(
+                        comp, remote_url, cache_dir,
+                        use_proxy=use_proxy, proxy_url=proxy_url,
+                    )
                     prepared.append(_rebuild_from_local_path(comp, local_path))
                 except Exception as e:
                     logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
@@ -272,7 +397,8 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
                     else:
                         local_path = await comp.convert_to_file_path()
                     if local_path:
-                        prepared.append(_rebuild_from_local_path(comp, local_path))
+                        cached_path = _copy_media_to_cache(local_path, cache_dir)
+                        prepared.append(_rebuild_from_local_path(comp, cached_path))
                     else:
                         prepared.append(comp)
                 except Exception:
@@ -282,18 +408,19 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
     return prepared
 
 
-async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: str | None = None):
+async def _prepare_chain_for_queue(chain, cache_dir: Path,
+                                   use_proxy: bool = False,
+                                   proxy_url: str | None = None):
     """将消息链中的所有媒体本地化到插件自有临时目录，防止队列延迟后源端文件被清理。
 
     优先用 AstrBot 核心 convert_to_file_path() 获取本地缓存路径（适配器层已缓存，
-    通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到 msg_forward_cc_media
-    自有目录，确保队列延迟后仍可访问。
+    通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到注入的
+    插件共享缓存目录，确保队列延迟后仍可访问。
     """
     if not chain:
         return chain
     prepared = []
-    tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_media_cache_dir(cache_dir)
     for comp in chain:
         if not isinstance(comp, (Image, Record, Video, File)):
             prepared.append(comp)
@@ -307,10 +434,7 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
             else:
                 local_path = await comp.convert_to_file_path()
             if local_path and os.path.isfile(local_path):
-                suffix = Path(local_path).suffix or ""
-                fd, dest = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
-                os.close(fd)
-                shutil.copy2(local_path, dest)
+                dest = _copy_media_to_cache(local_path, cache_dir)
                 prepared.append(_rebuild_from_local_path(comp, dest))
                 continue
         except Exception:
@@ -320,7 +444,9 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
         remote_url = _extract_remote_url(comp)
         if remote_url:
             try:
-                local_path = await _download_url_to_local(comp, remote_url, use_proxy, proxy_url)
+                local_path = await _download_url_to_local(
+                    comp, remote_url, cache_dir, use_proxy, proxy_url,
+                )
                 prepared.append(_rebuild_from_local_path(comp, local_path))
                 continue
             except Exception as e:
@@ -331,6 +457,15 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
         logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），无法获取文件，将以占位文本代替")
         prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
     return prepared
+
+
+def _onebot_forward_media_url(data: dict) -> str:
+    """Only accept a remote media URL from an expanded OneBot node."""
+    for key in ("url", "file"):
+        value = data.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+    return ""
 
 
 def _sanitize_chain_for_forward(chain):
@@ -479,6 +614,7 @@ class MsgForward(star.Star):
 
         self.data_dir = star.StarTools.get_data_dir("msg_forward_cc")
         self.pending_file = self.data_dir / "pending.json"
+        self.media_cache_dir = self.data_dir / "media_cache"
 
         self.store = MsgForwardStore(self.pending_file)
 
@@ -490,6 +626,8 @@ class MsgForward(star.Star):
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._queue_worker_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
+        # Pending QQ merged-image batches, keyed by source/rule/target.
+        self._image_batches: dict[str, dict] = {}
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
@@ -610,8 +748,9 @@ class MsgForward(star.Star):
         return f"{src} → {dst}"
 
     async def initialize(self):
+        _ensure_media_cache_dir(self.media_cache_dir)
         self._queue_worker_task = asyncio.create_task(self._queue_worker())
-        # 启动时清理所有队列媒体缓存
+        # 启动时清理过期的共享媒体缓存
         self._cleanup_old_media()
         # 启动定期清理任务
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
@@ -677,6 +816,7 @@ class MsgForward(star.Star):
                 "source_umo": source_umo,
                 "target_umo": target_umo,
                 "hide_header": hide_header,
+                "image_send_mode": "direct",
                 "enabled": True,
             })
             self.config["rules"] = rules
@@ -747,6 +887,7 @@ class MsgForward(star.Star):
                 "source_umo": source_umo,
                 "target_umo": target_umo,
                 "hide_header": hide_header,
+                "image_send_mode": "direct",
                 "enabled": True,
             })
             self.config["rules"] = rules
@@ -1145,9 +1286,484 @@ class MsgForward(star.Star):
         except (TypeError, ValueError):
             return 0
 
+    def _image_batch_window_for(self, rule: dict) -> int:
+        """Return the merged-image collection window in seconds."""
+        val = rule.get("image_batch_window_seconds")
+        if val is None:
+            val = self.config.get("default_image_batch_window_seconds", 5)
+        try:
+            return max(0, min(int(val), 300)) if val else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _is_aiocqhttp_group_target(self, target: str) -> bool:
+        """Resolve a UMO platform instance ID before enabling QQ merged forwarding."""
+        try:
+            platform_id, msg_type, _ = target.split(":", 2)
+        except ValueError:
+            return False
+        if msg_type != "GroupMessage":
+            return False
+        # Keep compatibility with UMO values that use the adapter type directly.
+        if platform_id.lower() == "aiocqhttp":
+            return True
+        try:
+            platform = self.context.get_platform_inst(platform_id)
+        except (AttributeError, TypeError):
+            return False
+        if platform is None:
+            return False
+        try:
+            return str(platform.meta().name).lower() == "aiocqhttp"
+        except (AttributeError, TypeError):
+            return False
+
+    @staticmethod
+    def _has_native_forward(chain) -> bool:
+        """Native forwarded messages must stay direct instead of being nested."""
+        return any(isinstance(comp, (Forward, Node, Nodes)) for comp in chain)
+
+    def _should_merge_images(self, rule: dict, target: str, message_chain) -> bool:
+        """Merged image forwarding is intentionally limited to QQ group targets."""
+        return (
+            rule.get("image_send_mode", "direct") == "merged"
+            and self._is_aiocqhttp_group_target(target)
+            and any(isinstance(comp, Image) for comp in message_chain)
+            and not self._has_native_forward(message_chain)
+        )
+
+    @staticmethod
+    def _is_batchable_image_chain(message_chain) -> bool:
+        """Batch ordinary image messages while leaving other media immediate."""
+        return (
+            any(isinstance(comp, Image) for comp in message_chain)
+            and all(isinstance(comp, (Plain, Image)) for comp in message_chain)
+        )
+
+    @staticmethod
+    def _make_merged_chain(message_chain, header_text: str,
+                           sender_name: str, sender_id) -> list:
+        """Build an AstrBot Nodes component for OneBot's native merged forward."""
+        content = list(message_chain)
+        if header_text:
+            content.insert(0, Plain(text=header_text))
+        return [Nodes(nodes=[Node(
+            name=str(sender_name or "转发消息"),
+            uin=str(sender_id or "0"),
+            content=content,
+        )])]
+
+    def _build_outbound_chain(self, event: AstrMessageEvent, source_umo: str,
+                              rule: dict, target: str, message_chain,
+                              direct_header_text: str, merged_header_text: str):
+        """Select direct or QQ-native merged forwarding for one target."""
+        if self._should_merge_images(rule, target, message_chain):
+            return self._make_merged_chain(
+                message_chain,
+                merged_header_text,
+                event.get_sender_name(),
+                event.get_sender_id(),
+            ), True
+        return (
+            message_chain if not direct_header_text
+            else [Plain(text=direct_header_text)] + message_chain
+        ), False
+
+    @staticmethod
+    def _build_queued_outbound_chain(item: dict, message_chain):
+        if item.get("merge_images"):
+            return MsgForward._make_merged_chain(
+                message_chain,
+                item.get("merged_header_text", ""),
+                item.get("merged_sender_name", ""),
+                item.get("merged_sender_id", "0"),
+            )
+        header_text = item.get("header_text", "")
+        return message_chain if not header_text else [Plain(text=header_text)] + message_chain
+
+    # ------------------------
+    # APNG 伪装图兜底（图片转发失败后自动重发）
+    # ------------------------
+
+    def _apng_disguise_mode(self, rule: dict | None) -> str:
+        """解析伪装图模式：规则级 inherit 时回退到全局设置。"""
+        mode = str((rule or {}).get("apng_disguise_mode", "inherit") or "inherit").lower()
+        if mode != "inherit" and mode not in _APNG_DISGUISE_MODES:
+            mode = "inherit"
+        if mode == "inherit":
+            mode = str(self.config.get("apng_disguise_mode", "on_failure") or "off").lower()
+        return mode if mode in _APNG_DISGUISE_MODES else "off"
+
+    def _can_disguise(self, rule: dict | None) -> bool:
+        """伪装模块可用且该规则开启了失败兜底。"""
+        return _apng_disguise is not None and self._apng_disguise_mode(rule) == "on_failure"
+
+    def _apng_disguise_options(self, rule: dict | None = None) -> dict:
+        """读取伪装图全局配置（封面 / 缩放 / 播放次数 / 发送形式）。"""
+        cover_mode = str(
+            self.config.get("apng_disguise_cover_mode", "white") or "white"
+        ).lower()
+        cover_path = ""
+        if cover_mode == "custom":
+            cover_path = str(self.config.get("apng_disguise_cover_path", "") or "").strip()
+            if cover_path and not Path(cover_path).is_file():
+                logger.warning(f"⚠️ 伪装图自定义封面不存在，已回退纯白封面：{cover_path}")
+                cover_path = ""
+        fit = str(self.config.get("apng_disguise_cover_fit", "pad") or "pad").lower()
+        if fit not in ("pad", "crop"):
+            fit = "pad"
+        try:
+            max_edge = int(self.config.get("apng_disguise_max_edge", 0) or 0)
+        except (TypeError, ValueError):
+            max_edge = 0
+        try:
+            loops = int(self.config.get("apng_disguise_loop", 0) or 0)
+        except (TypeError, ValueError):
+            loops = 0
+        return {
+            "cover_path": cover_path,
+            "max_edge": max(0, max_edge),
+            "loops": max(0, loops),
+            "cover_fit": fit,
+            "send_as_file": bool(self.config.get("apng_disguise_send_as_file", False)),
+        }
+
+    async def _disguise_image_component(self, comp, opts: dict):
+        """把单个 Image 组件替换为伪装 APNG；失败或跳过时返回 None（调用方保留原组件）。"""
+        if _apng_disguise is None:
+            return None
+        try:
+            local_path = await comp.convert_to_file_path()
+        except Exception as e:
+            logger.warning(f"⚠️ 伪装图兜底：获取图片本地文件失败：{e}")
+            return None
+        if not local_path or not Path(local_path).is_file():
+            logger.warning("⚠️ 伪装图兜底：图片本地文件不可用，跳过伪装")
+            return None
+        fd, dest = _create_media_cache_file(self.media_cache_dir, ".png")
+        os.close(fd)
+        try:
+            result = await asyncio.to_thread(
+                _make_disguised_file,
+                str(local_path), dest, opts["cover_path"],
+                opts["max_edge"], opts["loops"], opts["cover_fit"],
+            )
+        except Exception as e:
+            Path(dest).unlink(missing_ok=True)
+            logger.warning(f"⚠️ 伪装图兜底：生成伪装 APNG 失败：{e}")
+            return None
+        if not result:
+            Path(dest).unlink(missing_ok=True)
+            logger.info("ℹ️ 伪装图兜底：图片本身已是 APNG，跳过")
+            return None
+        if opts["send_as_file"]:
+            return File(name=Path(str(local_path)).with_suffix(".png").name, file=dest)
+        try:
+            return Image.fromFileSystem(dest)
+        except Exception as e:
+            logger.warning(f"⚠️ 伪装图兜底：重建图片组件失败：{e}")
+            return None
+
+    async def _disguise_chain_list(self, chain, opts: dict) -> tuple:
+        """递归替换链中的图片（含 QQ 合并转发的 Nodes 节点），返回 (新链, 替换数)。"""
+        out, replaced = [], 0
+        for comp in chain:
+            if isinstance(comp, Image):
+                new_comp = await self._disguise_image_component(comp, opts)
+                if new_comp is not None:
+                    out.append(new_comp)
+                    replaced += 1
+                else:
+                    out.append(comp)
+                continue
+            if isinstance(comp, Nodes):
+                nodes, sub_replaced = [], 0
+                for node in getattr(comp, "nodes", None) or []:
+                    content = getattr(node, "content", None)
+                    if not isinstance(content, list):
+                        nodes.append(node)
+                        continue
+                    new_content, count = await self._disguise_chain_list(content, opts)
+                    if count:
+                        nodes.append(Node(
+                            content=new_content,
+                            name=getattr(node, "name", "") or "",
+                            uin=getattr(node, "uin", "0") or "0",
+                        ))
+                        sub_replaced += count
+                    else:
+                        nodes.append(node)
+                if sub_replaced:
+                    out.append(Nodes(nodes=nodes))
+                    replaced += sub_replaced
+                else:
+                    out.append(comp)
+                continue
+            out.append(comp)
+        return out, replaced
+
+    async def _build_disguised_chain(self, chain, opts: dict):
+        """生成伪装链；没有任何图片被替换时返回 None。"""
+        if not chain:
+            return None
+        try:
+            new_chain, replaced = await self._disguise_chain_list(chain, opts)
+        except Exception as e:
+            logger.warning(f"⚠️ 伪装图兜底：处理消息链异常：{e}")
+            return None
+        return new_chain if replaced else None
+
+    async def _resend_with_disguise(self, target: str, apng_mode: str, chain,
+                                    build_result) -> bool:
+        """把链中的图片换成伪装 APNG 后重发；成功返回 True。"""
+        if _apng_disguise is None or apng_mode != "on_failure":
+            return False
+        opts = self._apng_disguise_options()
+        disguised = await self._build_disguised_chain(chain, opts)
+        if not disguised:
+            return False
+        try:
+            await self.context.send_message(target, build_result(disguised))
+        except Exception as e:
+            logger.error(f"❌ 使用 APNG 伪装图重发仍失败: {e}")
+            return False
+        logger.warning(
+            "⚠️ 图片转发失败，已改用 APNG 伪装图重发成功"
+            "（静态看图显示封面，浏览器 / APNG 播放器显示真图）"
+        )
+        return True
+
+    def _enqueue_image_batch(
+        self, key: str, target: str, message_chain, merged_header_text: str,
+        sender_name: str, sender_id, window_seconds: int,
+        cooldown_key: str | None = None, cooldown_seconds: int = 0,
+        apng_mode: str = "off",
+    ):
+        """Append one source image message and schedule one merged send."""
+        batches = getattr(self, "_image_batches", None)
+        if batches is None:
+            batches = self._image_batches = {}
+        batch = batches.get(key)
+        if batch is None:
+            batch = {
+                "target": target,
+                "nodes": [],
+                "cooldown_key": cooldown_key,
+                "cooldown_seconds": cooldown_seconds,
+                "apng_mode": apng_mode,
+                "task": None,
+            }
+            batches[key] = batch
+            batch["task"] = asyncio.create_task(
+                self._flush_image_batch_after(key, window_seconds)
+            )
+
+        content = list(message_chain)
+        if merged_header_text:
+            content.insert(0, Plain(text=merged_header_text))
+        batch["nodes"].append(Node(
+            name=str(sender_name or "转发消息"),
+            uin=str(sender_id or "0"),
+            content=content,
+        ))
+
+        if len(batch["nodes"]) >= _IMAGE_BATCH_MAX_MESSAGES:
+            task = batch.get("task")
+            if task is not None:
+                task.cancel()
+            batch["task"] = asyncio.create_task(self._flush_image_batch(key))
+
+    async def _flush_image_batch_after(self, key: str, window_seconds: int):
+        try:
+            await asyncio.sleep(window_seconds)
+            await self._flush_image_batch(key)
+        except asyncio.CancelledError:
+            return
+
+    async def _flush_image_batch(self, key: str):
+        batch = self._image_batches.pop(key, None)
+        if not batch or not batch.get("nodes"):
+            return
+        try:
+            await self.context.send_message(
+                batch["target"],
+                MessageEventResult(chain=[Nodes(nodes=batch["nodes"])]),
+            )
+            cooldown_seconds = batch.get("cooldown_seconds", 0)
+            cooldown_key = batch.get("cooldown_key")
+            if cooldown_seconds > 0 and cooldown_key:
+                self._cooldowns[cooldown_key] = time.time() + cooldown_seconds
+            logger.info(
+                f"🖼️ 图片批次已合并转发（{len(batch['nodes'])} 条）→ {batch['target']}"
+            )
+        except Exception as e:
+            # 最后兜底：批次内图片替换为 APNG 伪装图后重发
+            if await self._resend_disguised_batch(batch):
+                cooldown_seconds = batch.get("cooldown_seconds", 0)
+                cooldown_key = batch.get("cooldown_key")
+                if cooldown_seconds > 0 and cooldown_key:
+                    self._cooldowns[cooldown_key] = time.time() + cooldown_seconds
+                return
+            logger.error(f"❌ 图片批次合并转发失败: {e}")
+
+    async def _resend_disguised_batch(self, batch: dict) -> bool:
+        """图片合并转发失败后的最后兜底：伪装后重发整个合并消息。"""
+        def _build(chain):
+            return MessageEventResult(chain=chain)
+
+        return await self._resend_with_disguise(
+            batch["target"],
+            batch.get("apng_mode", "off"),
+            [Nodes(nodes=batch["nodes"])],
+            _build,
+        )
+
+    async def _expand_onebot_forward_segment(
+        self, segment: dict, event: AstrMessageEvent, state: dict,
+        use_proxy: bool, proxy_url: str | None,
+    ) -> list:
+        """Convert one OneBot node segment into shared-cache components."""
+        segment_type = str(segment.get("type") or "").lower()
+        data = segment.get("data")
+        data = data if isinstance(data, dict) else {}
+        if segment_type == "text":
+            text = str(data.get("text") or "")
+            remaining = _FORWARD_MAX_CONTENT_CHARS - state["content_chars"]
+            if remaining <= 0:
+                return [Plain(text="[合并转发内容过长，已截断]")]
+            state["content_chars"] += len(text)
+            return [Plain(text=text[:remaining])] if text else []
+        if segment_type in {"forward", "forward_msg"}:
+            forward_id = str(data.get("id") or data.get("message_id") or "").strip()
+            if not forward_id:
+                return [Plain(text="[合并转发嵌套消息缺少标识]")]
+            state["depth"] += 1
+            try:
+                return [await self._expand_onebot_forward(
+                    event, forward_id, state, use_proxy, proxy_url,
+                )]
+            finally:
+                state["depth"] -= 1
+
+        media_url = _onebot_forward_media_url(data)
+        if segment_type == "image":
+            component = Image.fromURL(media_url) if media_url else None
+        elif segment_type in {"record", "audio"}:
+            component = Record.fromURL(media_url) if media_url else None
+        elif segment_type == "video":
+            component = Video.fromURL(media_url) if media_url else None
+        elif segment_type == "file":
+            name = str(data.get("name") or "转发文件")
+            component = File(name=name, file=media_url, url=media_url) if media_url else None
+        else:
+            return [Plain(text=f"[不支持的合并转发消息段：{segment_type or '未知'}]")]
+
+        if component is None:
+            return [Plain(text=f"[{segment_type}转发失败：媒体地址不可用]")]
+        try:
+            local_path = await _download_url_to_local(
+                component, media_url, self.media_cache_dir,
+                use_proxy=use_proxy, proxy_url=proxy_url,
+            )
+            return [_rebuild_from_local_path(component, local_path)]
+        except Exception as e:
+            logger.warning(f"⚠️ 合并转发媒体本地化失败（{segment_type}）: {e}")
+            return [Plain(text=f"[{segment_type}转发失败：媒体不可达]")]
+
+    async def _expand_onebot_forward(
+        self, event: AstrMessageEvent, forward_id: str, state: dict,
+        use_proxy: bool, proxy_url: str | None,
+    ):
+        """Fetch a OneBot merged-forward tree and rebuild it as AstrBot Nodes."""
+        if state["depth"] >= _FORWARD_MAX_DEPTH:
+            return Plain(text="[合并转发层级过深，已截断]")
+        if not forward_id or forward_id in state["seen"]:
+            return Plain(text="[合并转发存在循环或重复引用，已截断]")
+
+        platform_id = event.get_platform_id()
+        platform = self.context.get_platform_inst(platform_id) if platform_id else None
+        client = platform.get_client() if platform is not None else None
+        call_action = getattr(client, "call_action", None)
+        if not callable(call_action):
+            logger.warning("⚠️ 合并转发无法展开：aiocqhttp 客户端不可用")
+            return Plain(text="[合并转发无法展开：OneBot API 不可用]")
+
+        state["seen"].add(forward_id)
+        try:
+            raw = await call_action("get_forward_msg", id=forward_id)
+        except Exception as e:
+            logger.warning(f"⚠️ 拉取合并转发失败: {e}")
+            return Plain(text="[合并转发无法展开：原消息不可获取]")
+
+        if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+            raw = raw["data"]
+        messages = raw.get("messages") if isinstance(raw, dict) else raw
+        if not isinstance(messages, list):
+            return Plain(text="[合并转发无法展开：返回格式无效]")
+
+        nodes = []
+        for entry in messages:
+            if state["nodes"] >= _FORWARD_MAX_NODES:
+                nodes.append(Node(content=[Plain(text="[合并转发节点过多，已截断]")],
+                                  name="合并转发", uin="0"))
+                break
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("data") if entry.get("type") == "node" else entry
+            if not isinstance(payload, dict):
+                continue
+            sender = payload.get("sender")
+            sender = sender if isinstance(sender, dict) else {}
+            name = str(
+                sender.get("nickname") or sender.get("card") or sender.get("name")
+                or payload.get("name") or "未知发送者"
+            )
+            uin = str(
+                sender.get("user_id") or sender.get("uin") or sender.get("qq")
+                or payload.get("user_id") or payload.get("uin") or "0"
+            )
+            content = payload.get("content", payload.get("message"))
+            if isinstance(content, str):
+                content = [{"type": "text", "data": {"text": content}}]
+            if not isinstance(content, list):
+                node_content = [Plain(text="[合并转发节点内容不可用]")]
+            else:
+                node_content = []
+                for child in content:
+                    if isinstance(child, dict):
+                        node_content.extend(await self._expand_onebot_forward_segment(
+                            child, event, state, use_proxy, proxy_url,
+                        ))
+                if not node_content:
+                    node_content = [Plain(text="[合并转发节点为空]")]
+            nodes.append(Node(content=node_content, name=name, uin=uin))
+            state["nodes"] += 1
+
+        return Nodes(nodes=nodes) if nodes else Plain(text="[合并转发无法展开：没有可用节点]")
+
+    async def _expand_forward_chain_for_qq(
+        self, chain, event: AstrMessageEvent,
+        use_proxy: bool = False, proxy_url: str | None = None,
+    ):
+        """Expand source-session Forward ids only for a QQ group target."""
+        if event.get_platform_name() != "aiocqhttp":
+            return chain
+        state = {"depth": 0, "nodes": 0, "content_chars": 0, "seen": set()}
+        expanded = []
+        for comp in chain:
+            if isinstance(comp, Forward):
+                expanded.append(await self._expand_onebot_forward(
+                    event, str(comp.id), state, use_proxy, proxy_url,
+                ))
+            else:
+                expanded.append(comp)
+        return expanded
+
     def _enqueue_send(self, target: str, result: MessageEventResult, interval: int,
                       sanitized_chain, header_text: str, has_media: bool,
-                      use_proxy: bool, proxy_url):
+                      use_proxy: bool, proxy_url, merge_images: bool = False,
+                      merged_header_text: str = "", merged_sender_name: str = "",
+                      merged_sender_id="0", apng_mode: str = "off"):
         """把一次转发任务加入发送队列，交由后台 worker 按间隔依次发送。
 
         同时保存兜底所需的信息，供发送失败时在 worker 内本地化媒体后重试。
@@ -1167,6 +1783,11 @@ class MsgForward(star.Star):
             "has_media": has_media,
             "use_proxy": use_proxy,
             "proxy_url": proxy_url,
+            "merge_images": merge_images,
+            "merged_header_text": merged_header_text,
+            "merged_sender_name": merged_sender_name,
+            "merged_sender_id": merged_sender_id,
+            "apng_mode": apng_mode,
         })
 
     async def _queue_worker(self):
@@ -1210,11 +1831,12 @@ class MsgForward(star.Star):
             # 第一层降级：AstrBot 核心重新本地化所有媒体（覆盖本地临时路径过期）
             try:
                 prepared = await asyncio.wait_for(
-                    _prepare_chain_for_forward(item["sanitized_chain"]),
+                    _prepare_chain_for_forward(
+                        item["sanitized_chain"], self.media_cache_dir,
+                    ),
                     timeout=45,
                 )
-                fb_chain = prepared if not item["header_text"] else \
-                    [Plain(text=item["header_text"])] + prepared
+                fb_chain = self._build_queued_outbound_chain(item, prepared)
                 await self.context.send_message(target, MessageEventResult(chain=fb_chain))
                 logger.warning(f"⚠️ 队列转发首次失败（{e}），已重新本地化媒体后重试成功")
             except asyncio.TimeoutError:
@@ -1224,14 +1846,17 @@ class MsgForward(star.Star):
                     try:
                         localized = await _prepare_chain_fallback(
                             item["sanitized_chain"],
+                            self.media_cache_dir,
                             use_proxy=item["use_proxy"],
                             proxy_url=item["proxy_url"],
                         )
-                        fb_chain = localized if not item["header_text"] else \
-                            [Plain(text=item["header_text"])] + localized
+                        fb_chain = self._build_queued_outbound_chain(item, localized)
                         await self.context.send_message(target, MessageEventResult(chain=fb_chain))
                         logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
                     except Exception as e3:
+                        # 第三层降级：APNG 伪装图重发
+                        if await self._try_resend_disguised_queued(item, target):
+                            return
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
                 else:
                     logger.error(f"❌ 队列转发失败: 媒体本地化超时且无媒体可兜底")
@@ -1241,37 +1866,38 @@ class MsgForward(star.Star):
                     try:
                         localized = await _prepare_chain_fallback(
                             item["sanitized_chain"],
+                            self.media_cache_dir,
                             use_proxy=item["use_proxy"],
                             proxy_url=item["proxy_url"],
                         )
-                        fb_chain = localized if not item["header_text"] else \
-                            [Plain(text=item["header_text"])] + localized
+                        fb_chain = self._build_queued_outbound_chain(item, localized)
                         await self.context.send_message(target, MessageEventResult(chain=fb_chain))
                         logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
                     except Exception as e3:
+                        # 第三层降级：APNG 伪装图重发
+                        if await self._try_resend_disguised_queued(item, target):
+                            return
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
                 else:
                     logger.error(f"❌ 队列转发失败: {e2}")
+
+    async def _try_resend_disguised_queued(self, item: dict, target: str) -> bool:
+        """队列发送失败后的最后兜底：图片替换为 APNG 伪装图重发。"""
+        def _build(chain):
+            return MessageEventResult(chain=self._build_queued_outbound_chain(item, chain))
+
+        return await self._resend_with_disguise(
+            target, item.get("apng_mode", "off"), item["sanitized_chain"], _build,
+        )
 
     def _cleanup_old_media(self):
         """清理超过保留时间的媒体缓存文件。"""
         retention_hours = int(self.config.get("queue_media_retention_hours", 0) or 0)
         if retention_hours <= 0:
             retention_hours = 24
-        tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
-        if not tmp_dir.exists():
-            return
-        cutoff = time.time() - retention_hours * 3600
-        deleted = 0
-        for f in tmp_dir.iterdir():
-            if f.is_file() and f.stat().st_mtime < cutoff:
-                try:
-                    f.unlink()
-                    deleted += 1
-                except OSError:
-                    pass
+        deleted = _cleanup_media_cache(self.media_cache_dir, retention_hours)
         if deleted:
-            logger.info(f"🧹 已清理 {deleted} 个过期队列媒体缓存文件")
+            logger.info(f"🧹 已清理 {deleted} 个过期媒体缓存文件")
 
     async def _periodic_cleanup(self):
         """每小时清理一次过期媒体缓存。"""
@@ -1331,23 +1957,32 @@ class MsgForward(star.Star):
                 # 开启 download_media_before_send 时，发送前先本地化（原逻辑不变）。
                 if self._should_download_media(rule):
                     if prepared_chain is None:
-                        prepared_chain = await _prepare_chain_for_forward(sanitized_chain)
+                        prepared_chain = await _prepare_chain_for_forward(
+                            sanitized_chain, self.media_cache_dir,
+                        )
                     message_chain = prepared_chain
                 else:
                     message_chain = sanitized_chain
 
-                # 来源头（hide_header 时为空，不前置）
+                # 直发保持既有头部格式；合并转发把同一来源信息放进 QQ 合并节点。
                 header_text = ""
+                merged_header_text = ""
                 if not rule.get("hide_header", False):
-                    header_text = self._format_origin_header(event, source_umo) + "\n\n\u200b"
-                new_chain = message_chain if not header_text else [Plain(text=header_text)] + message_chain
+                    origin_header = self._format_origin_header(event, source_umo)
+                    header_text = origin_header + "\n\n\u200b"
+                    merged_header_text = origin_header + "\n\n"
 
                 # 是否含媒体组件（决定失败时是否值得本地化后重试）
                 has_media = any(isinstance(c, (Image, Record, Video, File)) for c in sanitized_chain)
                 # 规则级代理三态：use_proxy 关→直连；开且 proxy_url 空→系统代理；开且非空→该地址
                 use_proxy = bool(rule.get("use_proxy", False))
                 proxy_url = (rule.get("proxy_url") or "").strip() or None
-                fallback_chain = None
+                fallback_message_chain = None
+                expanded_forward_chain = None
+                batch_message_chain = None
+                image_batch_window = self._image_batch_window_for(rule)
+                # APNG 伪装图兜底模式（规则级 inherit → 全局），供失败时重发使用
+                apng_mode = self._apng_disguise_mode(rule)
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
@@ -1356,13 +1991,30 @@ class MsgForward(star.Star):
                         # 队列模式下必须本地化媒体，防止源端临时文件延迟后被清理
                         if prepared_chain is None:
                             prepared_chain = await _prepare_chain_for_queue(
-                                sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url,
+                                sanitized_chain, self.media_cache_dir,
+                                use_proxy=use_proxy, proxy_url=proxy_url,
                             )
-                        queue_chain = prepared_chain if not header_text else [Plain(text=header_text)] + prepared_chain
+                        target_chain = prepared_chain
+                        expands_forward = (
+                            self._is_aiocqhttp_group_target(target)
+                            and any(isinstance(comp, Forward) for comp in target_chain)
+                        )
+                        if expands_forward:
+                            if expanded_forward_chain is None:
+                                expanded_forward_chain = await self._expand_forward_chain_for_qq(
+                                    target_chain, event, use_proxy, proxy_url,
+                                )
+                            target_chain = expanded_forward_chain
+                        queue_chain, merge_images = self._build_outbound_chain(
+                            event, source_umo, rule, target, target_chain,
+                            header_text, merged_header_text,
+                        )
                         self._enqueue_send(
                             target, event.chain_result(queue_chain), queue_interval,
-                            prepared_chain, header_text, has_media,
-                            use_proxy, proxy_url,
+                            target_chain, header_text, has_media,
+                            use_proxy, proxy_url, merge_images, merged_header_text,
+                            event.get_sender_name(), event.get_sender_id(),
+                            apng_mode,
                         )
                         continue
                     if cooldown_sec > 0:
@@ -1370,19 +2022,70 @@ class MsgForward(star.Star):
                         cd_end = self._cooldowns.get(cd_key, 0)
                         if now < cd_end:
                             continue
+                    else:
+                        cd_key = None
+
+                    if (
+                        queue_interval == 0
+                        and image_batch_window > 0
+                        and self._should_merge_images(rule, target, message_chain)
+                        and self._is_batchable_image_chain(message_chain)
+                    ):
+                        if batch_message_chain is None:
+                            batch_message_chain = await _prepare_chain_for_queue(
+                                sanitized_chain, self.media_cache_dir,
+                                use_proxy=use_proxy, proxy_url=proxy_url,
+                            )
+                        batch_key = f"{source_umo}|{idx}|{target}"
+                        self._enqueue_image_batch(
+                            batch_key,
+                            target,
+                            batch_message_chain,
+                            merged_header_text,
+                            event.get_sender_name(),
+                            event.get_sender_id(),
+                            image_batch_window,
+                            cooldown_key=cd_key,
+                            cooldown_seconds=cooldown_sec,
+                            apng_mode=apng_mode,
+                        )
+                        continue
+                    target_chain = message_chain
+                    expands_forward = (
+                        self._is_aiocqhttp_group_target(target)
+                        and any(isinstance(comp, Forward) for comp in target_chain)
+                    )
+                    if expands_forward:
+                        if expanded_forward_chain is None:
+                            expanded_forward_chain = await self._expand_forward_chain_for_qq(
+                                target_chain, event, use_proxy, proxy_url,
+                            )
+                        target_chain = expanded_forward_chain
                     try:
-                        await self.context.send_message(target, event.chain_result(new_chain))
+                        outbound_chain, _ = self._build_outbound_chain(
+                            event, source_umo, rule, target, target_chain,
+                            header_text, merged_header_text,
+                        )
+                        await self.context.send_message(target, event.chain_result(outbound_chain))
                         # 转发成功后设置冷却
                         if cooldown_sec > 0:
                             self._cooldowns[cd_key] = now + cooldown_sec
                     except ValueError as e:
                         logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                     except Exception as e:
+                        if expands_forward:
+                            logger.error(f"❌ 已展开的合并转发发送失败，不重用源会话标识重试: {e}")
+                            continue
                         # 第一层降级：AstrBot 核心重新本地化所有媒体
                         try:
-                            if fallback_chain is None:
-                                prepared = await _prepare_chain_for_forward(sanitized_chain)
-                                fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
+                            if fallback_message_chain is None:
+                                fallback_message_chain = await _prepare_chain_for_forward(
+                                    sanitized_chain, self.media_cache_dir,
+                                )
+                            fallback_chain, _ = self._build_outbound_chain(
+                                event, source_umo, rule, target, fallback_message_chain,
+                                header_text, merged_header_text,
+                            )
                             await self.context.send_message(target, event.chain_result(fallback_chain))
                             logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
                             if cooldown_sec > 0:
@@ -1391,14 +2094,36 @@ class MsgForward(star.Star):
                             # 第二层降级：远程 URL 媒体
                             if has_media:
                                 try:
-                                    localized = await _prepare_chain_fallback(sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url)
-                                    fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
+                                    localized = await _prepare_chain_fallback(
+                                        sanitized_chain, self.media_cache_dir,
+                                        use_proxy=use_proxy, proxy_url=proxy_url,
+                                    )
+                                    fb_chain, _ = self._build_outbound_chain(
+                                        event, source_umo, rule, target, localized,
+                                        header_text, merged_header_text,
+                                    )
                                     await self.context.send_message(target, event.chain_result(fb_chain))
                                     logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
                                     if cooldown_sec > 0:
                                         self._cooldowns[cd_key] = now + cooldown_sec
                                 except Exception as e3:
-                                    logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e3}")
+                                    # 第三层降级：图片替换为 APNG 伪装图后重发
+                                    def _build_disguised_result(chain):
+                                        fb, _ = self._build_outbound_chain(
+                                            event, source_umo, rule, target, chain,
+                                            header_text, merged_header_text,
+                                        )
+                                        return event.chain_result(fb)
+
+                                    if await self._resend_with_disguise(
+                                        target, apng_mode,
+                                        fallback_message_chain or sanitized_chain,
+                                        _build_disguised_result,
+                                    ):
+                                        if cooldown_sec > 0:
+                                            self._cooldowns[cd_key] = now + cooldown_sec
+                                    else:
+                                        logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e3}")
                             else:
                                 logger.error(f"❌ 转发失败: {e2}")
 
@@ -1406,6 +2131,11 @@ class MsgForward(star.Star):
             logger.error(f"❌ 转发逻辑异常: {e}")
 
     async def terminate(self):
+        for batch in getattr(self, "_image_batches", {}).values():
+            task = batch.get("task")
+            if task is not None:
+                task.cancel()
+        getattr(self, "_image_batches", {}).clear()
         if self._queue_worker_task is not None:
             self._queue_worker_task.cancel()
         if self._cleanup_task is not None:

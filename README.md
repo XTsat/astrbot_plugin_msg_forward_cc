@@ -25,6 +25,8 @@
 - **转发冷却**：全局默认与规则级冷却时间，避免刷屏。
 - **发送队列**：全局默认与规则级队列间隔，匹配消息进入队列后每隔设定时间转发一条。
 - **媒体转发（失败自动降级）**：发送失败时自动下载远程媒体到本地重试。
+- **APNG 伪装图兜底**：图片转发失败（含常规降级全部失效）时，自动把图片换成「静态看图显示封面、浏览器/APNG 播放器显示真图」的伪装 PNG 再重发一次，用于绕过按静态图审核或拒收图片的平台。
+- **QQ 图片合并转发**：规则可选将普通图片消息作为 QQ 原生合并转发发送到 aiocqhttp 群目标；默认收集 5 秒内的连续图片并合成一份聊天记录，同时保留每条消息的文字与来源信息。
 
 ### 🚀 快速开始
 
@@ -70,6 +72,8 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 | `source_umo` | 消息来源会话标识，**每行一条**，可填多个（任一命中即触发转发） |
 | `target_umo` | 消息目标会话标识，**每行一条**，可填多个（消息会转发到其中的每一个） |
 | `hide_header` | 是否隐藏来源信息头 |
+| `image_send_mode` | 图片发送模式：`direct` 直接发送（默认）；`merged` 仅底层适配器为 aiocqhttp 的 QQ 群目标把普通图片消息作为原生合并转发发送，支持自定义平台实例 ID |
+| `image_batch_window_seconds` | 图片合并等待时间（秒），仅 `merged` 生效；未设置继承全局值，0 表示立即发送 |
 | `filter_mode` | 过滤模式（inherit=继承全局） |
 | `filter_patterns` | 过滤规则列表（留空=继承全局），每项 `regex:表达式` 或关键词 |
 | `queue_interval_seconds` | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
@@ -131,7 +135,23 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 
 > **@ 提及清洗**：转发前会清洗 `@` 提及组件——仅保留 `@全体成员`（`all`）与纯数字目标；空目标直接丢弃，非数字目标（如官方 Bot 的 openid、`qq_official` 等）降级为纯文本 `@昵称`。跨会话转发时源会话的 @ 目标在目标会话通常无法解析，若原样透传，目标平台（如 OneBot/NapCat）会用空 ID 查询群成员，导致内核调用超时（`retcode=1200 invoke timeout`），使整个转发失败。
 >
-> **媒体失败自动降级**：转发默认透传；若发送失败且消息含远程 URL 媒体，自动下载到本地重试一次（先正常网络、失败再 IPv4）；开启「发送媒体前先下载到本地」或队列模式时，本地化失败（如群文件未下载到本地）也会自动尝试从远程 URL 下载重建。下载仍失败则降级为 `[xxx转发失败：源文件不可达]` 占位文本。
+> **图片发送模式**：`direct` 为默认值，保持原有直接发送行为。选择 `merged` 时，插件会按 UMO 的平台实例 ID 查询 AstrBot 已注册平台；只有其底层适配器为 aiocqhttp、目标为群聊且消息链含普通图片时，才会使用 AstrBot 的 `Node` / `Nodes` 组件发送 QQ 原生合并转发。因此 `滑了个稽:GroupMessage:*` 这类自定义实例 ID 同样可用。图片附带的文字和来源信息会放入合并记录。文本消息、QQ 私聊、未找到实例、其它适配器，以及已是原生合并转发的消息都安全回退为直发，不会重复嵌套。
+>
+> **图片聚合窗口**：合并图片模式默认等待 5 秒。同一来源、同一规则和同一目标在窗口内收到的普通图片消息会各自保留发送者与说明，并作为多个节点一次性发送；单批最多 20 条。视频、文件、语音、原生聊天记录及启用发送队列的规则不参与聚合。规则可用 `image_batch_window_seconds` 覆盖全局值，设置为 0 可恢复每条图片立即发送。
+>
+> **媒体失败自动降级**：转发默认透传；若发送失败且消息含远程 URL 媒体，自动下载到本地重试一次（先正常网络、失败再 IPv4）；开启「发送媒体前先下载到本地」或队列模式时，本地化失败（如群文件未下载到本地）也会自动尝试从远程 URL 下载重建。远程视频本地化成功后会使用本地文件路径构造 `Video` 组件；下载仍失败则降级为 `[xxx转发失败：源文件不可达]` 占位文本。
+>
+> **APNG 伪装图兜底**：直发、队列发送与 QQ 图片合并转发三条链路在「本地化重试」也失败后，如果开启 `apng_disguise_mode`（默认 `on_failure`），插件会把链中的图片逐张换成**伪装 PNG** 再重发一次：文件里 `IDAT` 是封面图（默认纯白），真图作为 APNG 动画帧放在 `fdAT` 中。按 APNG 规范，此时静态默认图就是封面——静态看图软件、平台审核与转码只会看到封面，而浏览器（Chrome/Edge）与支持 APNG 的客户端会播放出真图。
+>
+> - 覆盖范围：普通图片、QQ 合并转发节点内的图片；语音/视频/文件不受影响；本身已是 APNG 的图片会跳过，不会二次伪装。
+> - 可选项：自定义封面（`apng_disguise_cover_mode` / `apng_disguise_cover_path`，支持 pad 留白与 crop 填满裁剪）、真图最长边限制（`apng_disguise_max_edge`）、播放次数（`apng_disguise_loop`，0=无限循环，建议保持 0）、按文件发送（`apng_disguise_send_as_file`，字节不被平台转码，但对方需下载后用浏览器查看）。
+> - 生成走线程池（不阻塞事件循环），产物写入共享媒体缓存目录，并通过结构自检（块 CRC、`acTL`/`fcTL`/`fdAT` 数量与序号）后才发送。
+> - 体积：伪装图必须是 PNG（无损），同等像素下天然比原 JPEG 大约 5 倍，这是该手法的固有代价。插件会自动做**无损瘦身**：没有真实透明像素的图改用 RGB、三通道完全相等的图改用灰度，像素值不变（实测照片类图约省 6%）。若需要更小体积可设置 `apng_disguise_max_edge`（如 1920 约降到 1/3、1280 约降到 1/5，代价是分辨率被缩小）。
+> - ⚠️ 前提与限制：伪装生效依赖「平台按静态图审核、且不重新编码图片」。若目标平台把图片统一转码为静态图（如转 JPEG），对方只会看到封面图；此时可改用文件发送。本功能仅用于让被误拦截的图片能被正常转发，请遵守各平台规则。
+>
+> **共享媒体缓存**：所有即时本地化、失败重试和队列媒体都写入 `StarTools.get_data_dir("msg_forward_cc") / "media_cache"`。在 AstrBot 与 NapCat 将同一数据卷挂载为 `/AstrBot/data` 的部署中，两端会解析到同一路径。缓存目录为 `0755`，新建媒体文件为 `0644`；定时清理只处理该缓存根目录内的过期文件。
+>
+> **QQ 合并转发展开**：来自 aiocqhttp 的 `Forward` 组件发送到 QQ 群时，插件会通过 OneBot `get_forward_msg` 获取原节点并重建为 `Nodes`，保留每个节点可用的昵称和用户标识。嵌套深度、节点数和总文本长度均有限制；原消息过期、内层不可获取、媒体不可达或单个节点异常时，仅以中文占位文本替代对应部分，不影响其余节点或规则。已有 `Nodes` 不会再次展开或嵌套。
 
 </details>
 
@@ -195,8 +215,16 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，否则=关键词） |
 | `default_cooldown_seconds` | int | `0` | 默认转发冷却时间（秒），每条规则可单独覆盖 |
 | `default_queue_interval_seconds` | int | `0` | 默认发送队列间隔（秒），开启后消息进入队列每隔该秒数转发一条，每条规则可单独覆盖 |
+| `default_image_batch_window_seconds` | int | `5` | 合并图片模式的默认聚合窗口；0=关闭聚合并立即发送，每条规则可单独覆盖 |
 | `queue_max_size` | int | `0` | 发送队列最大长度，0=不限制；达到上限后新消息被丢弃（记录日志），队列中已有的消息不受影响 |
 | `download_media_before_send` | bool | `false` | 发送前先将媒体下载到本地，跨设备转发找不到文件时开启，每条规则可单独覆盖 |
+| `apng_disguise_mode` | string | `on_failure` | 图片转发失败后是否用 APNG 伪装图兜底：on_failure=失败后自动伪装重发；off=关闭。每条规则可单独覆盖 |
+| `apng_disguise_cover_mode` | string | `white` | 伪装图封面：white=纯白；custom=使用自定义封面图片 |
+| `apng_disguise_cover_path` | string | 空 | 自定义封面图片路径（封面=自定义时生效），文件不存在时回退纯白 |
+| `apng_disguise_cover_fit` | string | `pad` | 自定义封面适配方式：pad=等比留白；crop=填满裁剪 |
+| `apng_disguise_max_edge` | int | `0` | 伪装图真图最长边（像素），0=保持原尺寸 |
+| `apng_disguise_loop` | int | `0` | 伪装图播放次数，0=无限循环（推荐，保证真图常驻） |
+| `apng_disguise_send_as_file` | bool | `false` | 伪装图改用文件发送（字节不被平台转码，对方需下载后用浏览器查看） |
 
 #### `rules` 每条规则包含
 
@@ -207,11 +235,14 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `source_umo` | text | 消息来源会话标识，每行一条，可填多个（任一命中即触发转发） |
 | `target_umo` | text | 消息目标会话标识，每行一条，可填多个（消息会转发到其中的每一个） |
 | `hide_header` | bool | 是否隐藏来源信息头 |
+| `image_send_mode` | string | 图片发送模式，`direct`（默认）直接发送；`merged` 仅底层适配器为 aiocqhttp 的 QQ 群目标把普通图片消息作为原生合并转发发送，支持自定义平台实例 ID |
+| `image_batch_window_seconds` | int | 合并图片等待时间（秒），未设置继承全局值，0=立即发送 |
 | `filter_mode` | string | 过滤模式（inherit=继承全局），支持 inherit/off/blacklist/whitelist |
 | `filter_patterns` | list | 过滤规则列表（留空=继承全局），每项格式：`regex:表达式` 或 关键词 |
 | `cooldown_seconds` | int | 转发冷却时间（秒），0 或不填则继承全局默认值 |
 | `queue_interval_seconds` | int | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `download_media_before_send` | string | 是否在发送媒体前先下载到本地（inherit=继承全局），支持 inherit/true/false |
+| `apng_disguise_mode` | string | 图片转发失败后用 APNG 伪装图兜底（inherit=继承全局），支持 inherit/on_failure/off |
 
 #### `platform_name_map` 默认值
 
@@ -772,10 +803,16 @@ astrbot/
          ├─ logo.png
          ├─ _conf_schema.json
          ├─ main.py
+         ├─ apng_disguise.py
          ├─ metadata.yaml
          ├─ README.md
+         ├─ tests/
+         │  ├─ test_apng_disguise.py
+         │  └─ test_image_send_mode.py
          └─ requirements.txt
 ```
+
+> `apng_disguise.py` 是 APNG 伪装图生成器：核心逻辑只用标准库（`struct`/`zlib`），仅当输入不是 8-bit 非隔行 PNG 或需要缩放时才使用 Pillow（AstrBot 自带）。它同时提供 `validate_apng()` 结构自检，供失败兜底发送前校验产物。
 
 同时，插件会建立 `astrbot/data/plugin_data/msg_forward_cc` 目录以存储持久化数据：
 

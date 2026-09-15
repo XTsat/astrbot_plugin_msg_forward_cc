@@ -11,6 +11,8 @@
 | 文件 | 职责 |
 |------|------|
 | `main.py` | 插件主体，全部逻辑（988 行） |
+| `apng_disguise.py` | APNG 伪装图生成器 + 结构自检（纯标准库核心，可选 Pillow） |
+| `tests/` | unittest + pytest 用例（`test_image_send_mode.py`、`test_apng_disguise.py`） |
 | `_conf_schema.json` | WebUI 配置 Schema（131 行） |
 | `metadata.yaml` | 插件元数据（v0.4.1，支持 aiocqhttp/wechatpadpro/telegram/discord） |
 | `README.md` | 中文文档 |
@@ -37,17 +39,28 @@
 - `_prepare_chain_fallback(chain, use_proxy=False, proxy_url=None)`：转发失败后的兜底链，仅本地化远程 URL 媒体（用 `_download_url_to_local`，代理三态同上），失败降级占位文本
 - `load_json` / `save_json`：健壮的文件读写，带详细错误日志（FileNotFoundError/JSONDecodeError/OSError 分类处理）
 - `gen_code(n=6)`：用 `secrets` 生成绑定码（小写字母+数字）
+- `_load_apng_disguise_module()`：按「包内相对导入 → 同目录导入 → 按文件路径加载」三档加载同目录 `apng_disguise.py`，全部失败时返回 None 并告警（伪装兜底自动禁用，绝不影响正常转发）
+- `_make_disguised_file(src, dest, cover_path, max_edge, loops, cover_fit)`：同步生成伪装 APNG（在线程池中调用）；输入已是 APNG 时返回空串表示跳过
 
-### 2. 存储层 `MsgForwardStore`
+### 2. APNG 伪装图模块 `apng_disguise.py`
+
+- 原理：`IDAT` 放封面图（默认纯白），第一个 `fcTL` 出现在 `IDAT` 之后（IDAT 退化为静态默认图），真图作为第 0 帧放进 `fdAT` 整幅覆盖，再补一个 1×1 占位帧凑成 2 帧动画。静态解码器只看到封面，APNG 播放器（浏览器等）显示真图
+- 纯标准库核心：`parse_png`（反滤波解析 8-bit 非隔行 PNG）/ `encode_png` / `build_disguised_apng` / `validate_apng`（CRC、块顺序、`acTL` 帧数与 `fcTL`/`fdAT` 序号自检）/ `is_apng`
+- 可选 Pillow：非 PNG 输入（jpg/webp/gif…）、`max_edge` 缩放、自定义封面适配（`pad` 等比留白 / `crop` 填满裁剪）时惰性 import；无 Pillow 时仅支持 8-bit PNG 且封面需与真图同尺寸
+- 无损瘦身 `_select_color_type`：RGBA 但没有真实透明像素（alpha 全 255）→ 降为 RGB（6→2），RGB 且三通道全等 → 降为灰度（2→0），像素值完全不变；自定义封面用 `target_color_type` 强制跟随真图颜色类型（否则会因颜色类型不一致抛错）
+- 对外入口：`make_disguised_apng(...)` 返回字节、`write_disguised_apng(...)` 原子写入（临时文件 + `os.replace`，`0644`）
+- `loops=0` 为无限循环（默认，保证真图常驻画布）；播放次数 > 0 时部分客户端在动画结束后会回落显示封面
+
+### 3. 存储层 `MsgForwardStore`
 
 - 维护 `pending.json`，提供 `load_pending / save_pending / add_pending / pop_pending`（pop 不存在的 code 抛 KeyError）
 
-### 3. 插件主体 `MsgForward(star.Star)`
+### 4. 插件主体 `MsgForward(star.Star)`
 
 - `__init__`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、store、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 冷却结束时间戳）
 - `_format_origin_header(event, umo)`：生成来源信息头。解析 UMO 三字段；平台友好名从 `platform_name_map` 配置（合并内置默认映射，覆盖全部 AstrBot 官方适配器与常见社区适配器，见 `_conf_schema.json`）；消息类型映射 GroupMessage→群组、FriendMessage→私聊；支持 `header_template` 模板变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式
 
-### 4. 命令（`/mf` 前缀）
+### 5. 命令（`/mf` 前缀）
 
 | 命令 | 权限 | 功能 |
 |------|------|------|
@@ -64,7 +77,7 @@
 
 **bindraw 解析逻辑**（`build_umo`）：plat 小写化，以 `s` 结尾 → FriendMessage 并去掉 `s`；`default` 或空 → `default` 平台；`len(plat_key) > 3` 时直接用原字符串作为平台标识；ID 末尾 `s` 且平台无 `s` 后缀时也转私聊。
 
-### 5. 主转发逻辑 `forward_message`
+### 6. 主转发逻辑 `forward_message`
 
 - 监听 `@filter.event_message_type(filter.EventMessageType.ALL)` 全部消息
 - 匹配 source_umo 相同的所有规则，逐规则：
@@ -73,10 +86,11 @@
   3. 主链：默认透传 `sanitized_chain`（正常网络，媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
   4. 构造消息链：`hide_header` 为 true 直接透传；否则前置来源头（末尾加 `\n\n\u200b` 零宽空格避免连续换行问题）
   5. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳
-  6. 失败自动降级：发送失败且消息含远程 URL 媒体时，用 `_prepare_chain_fallback` 本地化后重试一次；仍失败记录错误
+  6. 失败自动降级：发送失败且消息含远程 URL 媒体时，用 `_prepare_chain_fallback` 本地化后重试一次；仍失败时若该规则的 `apng_disguise_mode=on_failure`，则调用 `_resend_with_disguise` 把链中图片换成 APNG 伪装图重发（第三层降级，成功同样写入冷却）
+- 其余两条发送链路同样带伪装兜底：发送队列 `_send_queued_item`（末尾调用 `_try_resend_disguised_queued`，模式随队列项 `apng_mode` 传递）与 QQ 图片合并转发 `_flush_image_batch`（失败后调用 `_resend_disguised_batch`，可替换 Nodes 节点内的图片）
 - 异常分类记录日志（ValueError = 非法 session 字符串），单规则失败不影响其他规则
 
-### 6. 过滤系统
+### 7. 过滤系统
 
 - 模式：`off`（不过滤）/ `blacklist`（命中不转发）/ `whitelist`（命中才转发）
 - 模式优先级：规则级 `filter_mode`（inherit → 全局 `filter_mode`）> 全局
@@ -84,7 +98,7 @@
 - 条目解析 `_parse_filter_item`：`regex:` 前缀 → 正则（`re.search`），否则关键词（小写包含匹配，不区分大小写）
 - `_unwrap_patterns`：兼容 text（按行拆分）和 template_list（取 dict 的 `rule` 字段）两种配置格式
 
-### 7. 配置 Schema 字段（_conf_schema.json）
+### 8. 配置 Schema 字段（_conf_schema.json）
 
 - `default_hide_header`（bool，false）：新建规则默认隐藏来源头
 - `rules`（template_list，模板 `rule`：source_umo/target_umo/hide_header/filter_mode[inherit|off|blacklist|whitelist]/filter_patterns/cooldown_seconds）
@@ -93,6 +107,10 @@
 - `filter_mode`（string，off）、`filter_patterns`（text，每行一条）
 - `default_cooldown_seconds`（int，0）
 - `download_media_before_send`（bool，false）：发送前媒体先下载到本地
+- `apng_disguise_mode`（string，on_failure）：图片转发失败后用 APNG 伪装图兜底（on_failure/off）
+- `apng_disguise_cover_mode`（string，white）+ `apng_disguise_cover_path`（string，空）+ `apng_disguise_cover_fit`（string，pad）：伪装图封面（纯白/自定义，pad 留白 / crop 填满）
+- `apng_disguise_max_edge`（int，0）、`apng_disguise_loop`（int，0）、`apng_disguise_send_as_file`（bool，false）：真图最长边、播放次数（0=无限循环）、按文件发送
+- `rules[].apng_disguise_mode`（string，inherit）：规则级覆盖，inherit/on_failure/off
 - `rules[].use_proxy`（bool，false）+ `rules[].proxy_url`（string，空）：规则级媒体下载代理三态——use_proxy 关→直连；开且 proxy_url 空→走 AstrBot 自带代理（系统环境变量）；开且非空→走该地址（如 `http://127.0.0.1:7890`）
 
 ## 已知设计细节与注意点
@@ -103,6 +121,9 @@
 - 转发对同一 source 的规则是循环顺序执行，无并发锁；存储层注释「无锁简化」
 - 媒体转发默认不下载（`download_media_before_send=false`），跨设备转发提示找不到文件时才开启
 - 媒体失败自动降级：转发默认透传（正常网络），发送失败且含远程 URL 媒体时用 `_prepare_chain_fallback` 本地化后重试一次（下载器内部先正常网络、失败再 IPv4）；下载仍失败降级为占位文本
+- APNG 伪装兜底（第三层降级）：仅在「图片转发失败」后触发，逐张图片本地化 → 生成伪装 APNG（线程池，不阻塞事件循环）→ 写入共享媒体缓存 → 替换为 `Image.fromFileSystem`（`apng_disguise_send_as_file` 时替换为 `File`）→ 重发一次；任一环节失败都只记日志并保留原链，绝不影响原有降级行为
+- APNG 伪装的生效前提是「目标平台按静态图审核且不重编码图片」；平台若统一转码为静态图，对方只会看到封面，此时应改用 `apng_disguise_send_as_file`（文件发送不转码，但对方需下载后用浏览器打开）
+- Pillow 只在使用非 PNG 输入 / 缩放 / 自定义封面时被惰性使用（AstrBot 自带）；缺失时伪装模块退化为仅支持 8-bit PNG 输入 + 纯白封面
 - 自定义下载器把媒体写入系统临时目录 `msg_forward_cc_media` 子目录，暂不做清理（与 AstrBot 自身临时文件行为一致）
 
 ## 开发约束
@@ -114,4 +135,4 @@
 - 配置文件改动后必须调用 `self.config.save_config()`
 - 回复消息统一用 `yield event.plain_result(...)`
 - 权限控制：管理类命令加 `@filter.permission_type(filter.PermissionType.ADMIN)`
-- 不引入新依赖，纯标准库（json/re/secrets/time/pathlib/string/tempfile/ssl/socket/urllib）+ AstrBot API；`aiohttp` / `certifi` 在 `_download_url_to_local` 内惰性 import（AstrBot 运行时已自带，仅用于兜底媒体下载，import 失败时降级为占位文本，不影响其余功能）
+- 不引入新依赖，纯标准库（json/re/secrets/time/pathlib/string/tempfile/ssl/socket/urllib）+ AstrBot API；`aiohttp` / `certifi` 在 `_download_url_to_local` 内惰性 import（AstrBot 运行时已自带，仅用于兜底媒体下载，import 失败时降级为占位文本，不影响其余功能）；`PIL`（Pillow，AstrBot 自带）仅在 `apng_disguise.py` 的非 PNG 输入 / 缩放 / 自定义封面路径惰性 import，缺失时该功能自动降级而不是报错
