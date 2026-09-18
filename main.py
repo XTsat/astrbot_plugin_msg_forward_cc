@@ -150,7 +150,7 @@ async def _download_url_to_local(comp, url: str, use_proxy: bool = False, proxy_
         )
 
     suffix = _guess_media_ext(comp, url, content_type)
-    tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+    tmp_dir = _get_media_cache_dir()
     tmp_dir.mkdir(parents=True, exist_ok=True)
     fd, path = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
     with os.fdopen(fd, "wb") as f:
@@ -158,18 +158,24 @@ async def _download_url_to_local(comp, url: str, use_proxy: bool = False, proxy_
     return path
 
 
-def _rebuild_from_local_path(comp, local_path: str):
+def _rebuild_from_local_path(comp, local_path: str, keep_local: bool = False):
     """按本地文件路径重建组件（fromFileSystem）。
 
     注意：File/Video 重建时优先使用原始 URL（NapCat 通过 URL 下载），而非本地路径
     （NapCat 读不到本地路径会报 retcode=1200 '路径不存在'）。
-    本地文件仅作为下载缓存保留在磁盘上。"""
+    本地文件仅作为下载缓存保留在磁盘上。
+    队列场景（keep_local=True）：保留本地路径（fromFileSystem / file=本地路径），
+    由发送前的 _prepare_chain_for_media_urls 注册 AstrBot 文件服务 token，
+    生成短时稳定 URL（跨容器可下载、发送时实时注册不过期）。"""
     if isinstance(comp, Image):
         return Image.fromFileSystem(local_path)
     if isinstance(comp, Record):
         return Record.fromFileSystem(local_path)
     if isinstance(comp, Video):
-        # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达；
+        # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达
+        if keep_local:
+            # 保留本地路径（path 字段），发送前注册文件服务 URL
+            return Video.fromFileSystem(local_path)
         # 优先保留原始 URL，让目标端（NapCat）通过 URL 下载
         url = getattr(comp, "url", None) or ""
         if url:
@@ -179,6 +185,9 @@ def _rebuild_from_local_path(comp, local_path: str):
         # File 组件优先使用 URL（NapCat 通过 URL 下载），
         # 无 URL 时降级为本地路径（从 local_path 缓存重建）
         name = getattr(comp, "name", None) or ""
+        if keep_local:
+            # 保留本地路径（file_ 字段），发送前注册文件服务 URL
+            return File(name=name, file=local_path)
         url = getattr(comp, "url", None) or ""
         if url:
             return File(name=name, url=url)
@@ -286,13 +295,13 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
     """将消息链中的所有媒体本地化到插件自有临时目录，防止队列延迟后源端文件被清理。
 
     优先用 AstrBot 核心 convert_to_file_path() 获取本地缓存路径（适配器层已缓存，
-    通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到 msg_forward_cc_media
-    自有目录，确保队列延迟后仍可访问。
+    通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到 AstrBot data 目录下的
+    msg_forward_cc_media 自有目录（持久化，重启不丢），确保队列延迟后仍可访问。
     """
     if not chain:
         return chain
     prepared = []
-    tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+    tmp_dir = _get_media_cache_dir()
     tmp_dir.mkdir(parents=True, exist_ok=True)
     for comp in chain:
         if not isinstance(comp, (Image, Record, Video, File)):
@@ -311,7 +320,9 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
                 fd, dest = tempfile.mkstemp(suffix=suffix, dir=str(tmp_dir))
                 os.close(fd)
                 shutil.copy2(local_path, dest)
-                prepared.append(_rebuild_from_local_path(comp, dest))
+                # keep_local=True：保留本地路径，发送前由 _prepare_chain_for_media_urls
+                # 注册 AstrBot 文件服务 token 生成跨容器可下载的 URL
+                prepared.append(_rebuild_from_local_path(comp, dest, keep_local=True))
                 continue
         except Exception:
             pass  # convert_to_file_path 失败，尝试远程 URL
@@ -321,7 +332,7 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
         if remote_url:
             try:
                 local_path = await _download_url_to_local(comp, remote_url, use_proxy, proxy_url)
-                prepared.append(_rebuild_from_local_path(comp, local_path))
+                prepared.append(_rebuild_from_local_path(comp, local_path, keep_local=True))
                 continue
             except Exception as e:
                 logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
@@ -331,6 +342,179 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
         logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），无法获取文件，将以占位文本代替")
         prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
     return prepared
+
+
+# ------------------------
+# AstrBot 内置文件服务（跨容器媒体 URL）
+# ------------------------
+
+# 队列媒体缓存目录：AstrBot data 目录下持久化子目录（重启/重载不丢文件）
+# 实际路径由插件 __init__ 按 data_dir 设置（StarTools.get_data_dir）
+_MEDIA_CACHE_DIR: Path | None = None
+
+
+def _get_media_cache_dir() -> Path:
+    """返回队列媒体缓存目录（AstrBot data 目录下，持久化）。"""
+    global _MEDIA_CACHE_DIR
+    if _MEDIA_CACHE_DIR is not None:
+        return _MEDIA_CACHE_DIR
+    return Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+
+
+def _get_file_service_base_url() -> str:
+    """读取 AstrBot 全局配置 callback_api_base（外部访问 AstrBot 的地址）。
+
+    供文件服务 URL 拼接：{callback_api_base}/api/file/{token}。
+    未配置时返回空串（文件服务不可用）。"""
+    try:
+        from astrbot.core import astrbot_config
+        base = (astrbot_config.get("callback_api_base") or "").strip().rstrip("/")
+        return base
+    except Exception:
+        return ""
+
+
+def _file_service_available() -> bool:
+    """AstrBot 内置文件服务是否可用（需配置 callback_api_base）。"""
+    return bool(_get_file_service_base_url())
+
+
+async def _register_file_with_service(local_path: str, timeout: float = 3600) -> str | None:
+    """把本地文件注册到 AstrBot 文件服务，返回可下载的 URL。
+
+    返回 {callback_api_base}/api/file/{token}；token 单次使用、默认 300s 过期，
+    因此需在每次发送前重新注册（本实现用较长 timeout + 发送前注册保证有效）。
+    未配置 callback_api_base 或注册失败时返回 None。"""
+    base = _get_file_service_base_url()
+    if not base:
+        return None
+    try:
+        from astrbot.core import file_token_service
+        token = await file_token_service.register_file(local_path, timeout=timeout)
+        return f"{base}/api/file/{token}"
+    except Exception as e:
+        logger.warning(f"⚠️ 注册媒体文件服务失败（{local_path}）：{e}")
+        return None
+
+
+def _local_media_path_of(comp) -> str | None:
+    """提取媒体组件本地化的文件路径；无本地文件返回 None（序列化时存的是本地路径）。"""
+    try:
+        if isinstance(comp, Video):
+            # keep_local 场景下 file 是 file:// URI 或本地路径
+            cand = getattr(comp, "file", "") or ""
+        elif isinstance(comp, File):
+            cand = getattr(comp, "file_", "") or ""
+        elif isinstance(comp, (Image, Record)):
+            cand = getattr(comp, "file", "") or ""
+        else:
+            return None
+    except Exception:
+        return None
+    if not cand:
+        return None
+    # file:// URI → 本地路径
+    if cand.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        try:
+            p = urlparse(cand)
+            return unquote(p.path)
+        except Exception:
+            return None
+    # base64/data URI / http(s) URL 不算本地路径
+    if cand.startswith(("base64://", "data:", "http://", "https://")):
+        return None
+    p = Path(cand)
+    if p.is_absolute() and p.is_file():
+        return str(p)
+    # 兼容相对路径（在媒体缓存目录内查找）
+    try:
+        rel = _get_media_cache_dir() / cand
+        if rel.is_file():
+            return str(rel)
+    except Exception:
+        pass
+    return None
+
+
+async def _prepare_chain_for_media_urls(chain) -> list:
+    """发送前把链中媒体组件注册到 AstrBot 文件服务，生成可下载的 URL。
+
+    队列场景下媒体已本地化到 AstrBot data 目录（持久化），但由于 NapCat 在另一容器
+    读不到本地路径、源端短效 URL 又会在队列延迟后过期，这里在「发送前」实时注册
+    新 token（每次发送、每个目标都重新注册，避免单次 token 与 300s 过期问题）。
+    Image/Record 由 aiocqhttp 转 base64 内嵌，无需文件服务；仅处理 Video/File。
+    callback_api_base 未配置时返回原链（回退原始 URL 行为）。"""
+    if not chain or not _file_service_available():
+        return chain
+    new_chain = []
+    for comp in chain:
+        if isinstance(comp, (Video, File)):
+            local_path = _local_media_path_of(comp)
+            if local_path:
+                url = await _register_file_with_service(local_path)
+                if url:
+                    if isinstance(comp, Video):
+                        comp = Video(file=url, url=url)
+                    else:
+                        comp = File(name=getattr(comp, "name", "") or "", url=url)
+        new_chain.append(comp)
+    return new_chain
+
+
+# ------------------------
+# 消息链序列化（队列持久化）
+# ------------------------
+
+def _serialize_chain(chain) -> list:
+    """把消息链组件序列化为可 JSON 存储的 dict 列表（供队列持久化）。
+
+    仅覆盖队列转发涉及的组件类型（Plain/Image/Record/Video/File/At）；
+    其余组件类型原样保留（无法序列化时跳过，避免阻塞入队）。"""
+    out = []
+    for comp in chain:
+        try:
+            if isinstance(comp, Plain):
+                out.append({"t": "plain", "text": comp.text})
+            elif isinstance(comp, Image):
+                out.append({"t": "image", "file": comp.file, "url": comp.url or ""})
+            elif isinstance(comp, Record):
+                out.append({"t": "record", "file": comp.file, "url": comp.url or ""})
+            elif isinstance(comp, Video):
+                out.append({"t": "video", "file": comp.file, "url": comp.url or "", "cover": getattr(comp, "cover", None) or ""})
+            elif isinstance(comp, File):
+                out.append({"t": "file", "name": comp.name or "", "file_": comp.file_ or "", "url": comp.url or ""})
+            elif isinstance(comp, At):
+                out.append({"t": "at", "qq": str(comp.qq), "name": comp.name or ""})
+            else:
+                # 无法序列化的组件类型：跳过（队列持久化不覆盖）
+                continue
+        except Exception:
+            continue
+    return out
+
+
+def _deserialize_chain(data: list) -> list:
+    """把序列化的 dict 列表还原为消息链组件列表。"""
+    chain = []
+    for item in data or []:
+        try:
+            t = item.get("t")
+            if t == "plain":
+                chain.append(Plain(text=item.get("text", "")))
+            elif t == "image":
+                chain.append(Image(file=item.get("file", ""), url=item.get("url", "")))
+            elif t == "record":
+                chain.append(Record(file=item.get("file", ""), url=item.get("url", "")))
+            elif t == "video":
+                chain.append(Video(file=item.get("file", ""), url=item.get("url", ""), cover=item.get("cover", "")))
+            elif t == "file":
+                chain.append(File(name=item.get("name", ""), file=item.get("file_", ""), url=item.get("url", "")))
+            elif t == "at":
+                chain.append(At(qq=item.get("qq", ""), name=item.get("name", "")))
+        except Exception:
+            continue
+    return chain
 
 
 def _sanitize_chain_for_forward(chain):
@@ -479,6 +663,12 @@ class MsgForward(star.Star):
 
         self.data_dir = star.StarTools.get_data_dir("msg_forward_cc")
         self.pending_file = self.data_dir / "pending.json"
+        self.queue_file = self.data_dir / "queue.json"
+
+        # 队列媒体缓存目录：AstrBot data 目录下持久化子目录（重启/重载不丢文件）
+        global _MEDIA_CACHE_DIR
+        _MEDIA_CACHE_DIR = self.data_dir / "media"
+        _MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         self.store = MsgForwardStore(self.pending_file)
 
@@ -490,6 +680,8 @@ class MsgForward(star.Star):
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._queue_worker_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
+        # 队列暂停标志：pause 后 worker 停止消费（积压消息暂不发送），resume 恢复
+        self._queue_paused: bool = False
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
@@ -609,7 +801,27 @@ class MsgForward(star.Star):
         dst = ", ".join(MsgForward._umo_list(rule, "target_umo")) or "?"
         return f"{src} → {dst}"
 
+    def _add_rule(self, source_umo: str, target_umo: str, hide_header: bool) -> int:
+        """新增一条转发规则并持久化，返回新规则的编号（1-based）。
+
+        统一 bind / bindraw 的建规则逻辑：构造带 __template_key 的规则 dict、
+        自动生成 remark 编号、追加到 rules 并保存。"""
+        rules = list(self.config.get("rules", []))
+        rules.append({
+            "__template_key": "rule",
+            "remark": f"规则 #{len(rules) + 1}",
+            "source_umo": source_umo,
+            "target_umo": target_umo,
+            "hide_header": hide_header,
+            "enabled": True,
+        })
+        self.config["rules"] = rules
+        self.config.save_config()
+        return len(rules)
+
     async def initialize(self):
+        # 恢复上次未发送完的持久化队列（重启/重载不丢消息）
+        self._restore_persisted_queue()
         self._queue_worker_task = asyncio.create_task(self._queue_worker())
         # 启动时清理所有队列媒体缓存
         self._cleanup_old_media()
@@ -627,25 +839,42 @@ class MsgForward(star.Star):
         """显示帮助信息"""
         yield event.plain_result(
             "📋 MsgForward 帮助\n\n"
-            "/mf add           创建一则转发绑定请求\n"
-            "/mf bind <绑定码>     接受一则转发绑定请求\n"
-            "/mf bindraw [源平台] <源ID> [目标平台] <目标ID>\n"
-            "                  直接创建转发绑定，省略默认平台为default。平台简写：df/qq/wx/tg/dc，加s为私聊\n"
-            "                  例：/mf bindraw 654321 wx 123456\n"
-            "                  例：/mf bindraw dfs 114514 wx 123456s（私聊）\n"
-            "/mf del <编号>    删除一条转发规则\n"
-            "/mf list          列出当前会话的转发规则（含群号）\n"
-            "/mf listall       列出所有转发规则\n"
-            "/mf hide <编号>   切换规则来源信息显示/隐藏\n"
-            "/mf toggle <编号>  启用/停用一条转发规则\n"
-            "/mf hidelist      列出当前会话规则的来源信息状态\n"
-            "/mf hidelistall   列出所有规则的来源信息状态\n"
-            "/mf filter        查看当前过滤与冷却配置\n"
-            "/mf help          显示此帮助\n\n"
-            "冷却转发：在规则配置中设置 cooldown_seconds > 0\n"
-            "转发一次后在该时间内不会再次转发，避免刷屏。\n\n"
-            "发送队列：在规则配置中设置 queue_interval_seconds > 0\n"
-            "匹配的消息进入队列，每隔该秒数转发一条。"
+            "mf\n"
+            "├── 🔗 绑定\n"
+            "│   ├── add: 创建一则转发绑定请求\n"
+            "│   ├── bind (code(str)): 接受一则转发绑定请求\n"
+            "│   └── bindraw ([源平台] 源ID [目标平台] 目标ID): 直接创建转发绑定\n"
+            "│       平台简写 df/qq/wx/tg/dc，加s为私聊，省略平台=default\n"
+            "│       例：/mf bindraw 654321 wx 123456\n"
+            "│       例：/mf bindraw dfs 114514 wx 123456s（私聊）\n"
+            "├── 📋 规则\n"
+            "│   ├── list: 列出当前会话的转发规则（含群号）\n"
+            "│   ├── listall: 列出所有转发规则\n"
+            "│   ├── del (编号(str)): 删除一条转发规则\n"
+            "│   ├── hide (编号(str)): 切换规则来源信息显示/隐藏\n"
+            "│   ├── toggle (编号(str)): 启用/停用一条转发规则\n"
+            "│   └── remark (编号(str), 备注(str)): 设置规则备注名称，留空清除备注\n"
+            "├── ❄ 冷却\n"
+            "│   ├── cooldown: 查看当前冷却配置\n"
+            "│   ├── cooldown default <秒>: 设置全局默认冷却（0=关闭）\n"
+            "│   ├── cooldown <编号> <秒>: 设置某条规则冷却（0=关闭该规则冷却）\n"
+            "│   └── cooldown <编号> inherit: 重置为继承全局默认\n"
+            "├── 🎯 过滤\n"
+            "│   └── filter: 查看当前过滤配置\n"
+            "├── ⏳ 发送队列\n"
+            "│   ├── queue status: 查看发送队列状态与配置\n"
+            "│   ├── queue on / queue off: 启用/停用发送队列总开关\n"
+            "│   ├── queue interval <秒>: 设置全局默认发送队列间隔（0=关闭）\n"
+            "│   ├── queue maxsize <条数>: 设置发送队列最大长度（0=不限制）\n"
+            "│   ├── queue retention <小时>: 队列媒体缓存保留时长（0=默认24小时）\n"
+            "│   ├── queue set <编号> <秒>: 设置某条规则队列间隔（0=关闭该规则队列）\n"
+            "│   ├── queue set <编号> inherit: 重置为继承全局默认\n"
+            "│   ├── queue clear: 清空积压队列与媒体缓存\n"
+            "│   └── queue pause / queue resume: 暂停/恢复队列消费\n"
+            "└── help: 显示此帮助\n\n"
+            "冷却：转发一次后在该时间内不会再次转发，避免刷屏。\n"
+            "队列：规则设置 queue_interval_seconds > 0 时进入队列，\n"
+            "每隔该秒数转发一条。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -670,19 +899,7 @@ class MsgForward(star.Star):
             source_umo = self.store.pop_pending(code)
             hide_header = self.config.get("default_hide_header", False)
 
-            rules = list(self.config.get("rules", []))
-            rules.append({
-                "__template_key": "rule",
-                "remark": f"规则 #{len(rules) + 1}",
-                "source_umo": source_umo,
-                "target_umo": target_umo,
-                "hide_header": hide_header,
-                "enabled": True,
-            })
-            self.config["rules"] = rules
-            self.config.save_config()
-
-            idx = len(rules)
+            idx = self._add_rule(source_umo, target_umo, hide_header)
             yield event.plain_result(f"✅ 已绑定 #{idx}\n{source_umo} → {target_umo}")
         except Exception as e:
             yield event.plain_result(f"❌ 绑定失败：{e}")
@@ -740,19 +957,7 @@ class MsgForward(star.Star):
             target_umo = build_umo(dst_plat, dst_id)
             hide_header = self.config.get("default_hide_header", False)
 
-            rules = list(self.config.get("rules", []))
-            rules.append({
-                "__template_key": "rule",
-                "remark": f"规则 #{len(rules) + 1}",
-                "source_umo": source_umo,
-                "target_umo": target_umo,
-                "hide_header": hide_header,
-                "enabled": True,
-            })
-            self.config["rules"] = rules
-            self.config.save_config()
-
-            idx = len(rules)
+            idx = self._add_rule(source_umo, target_umo, hide_header)
             yield event.plain_result(f"✅ 已绑定 #{idx}\n{source_umo} → {target_umo}")
         except Exception as e:
             yield event.plain_result(f"❌ 直接绑定失败：{e}")
@@ -761,21 +966,62 @@ class MsgForward(star.Star):
     @mf.command("del")
     async def cmd_del(self, event: AstrMessageEvent, rid: str):
         """删除一条转发规则（规则编号从 /mf list 查看）"""
-        try:
-            rules = list(self.config.get("rules", []))
-            idx = int(rid) - 1
-            if idx < 0 or idx >= len(rules):
-                yield event.plain_result(f"❌ 规则 #{rid} 不存在")
-                return
-            removed = rules.pop(idx)
-            self.config["rules"] = rules
-            self.config.save_config()
-            yield event.plain_result(
-                f"🗑️ 已删除规则 #{rid}（{self._rule_name(removed)}）"
-            )
-        except Exception as e:
-            yield event.plain_result(f"❌ 删除失败: {e}")
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        removed = rules.pop(idx)
+        self.config["rules"] = rules
+        self.config.save_config()
+        yield event.plain_result(
+            f"🗑️ 已删除规则 #{rid}（{self._rule_name(removed)}）"
+        )
 
+    def _get_rule(self, rid: str):
+        """按编号解析规则，返回 (rules, idx, rule)。
+
+        编号非法或越界时返回 (None, None, None)，由调用方统一提示「规则不存在」。
+        rules 是可变副本，调用方修改后需自行 self.config["rules"] = rules 并保存。"""
+        try:
+            idx = int(rid) - 1
+        except (TypeError, ValueError):
+            return None, None, None
+        rules = list(self.config.get("rules", []))
+        if idx < 0 or idx >= len(rules):
+            return None, None, None
+        return rules, idx, rules[idx]
+
+    def _toggle_rule_field(self, rid: str, field: str, on_text: str, off_text: str) -> str | None:
+        """切换规则某个布尔字段并持久化，返回成功提示文案；失败返回 None。
+
+        供 /mf hide（hide_header）与 /mf toggle（enabled）复用。"""
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            return None
+        current = bool(rule.get(field, False))
+        rule[field] = not current
+        self.config["rules"] = rules
+        self.config.save_config()
+        status = on_text if not current else off_text
+        return f"✅ 规则 #{rid}（{self._rule_name(rule)}）{status}"
+
+    def _format_rules(self, items) -> list:
+        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列状态）。
+
+        供 /mf list 与 /mf listall 复用，避免两处重复；编号由调用方决定
+        （list 传原始编号，listall 传 1..n 递增编号）。"""
+        lines = []
+        for idx, r in items:
+            en_status = "🟢" if r.get("enabled", True) else "⛔"
+            hide_status = "🔒" if r.get("hide_header", False) else "🔓"
+            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
+            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
+            qi = self._queue_interval_for(r)
+            qi_str = f"⏳{qi}s" if qi > 0 else ""
+            lines.append(f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str} {qi_str}".strip())
+        return lines
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
         """列出与当前会话相关的所有转发规则"""
@@ -788,116 +1034,141 @@ class MsgForward(star.Star):
             return
 
         lines = [f"📜 当前会话({source_umo}) 的规则："]
-        for idx, r in matched:
-            en_status = "🟢" if r.get("enabled", True) else "⛔"
-            hide_status = "🔒" if r.get("hide_header", False) else "🔓"
-            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
-            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
-            qi = self._queue_interval_for(r)
-            qi_str = f"⏳{qi}s" if qi > 0 else ""
-            lines.append(f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str} {qi_str}".strip())
+        lines.extend(self._format_rules(matched))
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("hide")
     async def cmd_hide_header(self, event: AstrMessageEvent, rid: str):
         """切换规则的来源信息显示状态（隐藏/显示）"""
-        try:
-            rules = list(self.config.get("rules", []))
-            idx = int(rid) - 1
-            if idx < 0 or idx >= len(rules):
-                yield event.plain_result(f"❌ 规则 #{rid} 不存在")
-                return
-
-            current = rules[idx].get("hide_header", False)
-            rules[idx]["hide_header"] = not current
-            self.config["rules"] = rules
-            self.config.save_config()
-
-            status = "隐藏" if not current else "显示"
-            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）来源信息已{status}")
-        except Exception as e:
-            yield event.plain_result(f"❌ 操作失败：{e}")
+        msg = self._toggle_rule_field(rid, "hide_header", "来源信息已隐藏", "来源信息已显示")
+        if msg is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        yield event.plain_result(msg)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("toggle")
     async def cmd_toggle(self, event: AstrMessageEvent, rid: str):
         """切换规则的启用状态（启用/停用）"""
-        try:
-            rules = list(self.config.get("rules", []))
-            idx = int(rid) - 1
-            if idx < 0 or idx >= len(rules):
-                yield event.plain_result(f"❌ 规则 #{rid} 不存在")
-                return
-
-            current = rules[idx].get("enabled", True)
-            rules[idx]["enabled"] = not current
-            self.config["rules"] = rules
-            self.config.save_config()
-
-            status = "已启用" if not current else "已停用"
-            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）{status}")
-        except Exception as e:
-            yield event.plain_result(f"❌ 操作失败：{e}")
-
-    @mf.command("hidelist")
-    async def cmd_header_status(self, event: AstrMessageEvent):
-        """列出当前会话规则的来源信息显示状态（允许：显示来源，禁止：隐藏来源）"""
-        source_umo = str(event.unified_msg_origin)
-        rules = self.config.get("rules", [])
-        matched = [(idx, r) for idx, r in enumerate(rules, start=1)
-                   if source_umo in MsgForward._umo_list(r, "source_umo")]
-        if not matched:
-            yield event.plain_result("📭 当前会话没有规则")
+        msg = self._toggle_rule_field(rid, "enabled", "已启用", "已停用")
+        if msg is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
             return
-
-        allowed = []
-        blocked = []
-
-        for idx, r in matched:
-            if r.get("hide_header", False):
-                blocked.append(f"#{idx} {self._rule_name(r)}")
-            else:
-                allowed.append(f"#{idx} {self._rule_name(r)}")
-
-        lines = [f"📋 当前会话({source_umo}) 来源信息状态："]
-        if allowed:
-            lines.append("\n✅ 允许显示来源：")
-            lines.extend(allowed)
-        if blocked:
-            lines.append("\n🔒 禁止显示来源：")
-            lines.extend(blocked)
-
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(msg)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @mf.command("hidelistall")
-    async def cmd_header_status_all(self, event: AstrMessageEvent):
-        """查看所有规则的来源信息显示状态（允许：显示来源，禁止：隐藏来源）"""
-        rules = self.config.get("rules", [])
-        if not rules:
-            yield event.plain_result("📭 暂无规则")
+    @mf.command("remark")
+    async def cmd_remark(self, event: AstrMessageEvent, rid: str, remark: str = ""):
+        """设置规则的备注名称（留空清除备注，恢复默认显示）"""
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        remark = (remark or "").strip()
+        if remark:
+            rule["remark"] = remark
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ 规则 #{rid} 备注已设为：{remark}")
+        else:
+            rule.pop("remark", None)
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ 规则 #{rid} 备注已清除（恢复为默认显示）")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mf.command("cooldown")
+    async def cmd_cooldown(self, event: AstrMessageEvent, args: str = ""):
+        """查看/设置转发冷却时间。
+
+        用法：
+          /mf cooldown                查看当前冷却配置
+          /mf cooldown default <秒>   设置全局默认冷却（0=关闭）
+          /mf cooldown <编号> <秒>    设置某条规则冷却（0=关闭，inherit=继承全局）
+        """
+        args = (args or "").strip()
+        # 无参数：查看当前冷却配置
+        if not args:
+            default_cd = int(self.config.get("default_cooldown_seconds", 0) or 0)
+            lines = [f"📋 转发冷却：全局默认 ❄{default_cd}s" if default_cd > 0 else "📋 转发冷却：全局默认 ❄关闭"]
+            rules = self.config.get("rules", [])
+            has_per_rule = False
+            for idx, r in enumerate(rules, start=1):
+                cd = r.get("cooldown_seconds")
+                if cd is None:
+                    continue
+                cd = int(cd)
+                if not has_per_rule:
+                    lines.append("规则级冷却：")
+                    has_per_rule = True
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ❄{cd}s" if cd > 0 else f"  #{idx} | {self._rule_name(r)} | ❄关闭")
+            if not has_per_rule:
+                lines.append("（所有规则使用全局默认冷却）")
+            lines.append("\n用法：/mf cooldown default <秒> 设全局默认；/mf cooldown <编号> <秒|inherit> 设规则级")
+            yield event.plain_result("\n".join(lines))
             return
 
-        allowed = []
-        blocked = []
+        parts = args.split()
+        # 首参数为 default：设置全局默认冷却
+        if parts[0].lower() == "default":
+            if len(parts) != 2:
+                yield event.plain_result("❌ 用法：/mf cooldown default <秒>（非负整数）")
+                return
+            try:
+                val = int(parts[1])
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                yield event.plain_result("❌ 用法：/mf cooldown default <秒>（非负整数）")
+                return
+            self.config["default_cooldown_seconds"] = val
+            self.config.save_config()
+            desc = f"❄{val}s" if val > 0 else "❄关闭"
+            yield event.plain_result(f"✅ 全局默认冷却已设为 {desc}")
+            return
 
-        for idx, r in enumerate(rules, start=1):
-            if r.get("hide_header", False):
-                blocked.append(f"#{idx} {self._rule_name(r)}")
-            else:
-                allowed.append(f"#{idx} {self._rule_name(r)}")
+        # 单参数（纯数字）：兼容旧用法，设置全局默认冷却
+        if len(parts) == 1:
+            try:
+                val = int(parts[0])
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                yield event.plain_result("❌ 用法：/mf cooldown default <秒> 设全局默认；/mf cooldown <编号> <秒|inherit> 设规则级")
+                return
+            self.config["default_cooldown_seconds"] = val
+            self.config.save_config()
+            desc = f"❄{val}s" if val > 0 else "❄关闭"
+            yield event.plain_result(f"✅ 全局默认冷却已设为 {desc}")
+            return
 
-        lines = ["📋 所有规则来源信息状态："]
-        if allowed:
-            lines.append("\n✅ 允许显示来源：")
-            lines.extend(allowed)
-        if blocked:
-            lines.append("\n🔒 禁止显示来源：")
-            lines.extend(blocked)
+        # 双参数：设置规则级冷却
+        rid, arg = parts[0], parts[1].strip().lower()
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        if arg == "inherit":
+            rule.pop("cooldown_seconds", None)
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）冷却已重置为继承全局默认")
+            return
+        try:
+            val = int(arg)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("❌ 用法：/mf cooldown <编号> <秒|inherit>，秒必须是非负整数")
+            return
+        rule["cooldown_seconds"] = val
+        self.config["rules"] = rules
+        self.config.save_config()
+        desc = f"❄{val}s" if val > 0 else "❄关闭"
+        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）冷却已设为 {desc}")
 
-        yield event.plain_result("\n".join(lines))
-
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("listall")
     async def cmd_list_all(self, event: AstrMessageEvent):
         """列出所有转发规则"""
@@ -907,18 +1178,10 @@ class MsgForward(star.Star):
             return
 
         lines = ["📜 所有转发规则："]
-        for idx, r in enumerate(rules, start=1):
-            en_status = "🟢" if r.get("enabled", True) else "⛔"
-            hide_status = "🔒" if r.get("hide_header", False) else "🔓"
-            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
-            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
-            qi = self._queue_interval_for(r)
-            qi_str = f"⏳{qi}s" if qi > 0 else ""
-            lines.append(
-                f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str} {qi_str}".strip()
-            )
+        lines.extend(self._format_rules(list(enumerate(rules, start=1))))
         yield event.plain_result("\n".join(lines))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("filter")
     async def cmd_filter_list(self, event: AstrMessageEvent):
         """查看当前的过滤配置"""
@@ -970,20 +1233,208 @@ class MsgForward(star.Star):
             elif cd is not None and int(cd) == 0:
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
 
-        # 显示发送队列配置
-        default_qi = self.config.get("default_queue_interval_seconds", 0)
-        qi_desc = f"{default_qi}s" if int(default_qi) > 0 else "关闭"
-        max_size = int(self.config.get("queue_max_size", 0) or 0)
-        max_desc = f"（上限 {max_size} 条）" if max_size > 0 else "（无上限）"
-        lines.append(f"\n📋 发送队列：全局默认 ⏳{qi_desc}{max_desc}")
-        for idx, r in enumerate(rules, start=1):
-            qi = r.get("queue_interval_seconds")
-            if qi is not None and int(qi) > 0:
-                lines.append(f"  #{idx} | {self._rule_name(r)} | ⏳{qi}s")
-            elif qi is not None and int(qi) == 0:
-                lines.append(f"  #{idx} | {self._rule_name(r)} | ⏳关闭")
-
         yield event.plain_result("\n".join(lines))
+
+    @mf.group("queue")
+    def queue(self):
+        """queue 命令组：发送队列配置"""
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("status")
+    async def cmd_queue_status(self, event: AstrMessageEvent):
+        """查看发送队列状态与配置"""
+        enabled = bool(self.config.get("queue_enabled", False))
+        default_qi = int(self.config.get("default_queue_interval_seconds", 0) or 0)
+        max_size = int(self.config.get("queue_max_size", 0) or 0)
+        retention = int(self.config.get("queue_media_retention_hours", 0) or 0)
+        if retention <= 0:
+            retention = 24
+        pending = self._send_queue.qsize()
+
+        lines = [
+            "📋 发送队列状态：",
+            f"  总开关：{'🟢 已启用' if enabled else '⛔ 已停用'}",
+            f"  消费状态：{'⏸️ 已暂停' if self._queue_paused else '▶️ 运行中'}",
+            f"  默认间隔：{'⏳' + str(default_qi) + 's' if default_qi > 0 else '关闭'}",
+            f"  队列上限：{'无限制' if max_size <= 0 else str(max_size) + ' 条'}",
+            f"  媒体缓存保留：{retention} 小时",
+            f"  当前积压：{pending} 条",
+        ]
+        if not enabled:
+            lines.append("  ⚠️ 总开关已停用，即使规则设置了间隔也不会进入队列")
+        if self._queue_paused:
+            lines.append("  ⚠️ 队列已暂停，积压消息暂不发送（/mf queue resume 恢复）")
+        lines.append("\n📋 各规则队列间隔：")
+        rules = self.config.get("rules", [])
+        has_rule = False
+        for idx, r in enumerate(rules, start=1):
+            qi = self._queue_interval_for(r)
+            if qi > 0:
+                has_rule = True
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ⏳{qi}s")
+        if not has_rule:
+            lines.append("  （无规则启用队列，全部立即转发）")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("on")
+    async def cmd_queue_on(self, event: AstrMessageEvent):
+        """启用发送队列总开关"""
+        self.config["queue_enabled"] = True
+        self.config.save_config()
+        yield event.plain_result("✅ 发送队列已启用")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("off")
+    async def cmd_queue_off(self, event: AstrMessageEvent):
+        """停用发送队列总开关"""
+        self.config["queue_enabled"] = False
+        self.config.save_config()
+        yield event.plain_result("✅ 发送队列已停用（规则设置的间隔将不再生效）")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("interval")
+    async def cmd_queue_interval(self, event: AstrMessageEvent, seconds: str):
+        """设置全局默认发送队列间隔（秒），0=关闭"""
+        try:
+            val = int(seconds)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("❌ 间隔必须是非负整数（秒），如 /mf queue interval 5")
+            return
+        self.config["default_queue_interval_seconds"] = val
+        self.config.save_config()
+        desc = f"⏳{val}s" if val > 0 else "关闭"
+        yield event.plain_result(f"✅ 全局默认队列间隔已设为 {desc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("maxsize")
+    async def cmd_queue_maxsize(self, event: AstrMessageEvent, size: str):
+        """设置发送队列最大长度，0=不限制"""
+        try:
+            val = int(size)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("❌ 队列上限必须是非负整数（条），如 /mf queue maxsize 100")
+            return
+        self.config["queue_max_size"] = val
+        self.config.save_config()
+        desc = "不限制" if val == 0 else f"{val} 条"
+        yield event.plain_result(f"✅ 发送队列上限已设为 {desc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("retention")
+    async def cmd_queue_retention(self, event: AstrMessageEvent, hours: str):
+        """设置队列媒体缓存保留时长（小时），0=默认24小时"""
+        try:
+            val = int(hours)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("❌ 保留时长必须是非负整数（小时），如 /mf queue retention 48")
+            return
+        self.config["queue_media_retention_hours"] = val
+        self.config.save_config()
+        desc = f"{val} 小时" if val > 0 else "默认 24 小时"
+        yield event.plain_result(f"✅ 队列媒体缓存保留时长已设为 {desc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("set")
+    async def cmd_queue_set(self, event: AstrMessageEvent, rid: str, seconds: str):
+        """设置某条规则的队列间隔（秒），0=关闭该规则队列，inherit=重置为继承全局"""
+        try:
+            idx = int(rid) - 1
+        except ValueError:
+            yield event.plain_result("❌ 用法：/mf queue set <规则编号> <秒|inherit>，如 /mf queue set 2 5 或 /mf queue set 2 inherit")
+            return
+        rules = list(self.config.get("rules", []))
+        if idx < 0 or idx >= len(rules):
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+
+        arg = (seconds or "").strip().lower()
+        if arg == "inherit":
+            # 删除键 → 恢复为继承全局默认间隔
+            rules[idx].pop("queue_interval_seconds", None)
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）队列间隔已重置为继承全局默认")
+            return
+
+        try:
+            val = int(arg)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("❌ 用法：/mf queue set <规则编号> <秒|inherit>，秒必须是非负整数，如 /mf queue set 2 5")
+            return
+        rules[idx]["queue_interval_seconds"] = val
+        self.config["rules"] = rules
+        self.config.save_config()
+        desc = f"⏳{val}s" if val > 0 else "关闭（立即转发）"
+        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）队列间隔已设为 {desc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("clear")
+    async def cmd_queue_clear(self, event: AstrMessageEvent):
+        """清空当前积压的发送队列，并清理队列媒体缓存"""
+        n = self._send_queue.qsize()
+        while not self._send_queue.empty():
+            try:
+                self._send_queue.get_nowait()
+                self._send_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        # 同步清空磁盘持久化队列
+        try:
+            self._save_persisted_queue([])
+        except Exception:
+            pass
+        cache_deleted = self._clear_media_cache()
+        msg = f"🗑️ 已清空发送队列（丢弃 {n} 条积压消息）"
+        if cache_deleted is not None:
+            msg += f"\n🧹 已清理 {cache_deleted} 个队列媒体缓存文件"
+        yield event.plain_result(msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("pause")
+    async def cmd_queue_pause(self, event: AstrMessageEvent):
+        """暂停发送队列消费：已入队的消息暂不发送，新消息仍可入队"""
+        if self._queue_paused:
+            yield event.plain_result("⏸️ 发送队列已处于暂停状态")
+            return
+        self._queue_paused = True
+        yield event.plain_result(f"⏸️ 发送队列已暂停（当前积压 {self._send_queue.qsize()} 条暂不发送）")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @queue.command("resume")
+    async def cmd_queue_resume(self, event: AstrMessageEvent):
+        """恢复发送队列消费"""
+        if not self._queue_paused:
+            yield event.plain_result("▶️ 发送队列未处于暂停状态")
+            return
+        self._queue_paused = False
+        yield event.plain_result(f"▶️ 发送队列已恢复（继续发送积压的 {self._send_queue.qsize()} 条消息）")
+
+    def _clear_media_cache(self) -> int | None:
+        """清空队列媒体缓存目录（AstrBot data 目录下 media/）下的所有文件。
+
+        返回删除的文件数；目录不存在时返回 None（表示无缓存可清理）。"""
+        tmp_dir = _get_media_cache_dir()
+        if not tmp_dir.exists():
+            return None
+        deleted = 0
+        for f in tmp_dir.iterdir():
+            if f.is_file():
+                try:
+                    f.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+        return deleted
 
     async def _resolve_file_urls(self, event: AstrMessageEvent, chain):
         """为链中无 URL 的 File 组件尝试从原始 OneBot 消息获取下载 URL。
@@ -1151,14 +1602,18 @@ class MsgForward(star.Star):
         """把一次转发任务加入发送队列，交由后台 worker 按间隔依次发送。
 
         同时保存兜底所需的信息，供发送失败时在 worker 内本地化媒体后重试。
-        若队列已达上限（queue_max_size > 0），则拒绝入队并记录警告。"""
+        若队列已达上限（queue_max_size > 0），则拒绝入队并记录警告。
+        入队后同步持久化到磁盘（queue.json），重启/重载后由 initialize 恢复。"""
         max_size = self.config.get("queue_max_size", 0)
         if max_size > 0 and self._send_queue.qsize() >= max_size:
-            logger.warning(
-                f"⚠️ 发送队列已满（上限 {max_size}），丢弃消息 → {target}"
+            logger.error(
+                f"❌ 发送队列已满（上限 {max_size} 条），本条消息被丢弃 → {target}。"
+                f"请调大 queue_max_size 或降低发送频率。"
             )
             return
-        self._send_queue.put_nowait({
+        uid = secrets.token_hex(8)
+        item = {
+            "uid": uid,
             "target": target,
             "result": result,
             "interval": max(0, interval),
@@ -1167,7 +1622,93 @@ class MsgForward(star.Star):
             "has_media": has_media,
             "use_proxy": use_proxy,
             "proxy_url": proxy_url,
-        })
+        }
+        self._send_queue.put_nowait(item)
+        # 持久化：入队即写盘（序列化链组件），发送成功后由 worker 按 uid 移除
+        try:
+            persisted = self._load_persisted_queue()
+            persisted.append({
+                "uid": uid,
+                "target": target,
+                "interval": max(0, interval),
+                "chain": _serialize_chain(sanitized_chain),
+                "header_text": header_text,
+                "has_media": has_media,
+                "use_proxy": use_proxy,
+                "proxy_url": proxy_url,
+            })
+            self._save_persisted_queue(persisted)
+        except Exception as e:
+            logger.warning(f"⚠️ 队列持久化失败（不影响本次入队）：{e}")
+
+    def _load_persisted_queue(self) -> list:
+        """读取磁盘上未发送完的队列条目（queue.json）。"""
+        try:
+            if self.queue_file.exists():
+                data = load_json(self.queue_file)
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and isinstance(data.get("items"), list):
+                    return data["items"]
+            return []
+        except Exception as e:
+            logger.warning(f"⚠️ 读取持久化队列失败：{e}")
+            return []
+
+    def _save_persisted_queue(self, items: list):
+        """把未发送完的队列条目写回磁盘（queue.json）。"""
+        try:
+            save_json(self.queue_file, {"items": items})
+        except Exception as e:
+            logger.warning(f"⚠️ 写入持久化队列失败：{e}")
+
+    def _remove_persisted_item(self, uid: str):
+        """发送成功后从磁盘队列移除对应条目（按 uid）。"""
+        if not uid:
+            return
+        try:
+            items = self._load_persisted_queue()
+            before = len(items)
+            items = [it for it in items if it.get("uid") != uid]
+            if len(items) != before:
+                self._save_persisted_queue(items)
+        except Exception as e:
+            logger.warning(f"⚠️ 更新持久化队列失败：{e}")
+
+    def _restore_persisted_queue(self):
+        """重启/重载后把磁盘上未发送完的队列条目重新入队。
+
+        媒体组件保持序列化时的 URL/路径；若本地化媒体已随清理被删除，
+        仍按原样入队，由 worker 发送失败时走媒体兜底降级。"""
+        items = self._load_persisted_queue()
+        if not items:
+            return
+        restored = 0
+        for it in items:
+            try:
+                chain = _deserialize_chain(it.get("chain", []))
+                if not chain:
+                    continue
+                header_text = it.get("header_text", "") or ""
+                # sanitized_chain 不含来源头；result 才前置来源头（与入队时一致）
+                result_chain = ([Plain(text=header_text)] + chain) if header_text else chain
+                result = MessageEventResult(chain=result_chain)
+                self._send_queue.put_nowait({
+                    "uid": it.get("uid", ""),
+                    "target": it.get("target", ""),
+                    "result": result,
+                    "interval": int(it.get("interval", 0) or 0),
+                    "sanitized_chain": chain,
+                    "header_text": header_text,
+                    "has_media": bool(it.get("has_media", False)),
+                    "use_proxy": bool(it.get("use_proxy", False)),
+                    "proxy_url": it.get("proxy_url", None),
+                })
+                restored += 1
+            except Exception as e:
+                logger.warning(f"⚠️ 恢复队列条目失败：{e}")
+        if restored:
+            logger.info(f"✅ 已从磁盘恢复 {restored} 条未发送完的队列消息")
 
     async def _queue_worker(self):
         """后台发送队列消费者：逐条发送，每发一条后按该条间隔休眠再发下一条。
@@ -1176,6 +1717,9 @@ class MsgForward(star.Star):
         确保 worker 永不因单条消息或意外异常而退出，避免队列永久卡住。"""
         while True:
             try:
+                # 暂停时阻塞等待，直到 resume 唤醒；不消费队列中的消息
+                while self._queue_paused:
+                    await asyncio.sleep(0.5)
                 item = await self._send_queue.get()
                 try:
                     await self._send_queued_item(item)
@@ -1199,11 +1743,18 @@ class MsgForward(star.Star):
         第一层降级：用 AstrBot 核心 downloader（convert_to_file_path）重新本地化所有
         媒体组件，覆盖因队列延迟导致源端临时文件路径/短效 URL 过期的问题；
         超时保护（45s）防止 downloader 挂死阻塞队列；
-        第二层降级：对远程 URL 媒体用裸 aiohttp 下载（_prepare_chain_fallback）兜底。"""
+        第二层降级：对远程 URL 媒体用裸 aiohttp 下载（_prepare_chain_fallback）兜底。
+        任一成功路径都会从磁盘持久化队列移除该条（uid）。
+        发送前会为链中 Video/File 媒体注册 AstrBot 文件服务 token（每次发送实时注册，
+        避免单次 token 与 300s 过期问题），使跨容器目标端（NapCat）能通过 URL 下载。"""
         target = item["target"]
         result = item["result"]
+        uid = item.get("uid", "")
         try:
-            await self.context.send_message(target, result)
+            # 发送前：为 Video/File 注册文件服务 URL（Image/Record 由 aiocqhttp 转 base64）
+            outgoing = await _prepare_chain_for_media_urls(result.chain)
+            await self.context.send_message(target, MessageEventResult(chain=outgoing))
+            self._remove_persisted_item(uid)
         except ValueError as e:
             logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
         except Exception as e:
@@ -1215,7 +1766,10 @@ class MsgForward(star.Star):
                 )
                 fb_chain = prepared if not item["header_text"] else \
                     [Plain(text=item["header_text"])] + prepared
+                # 重试前同样注册文件服务 URL
+                fb_chain = await _prepare_chain_for_media_urls(fb_chain)
                 await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                self._remove_persisted_item(uid)
                 logger.warning(f"⚠️ 队列转发首次失败（{e}），已重新本地化媒体后重试成功")
             except asyncio.TimeoutError:
                 logger.warning(f"⚠️ 队列转发：媒体本地化超时（45s），进入远程 URL 兜底")
@@ -1229,7 +1783,9 @@ class MsgForward(star.Star):
                         )
                         fb_chain = localized if not item["header_text"] else \
                             [Plain(text=item["header_text"])] + localized
+                        fb_chain = await _prepare_chain_for_media_urls(fb_chain)
                         await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                        self._remove_persisted_item(uid)
                         logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
                     except Exception as e3:
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
@@ -1246,7 +1802,9 @@ class MsgForward(star.Star):
                         )
                         fb_chain = localized if not item["header_text"] else \
                             [Plain(text=item["header_text"])] + localized
+                        fb_chain = await _prepare_chain_for_media_urls(fb_chain)
                         await self.context.send_message(target, MessageEventResult(chain=fb_chain))
+                        self._remove_persisted_item(uid)
                         logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
                     except Exception as e3:
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
@@ -1258,7 +1816,7 @@ class MsgForward(star.Star):
         retention_hours = int(self.config.get("queue_media_retention_hours", 0) or 0)
         if retention_hours <= 0:
             retention_hours = 24
-        tmp_dir = Path(tempfile.gettempdir()) / "msg_forward_cc_media"
+        tmp_dir = _get_media_cache_dir()
         if not tmp_dir.exists():
             return
         cutoff = time.time() - retention_hours * 3600

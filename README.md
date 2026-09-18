@@ -92,8 +92,6 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 
 ```
 /mf hide <规则ID>            # 切换规则的来源信息显示状态
-/mf hidelist                 # 列出当前会话规则的来源信息状态
-/mf hidelistall              # 列出所有规则的来源信息状态
 ```
 
 `/mf list` 命令会显示每个规则的状态标记：
@@ -132,6 +130,10 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 > **@ 提及清洗**：转发前会清洗 `@` 提及组件——仅保留 `@全体成员`（`all`）与纯数字目标；空目标直接丢弃，非数字目标（如官方 Bot 的 openid、`qq_official` 等）降级为纯文本 `@昵称`。跨会话转发时源会话的 @ 目标在目标会话通常无法解析，若原样透传，目标平台（如 OneBot/NapCat）会用空 ID 查询群成员，导致内核调用超时（`retcode=1200 invoke timeout`），使整个转发失败。
 >
 > **媒体失败自动降级**：转发默认透传；若发送失败且消息含远程 URL 媒体，自动下载到本地重试一次（先正常网络、失败再 IPv4）；开启「发送媒体前先下载到本地」或队列模式时，本地化失败（如群文件未下载到本地）也会自动尝试从远程 URL 下载重建。下载仍失败则降级为 `[xxx转发失败：源文件不可达]` 占位文本。
+>
+> **队列持久化**：发送队列中的消息会同步写入 `astrbot/data/plugin_data/msg_forward_cc/queue.json`，AstrBot 重启或插件重载后自动恢复未发送完的消息，避免积压消息丢失。
+>
+> **跨容器媒体转发（复用 AstrBot 内置文件服务）**：队列模式下媒体会被下载并保存到 AstrBot data 目录（`astrbot/data/plugin_data/msg_forward_cc/media/`，持久化重启不丢）。若 AstrBot 与目标端（如 NapCat）运行在不同容器，NapCat 读不到 AstrBot 的本地路径，且源端短效 URL 在队列延迟后可能过期。此时插件复用 AstrBot 内置文件服务：发送前把媒体注册到 `file_token_service`，生成 `{callback_api_base}/api/file/{token}` 免认证 URL 供 NapCat 下载（每次发送实时注册，避免单次 token 与过期问题）。**需在 AstrBot WebUI 配置 `callback_api_base`**（基础配置 → 回调地址，如 `http://<AstrBot容器IP>:6185`），未配置时回退为原始 URL 行为。
 
 </details>
 
@@ -151,9 +153,21 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `mf listall` | 列出所有转发规则 |
 | `mf hide` | 切换规则的来源信息显示状态 |
 | `mf toggle` | 启用/停用一条转发规则 |
-| `mf hidelist` | 列出当前会话规则的来源信息状态 |
-| `mf hidelistall` | 列出所有规则的来源信息状态 |
+| `mf remark` | 设置规则备注名称（例：/mf remark 2 同步群，留空清除备注） |
+| `mf cooldown` | 查看当前冷却配置（全局默认 + 规则级） |
+| `mf cooldown default <秒>` | 设置全局默认冷却时间（0=关闭） |
+| `mf cooldown <编号> <秒>` | 设置某条规则冷却时间（0=关闭该规则冷却） |
+| `mf cooldown <编号> inherit` | 重置某条规则冷却为继承全局默认 |
 | `mf filter` | 查看当前过滤配置（模式+正则） |
+| `mf queue status` | 查看发送队列状态与配置 |
+| `mf queue on` / `mf queue off` | 启用/停用发送队列总开关 |
+| `mf queue interval <秒>` | 设置全局默认发送队列间隔（0=关闭） |
+| `mf queue maxsize <条数>` | 设置发送队列最大长度（0=不限制） |
+| `mf queue retention <小时>` | 设置队列媒体缓存保留时长（0=默认24小时） |
+| `mf queue set <编号> <秒>` | 设置某条规则的队列间隔（0=关闭该规则队列） |
+| `mf queue set <编号> inherit` | 重置某条规则的队列间隔为继承全局默认 |
+| `mf queue clear` | 清空当前积压的发送队列并清理媒体缓存 |
+| `mf queue pause` / `mf queue resume` | 暂停/恢复发送队列消费（暂停后积压消息暂不发送） |
 | `mf help` | 显示该插件帮助信息 |
 
 > **UMO（Unified Message Origin）**：会话唯一标识，格式 `平台名:消息类型:会话ID`，消息类型为 `GroupMessage`（群聊）或 `FriendMessage`（私聊）。示例：`aiocqhttp:GroupMessage:654321`。
@@ -195,7 +209,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，否则=关键词） |
 | `default_cooldown_seconds` | int | `0` | 默认转发冷却时间（秒），每条规则可单独覆盖 |
 | `default_queue_interval_seconds` | int | `0` | 默认发送队列间隔（秒），开启后消息进入队列每隔该秒数转发一条，每条规则可单独覆盖 |
-| `queue_max_size` | int | `0` | 发送队列最大长度，0=不限制；达到上限后新消息被丢弃（记录日志），队列中已有的消息不受影响 |
+| `queue_max_size` | int | `0` | 发送队列最大长度，0=不限制；达到上限后新消息被丢弃（记录 error 日志），队列中已有的消息不受影响 |
 | `download_media_before_send` | bool | `false` | 发送前先将媒体下载到本地，跨设备转发找不到文件时开启，每条规则可单独覆盖 |
 
 #### `rules` 每条规则包含
@@ -209,8 +223,8 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `hide_header` | bool | 是否隐藏来源信息头 |
 | `filter_mode` | string | 过滤模式（inherit=继承全局），支持 inherit/off/blacklist/whitelist |
 | `filter_patterns` | list | 过滤规则列表（留空=继承全局），每项格式：`regex:表达式` 或 关键词 |
-| `cooldown_seconds` | int | 转发冷却时间（秒），0 或不填则继承全局默认值 |
-| `queue_interval_seconds` | int | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
+| `cooldown_seconds` | int | 转发冷却时间（秒），0=关闭本规则冷却；不填则继承全局默认值 |
+| `queue_interval_seconds` | int | 发送队列间隔（秒），0=关闭本规则队列（立即转发）；不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `download_media_before_send` | string | 是否在发送媒体前先下载到本地（inherit=继承全局），支持 inherit/true/false |
 
 #### `platform_name_map` 默认值
