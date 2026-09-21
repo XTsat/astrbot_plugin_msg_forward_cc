@@ -17,7 +17,7 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-from astrbot.core.message.components import At, Plain, Image, Record, Video, File
+from astrbot.core.message.components import At, Plain, Image, Record, Video, File, Face
 from astrbot.core.message.message_event_result import MessageEventResult
 
 
@@ -68,6 +68,99 @@ _VALID_URL_EXT = {
 def _comp_type_name(comp) -> str:
     """返回组件的可读类型名，用于日志与占位文本。"""
     return getattr(getattr(comp, "type", None), "value", None) or type(comp).__name__
+
+
+# ------------------------
+# 内容类型筛选（v0.5.0）
+# ------------------------
+
+# 全部可选内容类型（键 = 配置/命令中使用的标识，显示名用于日志与命令提示）
+CONTENT_TYPES = {
+    "plain": "文字",
+    "image": "图片",
+    "face": "表情",
+    "record": "语音",
+    "video": "视频",
+    "file": "文件",
+    "at": "@提及",
+    "other": "其他",
+}
+
+# 别名 → 标准键（/mf content 命令解析与配置值兼容用）。
+# 中文别名与 WebUI labels 显示名一致：配置里直接填中文（如 ["文字","表情"]）也能正确解析
+_CONTENT_TYPE_ALIASES = {
+    "plain": "plain", "text": "plain", "文字": "plain",
+    "image": "image", "img": "image", "图片": "image",
+    "face": "face", "sticker": "face", "emoji": "face", "表情": "face",
+    "record": "record", "voice": "record", "语音": "record",
+    "video": "video", "视频": "video",
+    "file": "file", "文件": "file",
+    "at": "at", "mention": "at", "@提及": "at", "艾特": "at",
+    "other": "other", "其他": "other",
+}
+
+
+def _comp_content_type(comp) -> str:
+    """返回单个消息组件对应的内容类型键（CONTENT_TYPES 之一）。
+
+    用于内容类型筛选：判断该组件是否属于规则选中的转发类型。
+    AtAll 继承自 At，一并归入 at。其余未显式分类的组件归入 other。
+    注意：「表情」仅指 QQ 内置表情（Face 组件）；收藏的表情/表情包以图片形式
+    到达，归入「图片」类型（不同协议端上报形态不一致，无法稳定区分，不重分类）。"""
+    if isinstance(comp, Plain):
+        return "plain"
+    if isinstance(comp, Image):
+        return "image"
+    if isinstance(comp, Face):
+        return "face"
+    if isinstance(comp, Record):
+        return "record"
+    if isinstance(comp, Video):
+        return "video"
+    if isinstance(comp, File):
+        return "file"
+    if isinstance(comp, At):
+        return "at"
+    return "other"
+
+
+def _content_types_for(rule: dict, config) -> set:
+    """解析某条规则生效的内容类型集合。
+
+    规则级 content_types 非空时用它；为空/缺失时继承全局 default_content_types。
+    全局默认全选（与旧版行为一致）。返回 set（去重、忽略非法键）。"""
+    allowed = rule.get("content_types")
+    if not allowed:
+        allowed = config.get("default_content_types")
+    if not allowed:
+        return set(CONTENT_TYPES.keys())
+    if isinstance(allowed, str):
+        allowed = [x.strip() for x in allowed.split(",") if x.strip()]
+    result = set()
+    for item in allowed:
+        key = _CONTENT_TYPE_ALIASES.get(str(item).strip().lower())
+        if key:
+            result.add(key)
+    return result or set(CONTENT_TYPES.keys())
+
+
+def _filter_chain_by_types(chain, allowed: set) -> list:
+    """按内容类型集合过滤消息链，仅保留类型命中的组件。
+
+    返回新链；若全部组件都被过滤则返回空列表（调用方据此跳过转发）。"""
+    if not chain:
+        return chain
+    return [comp for comp in chain if _comp_content_type(comp) in allowed]
+
+
+def _should_attach_header(rule: dict, allowed: set) -> bool:
+    """判断是否前置文字形式的来源信息头。
+
+    规则 hide_header 为 true 时不前置；否则仅当「文字」在选中类型中才前置——
+    只转发图片/视频等纯媒体时，消息里不含任何文字，来源头也不附带。"""
+    if rule.get("hide_header", False):
+        return False
+    return "plain" in allowed
 
 
 def _extract_remote_url(comp) -> str | None:
@@ -518,12 +611,19 @@ def _deserialize_chain(data: list) -> list:
 
 
 def _sanitize_chain_for_forward(chain):
-    """转发前清洗 @ 提及组件：只保留 @全体（all）与纯数字目标。
+    """转发前清洗 @ 提及组件（方案 A：At 原样透传，昵称仅作兜底）。
 
-    跨会话转发时，源会话的 @ 目标（QQ号 / openid / uid）在目标会话通常无法解析；
-    若原样透传，目标平台（如 OneBot/NapCat）会用空 uid 查询群成员，
-    内核调用超时导致整个转发失败（retcode=1200 invoke timeout）。
-    空目标直接丢弃；非数字目标（如 openid、"qq_official"）降级为纯文本 @昵称。"""
+    处理顺序（逐组件）：
+      1. @全体（qq="all"）与纯数字目标 → 原样透传，交给目标协议端按 qq 解析；
+      2. 非数字但非空的目标（如 openid / uid / "qq_official"）→ 同样保留 At 组件
+         与 qq 原样透传，让目标协议端自己按 qq 尝试解析（QQ→QQ 同号场景可直接命中）；
+         同时把 name 记录在 At.name 上，解析不到时由协议端降级显示昵称；
+      3. 空目标（qq 为空、None 或 "0"）→ 无任何可解析信息，且原样透传会让目标平台
+         （如 OneBot/NapCat）用空 uid 查询群成员，内核调用超时导致整个转发失败
+         （retcode=1200 invoke timeout），故丢弃；有昵称则降级为纯文本 @昵称。
+
+    注意：本函数只补全 name、不把非数字目标改写成文本 —— 昵称信息不丢失，
+    真正的文本降级由 _sanitize_at_chain_for_target 在「按目标平台判断」后执行。"""
     if not chain:
         return chain
     cleaned = []
@@ -533,15 +633,95 @@ def _sanitize_chain_for_forward(chain):
             continue
         qq = getattr(comp, "qq", None)
         qq_str = str(qq).strip() if qq is not None else ""
+        name = (getattr(comp, "name", "") or "").strip()
+        # 纯数字是 OneBot 标准 @ 目标；本项目历史配置中 "0" 表示无效值，一并按空目标处理
+        if qq_str == "all" or (qq_str.isdigit() and qq_str != "0"):
+            cleaned.append(comp)
+            continue
+        if qq_str and qq_str != "0":
+            # 非数字但非空：保留 qq 与 name 原样透传，由目标协议端按 qq 解析
+            if name:
+                logger.info(f"ℹ️ 转发时 @ 目标({qq_str!r})非数字，已原样透传（昵称 {name!r} 作为兜底）")
+            else:
+                logger.info(f"ℹ️ 转发时 @ 目标({qq_str!r})非数字，已原样透传交由目标协议端解析")
+            cleaned.append(comp)
+            continue
+        # 空目标：无语义，原样透传会触发目标平台空 uid 查询超时，丢弃
+        if name:
+            cleaned.append(Plain(text=f"@{name}"))
+            logger.info(f"⚠️ 转发时 @ 目标为空，已降级为文本 @{name}")
+        else:
+            logger.warning(f"⚠️ 转发时丢弃无效的 @ 目标: {qq_str!r}")
+    return cleaned
+
+
+# 源目标可被目标协议端按 qq 解析的平台（qq 透传白名单的默认值，可由配置追加）
+_QQ_TARGET_PLATFORMS = {
+    "aiocqhttp", "qq_official", "qq_official_webhook",
+    "onebot", "napcat", "llonebot", "lagrange",
+}
+
+
+def _parse_platform_set(raw) -> set:
+    """把配置里的平台列表（list 或按行/逗号分隔的字符串）解析为小写集合。"""
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        items = [x for line in raw.splitlines() for x in line.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = [raw]
+    return {str(x).strip().lower() for x in items if str(x).strip()}
+
+
+def _at_passthrough_platforms(config) -> set:
+    """返回允许 At 透传（按 qq 解析）的目标平台集合。
+
+    内置 QQ 系平台默认透传；配置 at_passthrough_extra_platforms 可追加
+    （如自建适配器平台名）。追加项只增不减，无法用于关闭内置平台。"""
+    platforms = set(_QQ_TARGET_PLATFORMS)
+    if config:
+        platforms |= _parse_platform_set(config.get("at_passthrough_extra_platforms"))
+    return platforms
+
+
+def _sanitize_at_chain_for_target(chain, target: str, passthrough_platforms: set | None = None):
+    """按目标平台二次清洗 @ 提及：仅在「目标端无法按 qq 解析」时降级为文本 @昵称。
+
+    目标平台属于 QQ 系（见 _QQ_TARGET_PLATFORMS）时，At 原样透传（方案 A 主路径）：
+    qq 数字命中即可精确 @，协议端解析不到时自己按 At.name 降级显示。
+    目标平台为跨平台（微信 / Telegram / Discord 等）时，「@ + 源 qq」在该平台
+    没有任何可解析含义，透传可能因空/非法目标查询成员而超时或报错，
+    故降级为文本 @昵称，保证信息不丢失。
+
+    与旧版（v0.4.7）的区别：旧版对所有目标一律按「非数字即降级」处理，
+    本版把非数字目标的判断下沉到目标平台粒度，从而做到「优先 qq 精确匹配」。"""
+    if not chain:
+        return chain
+    platform = ""
+    parts = str(target).split(":")
+    if len(parts) == 3:
+        platform = parts[0].strip().lower()
+    allowed = _QQ_TARGET_PLATFORMS if passthrough_platforms is None else passthrough_platforms
+    if platform in allowed:
+        return chain
+    cleaned = []
+    for comp in chain:
+        if not isinstance(comp, At):
+            cleaned.append(comp)
+            continue
+        qq_str = str(getattr(comp, "qq", "") or "").strip()
+        # @全体成员与纯数字目标在各平台均有意义（数字目标交给目标端尽力解析）
         if qq_str == "all" or (qq_str.isdigit() and qq_str != "0"):
             cleaned.append(comp)
             continue
         name = (getattr(comp, "name", "") or "").strip()
         if name:
             cleaned.append(Plain(text=f"@{name}"))
-            logger.info(f"⚠️ 转发时 @ 目标({qq_str!r})无法解析，已降级为文本 @{name}")
+            logger.info(f"ℹ️ 目标平台 {platform or '未知'} 无法解析 @({qq_str!r})，已降级为文本 @{name}")
         else:
-            logger.warning(f"⚠️ 转发时丢弃无效的 @ 目标: {qq_str!r}")
+            logger.warning(f"⚠️ 目标平台 {platform or '未知'} 无法解析且无昵称的 @ 目标已丢弃: {qq_str!r}")
     return cleaned
 
 
@@ -861,6 +1041,18 @@ class MsgForward(star.Star):
             "│   └── cooldown <编号> inherit: 重置为继承全局默认\n"
             "├── 🎯 过滤\n"
             "│   └── filter: 查看当前过滤配置\n"
+            "├── 📦 内容类型\n"
+            "│   ├── content: 查看内容类型筛选配置\n"
+            "│   ├── content list: 查看可选内容类型与别名\n"
+            "│   ├── content default <类型...>: 设置全局默认（all=全选）\n"
+            "│   ├── content <编号> <类型...>: 设置某条规则转发的内容类型（多选）\n"
+            "│   └── content <编号> inherit: 重置为继承全局默认\n"
+            "├── 🔔 @ 转发\n"
+            "│   ├── at: 查看 @ 转发与昵称反查配置\n"
+            "│   ├── at on / at off: 全局开启/关闭 @昵称反查\n"
+            "│   ├── at cache <秒>: 群成员列表缓存有效期（0=每次重新拉取）\n"
+            "│   ├── at <编号> on|off: 设置某条规则昵称反查（inherit=继承全局）\n"
+            "│   └── at test <群号或UMO>: 测试目标群 @昵称反查命中情况\n"
             "├── ⏳ 发送队列\n"
             "│   ├── queue status: 查看发送队列状态与配置\n"
             "│   ├── queue on / queue off: 启用/停用发送队列总开关\n"
@@ -874,7 +1066,9 @@ class MsgForward(star.Star):
             "└── help: 显示此帮助\n\n"
             "冷却：转发一次后在该时间内不会再次转发，避免刷屏。\n"
             "队列：规则设置 queue_interval_seconds > 0 时进入队列，\n"
-            "每隔该秒数转发一条。"
+            "每隔该秒数转发一条。\n"
+            "@ 转发：默认 At 原样透传（目标端按 qq 精确解析）；开启昵称反查后\n"
+            "会按目标群成员列表把 @昵称 换成真实 qq（默认关闭）。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1006,7 +1200,7 @@ class MsgForward(star.Star):
         return f"✅ 规则 #{rid}（{self._rule_name(rule)}）{status}"
 
     def _format_rules(self, items) -> list:
-        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列状态）。
+        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列/@反查/内容类型状态）。
 
         供 /mf list 与 /mf listall 复用，避免两处重复；编号由调用方决定
         （list 传原始编号，listall 传 1..n 递增编号）。"""
@@ -1018,7 +1212,17 @@ class MsgForward(star.Star):
             cd_str = f"❄{cd}s" if int(cd) > 0 else ""
             qi = self._queue_interval_for(r)
             qi_str = f"⏳{qi}s" if qi > 0 else ""
-            lines.append(f"{en_status} #{idx} {self._rule_name(r)} {hide_status} {cd_str} {qi_str}".strip())
+            at_str = "🔔@反查" if self._should_at_lookup(r) else ""
+            # 内容类型覆盖标记：仅当规则显式配置 content_types 时显示
+            # （只选 1 类时显示类型名如 📦仅表情，多类显示类数如 📦3类）
+            ct_keys = self._rule_content_types_raw(r)
+            if ct_keys:
+                first = next(k for k in CONTENT_TYPES if k in ct_keys)
+                ct_str = f"📦仅{CONTENT_TYPES[first]}" if len(ct_keys) == 1 else f"📦{len(ct_keys)}类"
+            else:
+                ct_str = ""
+            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, at_str, ct_str]
+            lines.append(" ".join(p for p in parts if p))
         return lines
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1167,6 +1371,242 @@ class MsgForward(star.Star):
         self.config.save_config()
         desc = f"❄{val}s" if val > 0 else "❄关闭"
         yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）冷却已设为 {desc}")
+
+    # ----- 内容类型筛选命令（v0.5.0） -----
+
+    @staticmethod
+    def _parse_content_type_args(tokens) -> tuple[set | None, str]:
+        """解析内容类型参数序列（/mf content 命令用），返回 (类型集合, 错误信息)。
+
+        支持 all（全部类型）与别名（text/img/sticker/emoji/voice/mention 等）；
+        含未知类型或为空时返回 (None, 错误提示)，由调用方直接回复给用户。"""
+        out = set()
+        for tok in tokens:
+            t = str(tok).strip().lower()
+            if not t:
+                continue
+            if t == "all":
+                out.update(CONTENT_TYPES.keys())
+                continue
+            key = _CONTENT_TYPE_ALIASES.get(t)
+            if not key:
+                return None, f"❌ 未知内容类型「{tok}」，用 /mf content list 查看可用类型"
+            out.add(key)
+        if not out:
+            return None, "❌ 未指定任何内容类型，例：/mf content default plain image"
+        return out, ""
+
+    @staticmethod
+    def _content_types_text(allowed: set) -> str:
+        """把内容类型集合格式化为按固定顺序的中文显示名（顿号分隔）。"""
+        return "、".join(label for key, label in CONTENT_TYPES.items() if key in allowed)
+
+    @staticmethod
+    def _rule_content_types_raw(rule: dict) -> set:
+        """读取规则显式配置的 content_types（list 或逗号分隔字符串），返回类型键集合。
+
+        仅解析规则自身的覆盖值，不做全局回退；未配置/为空返回空集合。"""
+        ct = rule.get("content_types")
+        if isinstance(ct, str):
+            ct = [x for x in ct.split(",") if x.strip()]
+        if not isinstance(ct, (list, tuple)):
+            return set()
+        return {_CONTENT_TYPE_ALIASES.get(str(x).strip().lower()) for x in ct} - {None}
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mf.command("content")
+    async def cmd_content(self, event: AstrMessageEvent, args: str = ""):
+        """查看/设置转发的内容类型筛选（多选，未勾选的类型不转发）"""
+        args = (args or "").strip()
+        # 无参数或 list：查看当前配置与可用类型
+        if not args or args.lower() == "list":
+            default_types = _content_types_for({}, self.config)
+            lines = [
+                "📦 内容类型筛选（多选，未勾选的类型不转发）：",
+                f"  全局默认：{self._content_types_text(default_types)}",
+            ]
+            rules = self.config.get("rules", [])
+            has_override = False
+            for idx, r in enumerate(rules, start=1):
+                keys = self._rule_content_types_raw(r)
+                if not keys:
+                    continue
+                if not has_override:
+                    lines.append("规则级覆盖：")
+                    has_override = True
+                lines.append(f"  #{idx} | {self._rule_name(r)} | {self._content_types_text(keys)}")
+            if not has_override:
+                lines.append("（所有规则继承全局默认）")
+            else:
+                lines.append("（其余规则继承全局默认）")
+            lines.append(
+                "类型：plain=文字 image=图片 face=表情 record=语音 video=视频 file=文件 at=@提及 other=其他\n"
+                "别名：text=文字 img=图片 sticker/emoji=表情 voice=语音 mention=@提及 all=全部\n"
+                "      中文名可直接使用，例：/mf content 2 表情（等价 face）、/mf content 3 图片 文字\n"
+                "用法：/mf content default <类型...> 设全局默认（all=全选）；\n"
+                "/mf content <编号> <类型...> 设规则级；/mf content <编号> inherit 继承全局"
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        parts = args.split()
+        # default 前缀：设置全局默认内容类型
+        if parts[0].lower() == "default":
+            types, err = self._parse_content_type_args(parts[1:])
+            if types is None:
+                yield event.plain_result(err)
+                return
+            self.config["default_content_types"] = [k for k in CONTENT_TYPES if k in types]
+            self.config.save_config()
+            yield event.plain_result(f"✅ 全局默认内容类型已设为：{self._content_types_text(types)}")
+            return
+
+        # 规则级：<编号> <类型...|inherit>
+        rid = parts[0]
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        if len(parts) == 1:
+            yield event.plain_result(
+                "❌ 用法：/mf content <编号> <类型...|inherit>\n"
+                "例：/mf content 2 表情 或 /mf content 2 face（只转发表情）；\n"
+                "/mf content 3 文字 图片 或 /mf content 3 plain image（只转发文字和图片）；\n"
+                "/mf content 2 all（全选）；/mf content 2 inherit（继承全局默认）"
+            )
+            return
+        if len(parts) == 2 and parts[1].strip().lower() == "inherit":
+            rule.pop("content_types", None)
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）内容类型已重置为继承全局默认")
+            return
+        types, err = self._parse_content_type_args(parts[1:])
+        if types is None:
+            yield event.plain_result(err)
+            return
+        rule["content_types"] = [k for k in CONTENT_TYPES if k in types]
+        self.config["rules"] = rules
+        self.config.save_config()
+        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）内容类型已设为：{self._content_types_text(types)}")
+
+    @mf.group("at")
+    def at(self):
+        """at 命令组：@ 转发与昵称反查配置"""
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @at.command("status")
+    async def cmd_at_status(self, event: AstrMessageEvent):
+        """查看 @ 转发与昵称反查配置（/mf at 等价）"""
+        enabled = bool(self.config.get("at_nickname_lookup", False))
+        ttl = self._at_lookup_ttl()
+        cache_size = len(self._group_member_cache)
+        lines = [
+            f"🔔 @ 转发：At 原样透传（目标端按 qq 精确解析），昵称仅作兜底",
+            f"🔍 昵称反查：{'✅ 全局开启' if enabled else '⛔ 全局关闭（默认）'}"
+            + (f" | 缓存 {ttl}s" if ttl > 0 else " | 缓存关闭（每次重新拉取）"),
+            f"💾 已缓存群成员列表：{cache_size} 个群",
+        ]
+        rules = self.config.get("rules", [])
+        per_rule = [(idx, r) for idx, r in enumerate(rules, start=1) if r.get("at_nickname_lookup") is not None]
+        if per_rule:
+            lines.append("\n规则级昵称反查：")
+            for idx, r in per_rule:
+                lines.append(f"  #{idx} | {self._rule_name(r)} | {'🔔开启' if self._should_at_lookup(r) else '关闭'}")
+        else:
+            lines.append("（所有规则继承全局昵称反查设置）")
+        lines.append(
+            "\n用法：/mf at on|off 全局开关；/mf at <编号> on|off|inherit 规则级；"
+            "/mf at cache <秒> 缓存时长；/mf at test <群号> 测试反查"
+        )
+        lines.append("说明：反查仅在目标为 QQ 系群聊时生效，开启后每条消息多一次群成员查询（有缓存）。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @at.command("on")
+    async def cmd_at_on(self, event: AstrMessageEvent):
+        """全局开启 @昵称反查"""
+        self.config["at_nickname_lookup"] = True
+        self.config.save_config()
+        yield event.plain_result("✅ 已全局开启 @昵称反查（规则未单独设置时生效）")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @at.command("off")
+    async def cmd_at_off(self, event: AstrMessageEvent):
+        """全局关闭 @昵称反查"""
+        self.config["at_nickname_lookup"] = False
+        self.config.save_config()
+        yield event.plain_result("✅ 已全局关闭 @昵称反查（At 仍按原样透传）")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @at.command("cache")
+    async def cmd_at_cache(self, event: AstrMessageEvent, seconds: str = ""):
+        """设置群成员列表缓存有效期（秒，0=每次重新拉取）"""
+        arg = (seconds or "").strip()
+        try:
+            val = int(arg)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("❌ 用法：/mf at cache <秒>（非负整数，0=每次重新拉取）")
+            return
+        self.config["at_nickname_lookup_cache_ttl"] = val
+        self.config.save_config()
+        desc = f"{val}s" if val > 0 else "关闭（每次重新拉取）"
+        yield event.plain_result(f"✅ 群成员列表缓存已设为 {desc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @at.command("set")
+    async def cmd_at_set(self, event: AstrMessageEvent, rid: str = "", mode: str = ""):
+        """设置规则级昵称反查（/mf at <编号> on|off|inherit）"""
+        arg = (mode or "").strip().lower()
+        if not rid or arg not in ("on", "off", "inherit", "true", "false"):
+            yield event.plain_result(
+                "❌ 用法：/mf at <编号> on|off|inherit\n"
+                "  on=该规则开启反查；off=关闭；inherit=继承全局设置"
+            )
+            return
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        if arg in ("inherit",):
+            rule.pop("at_nickname_lookup", None)
+            result = "已重置为继承全局"
+        else:
+            rule["at_nickname_lookup"] = "true" if arg in ("on", "true") else "false"
+            result = f"已设为{'🔔开启' if rule['at_nickname_lookup'] == 'true' else '关闭'}"
+        self.config["rules"] = rules
+        self.config.save_config()
+        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）昵称反查{result}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @at.command("test")
+    async def cmd_at_test(self, event: AstrMessageEvent, args: str = ""):
+        """测试目标群 @ 反查：拉取成员列表并显示命中情况"""
+        target = (args or "").strip()
+        if not target:
+            yield event.plain_result("❌ 用法：/mf at test <群号 或 UMO>\n例：/mf at test 123456 或 /mf at test aiocqhttp:GroupMessage:123456")
+            return
+        parts = target.split(":")
+        if len(parts) == 3:
+            platform, msg_type, group_id = parts[0].strip().lower(), parts[1], parts[2]
+        else:
+            platform, msg_type, group_id = "aiocqhttp", "GroupMessage", target
+        if platform not in _QQ_TARGET_PLATFORMS or msg_type != "GroupMessage":
+            yield event.plain_result(f"❌ 昵称反查仅支持 QQ 系群聊（当前：{platform}:{msg_type}）")
+            return
+        name_map, id_map = await self._get_group_member_name_map(group_id)
+        if not name_map:
+            yield event.plain_result(f"❌ 未能拉取群 {group_id} 的成员列表（无 QQ 协议端 / 群号错误 / 无权限），反查将降级为文本 @昵称")
+            return
+        lines = [f"✅ 群 {group_id} 成员 {len(id_map)} 人已缓存", "样例（昵称 → qq）："]
+        for nick, uid in list(name_map.items())[:10]:
+            uniq = id_map.get(uid, uid)
+            lines.append(f"  {nick} → {uid}" + ("" if uniq == nick else f"（{uniq}）"))
+        lines.append("提示：转发时会把 @昵称 中能在上表命中的昵称替换为对应 qq。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("listall")
@@ -1507,6 +1947,209 @@ class MsgForward(star.Star):
                     cleaned.append(File(name=name, url=matched_url))
                     continue
             cleaned.append(comp)
+        return cleaned
+
+    # ----- @昵称反查 qq（v0.5.0 可选增强，默认关闭） -----
+
+    # 群成员列表缓存：group_id → (拉取时间戳, {昵称/群名片: user_id}, {user_id: 昵称})
+    # 反查 @ 时优先用缓存，避免每条消息都拉一次成员列表
+    _group_member_cache: dict = {}
+    _GROUP_MEMBER_CACHE_TTL = 300  # 秒
+    _GROUP_MEMBER_CACHE_MAX = 32   # 最多缓存的群数，超出按最旧淘汰
+    # 同一群的并发拉取合并：group_id → asyncio 任务（避免瞬间多条消息各拉一次）
+    _group_member_inflight: dict = {}
+
+    def _should_at_lookup(self, rule: dict) -> bool:
+        """判断某条规则是否开启 @昵称反查。
+
+        规则显式设置为 true/false 时按规则值决定；inherit（或未设置）时继承全局配置。
+        兼容旧版 bool 存储（True/False）。"""
+        val = rule.get("at_nickname_lookup")
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            if val == "true":
+                return True
+            if val == "false":
+                return False
+            # "inherit" 或其他值 → 继承全局
+        return bool(self.config.get("at_nickname_lookup", False))
+
+    def _at_lookup_ttl(self) -> int:
+        """群成员列表缓存有效期（秒），0 表示每次都重新拉取；默认 300 秒。"""
+        try:
+            ttl = int(self.config.get("at_nickname_lookup_cache_ttl", 300) or 0)
+        except (TypeError, ValueError):
+            ttl = 300
+        return max(ttl, 0)
+
+    def _member_cache_get(self, group_id: str):
+        """取群成员缓存（未命中或已过期返回 None）；过期项顺手清除。"""
+        cached = self._group_member_cache.get(group_id)
+        if not cached:
+            return None
+        ttl = self._at_lookup_ttl()
+        if ttl <= 0 or time.time() - cached[0] >= ttl:
+            self._group_member_cache.pop(group_id, None)
+            return None
+        return cached
+
+    def _member_cache_put(self, group_id: str, name_map: dict, id_map: dict):
+        """写入群成员缓存，并按上限淘汰最旧的条目。"""
+        self._group_member_cache[group_id] = (time.time(), name_map, id_map)
+        max_size = self._GROUP_MEMBER_CACHE_MAX
+        if max_size > 0 and len(self._group_member_cache) > max_size:
+            oldest = sorted(self._group_member_cache.items(), key=lambda kv: kv[1][0])
+            for key, _ in oldest[:len(self._group_member_cache) - max_size]:
+                self._group_member_cache.pop(key, None)
+
+    async def _fetch_group_member_list(self, group_id: str):
+        """调用 get_group_member_list 拉取目标群成员列表（不缓存、不抛异常）。
+
+        逐个已加载平台尝试：按群号数字匹配 AiocqhttpAdapter；匹配不到时回退到
+        首个 AiocqhttpAdapter（兼容非 QQ 协议端 / 群号非纯数字的 UMO）。
+        全部失败返回 None，由调用方降级为文本 @昵称。"""
+        try:
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
+        except Exception as e:
+            logger.warning(f"⚠️ 无法加载 aiocqhttp 适配器，@ 昵称反查不可用：{e}")
+            return None
+        try:
+            adapters = [p for p in self.context.platform_manager.get_insts()
+                        if isinstance(p, AiocqhttpAdapter)]
+        except Exception as e:
+            logger.warning(f"⚠️ 获取平台实例失败，@ 昵称反查降级为文本：{e}")
+            return None
+        if not adapters:
+            return None
+        candidates = []
+        if group_id.isdigit():
+            for p in adapters:
+                try:
+                    if str(getattr(p, "self_id", "") or "") == group_id:
+                        continue
+                    candidates.append(p)
+                except Exception:
+                    candidates.append(p)
+        # 数字群号优先逐个尝试；非数字 UMO 或都未命中时回退首个适配器
+        for platform in (candidates or adapters[:1]):
+            try:
+                ret = await platform.bot.call_action(
+                    action="get_group_member_list",
+                    group_id=int(group_id),
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ 拉取群成员列表失败（群 {group_id}），@ 昵称反查降级为文本：{e}")
+                continue
+            if isinstance(ret, dict):
+                # 部分协议端把成员列表包在 {"data": [...]} / {"members": [...]} 里
+                for key in ("data", "members", "list"):
+                    if isinstance(ret.get(key), list):
+                        ret = ret[key]
+                        break
+            if isinstance(ret, list):
+                return ret
+        return None
+
+    async def _get_group_member_name_map(self, group_id: str):
+        """拉取（或取缓存）目标群成员列表，返回 (昵称→user_id, user_id→昵称) 映射。
+
+        群名片（card）优先、昵称（nickname）兜底；同名时后者覆盖前者。
+        缓存有效期由 at_nickname_lookup_cache_ttl 控制；同一群的并发拉取会合并。
+        失败返回 (None, None)（不抛异常，由调用方降级为文本 @昵称）。"""
+        cached = self._member_cache_get(group_id)
+        if cached:
+            return cached[1], cached[2]
+        inflight = self._group_member_inflight.get(group_id)
+        if inflight is None:
+            inflight = asyncio.ensure_future(self._fetch_group_member_list(group_id))
+            self._group_member_inflight[group_id] = inflight
+            inflight.add_done_callback(lambda _t, gid=group_id: self._group_member_inflight.pop(gid, None))
+        try:
+            ret = await asyncio.shield(inflight)
+        except Exception as e:
+            logger.warning(f"⚠️ 拉取群成员列表失败（群 {group_id}），@ 昵称反查降级为文本：{e}")
+            return None, None
+        if not ret:
+            return None, None
+        name_map = {}
+        id_map = {}
+        for m in ret:
+            if not isinstance(m, dict):
+                continue
+            uid = str(m.get("user_id", "") or "")
+            if not uid:
+                continue
+            card = (m.get("card") or "").strip()
+            nickname = (m.get("nickname") or "").strip()
+            display = card or nickname
+            if display:
+                id_map[uid] = display
+            # 群名片优先，昵称作为独立的可匹配键（同名时后出现的覆盖）
+            if card:
+                name_map[card] = uid
+            if nickname:
+                name_map[nickname] = uid
+        self._member_cache_put(group_id, name_map, id_map)
+        logger.info(f"ℹ️ 已拉取群 {group_id} 成员列表：{len(id_map)} 人（缓存 {self._at_lookup_ttl()}s）")
+        return name_map, id_map
+
+    async def _resolve_at_mentions(self, chain, target: str) -> list:
+        """把链中「无法解析的 @ 提及」按昵称反查为目标群真实成员（v0.5.0 可选增强）。
+
+        反查顺序（优先 qq 精确匹配，昵称仅作兜底）：
+          1. 纯数字 qq / @全体 → 不动，直接透传（协议端可精确解析，无需反查）；
+          2. 数字 qq 但目标群中不存在该成员 → 用 At.name 反查目标群成员，命中则替换 qq；
+          3. 非数字目标（openid / uid 等）→ 同样按 name 反查替换为数字 qq；
+          4. 反查不到 / 目标非 QQ 群 / 拉取失败 → 保留原 At 与 name，后续由
+             _sanitize_at_chain_for_target 按目标平台决定透传或降级为文本 @昵称。
+
+        昵称重名（多人同名）时不做替换：随机 @ 错人比降级为文本更糟，仅记录日志。"""
+        if not chain:
+            return chain
+        parts = str(target).split(":")
+        if len(parts) != 3 or parts[0].strip().lower() not in _QQ_TARGET_PLATFORMS or parts[1] != "GroupMessage":
+            return chain
+        group_id = parts[2]
+        name_map, id_map = await self._get_group_member_name_map(group_id)
+        if not name_map:
+            return chain
+        # 同名检测：同一昵称被两个及以上成员占用时，该昵称不参与反查
+        # （用 id_map 反查：id_map 一个 user_id 对应一个人，计数准确）
+        ambiguous = set()
+        counts = {}
+        for uid, display in id_map.items():
+            counts[display] = counts.get(display, 0) + 1
+        for nick in name_map:
+            if counts.get(nick, 0) > 1:
+                ambiguous.add(nick)
+        cleaned = []
+        for comp in chain:
+            if not isinstance(comp, At):
+                cleaned.append(comp)
+                continue
+            qq = str(getattr(comp, "qq", "") or "").strip()
+            name = (getattr(comp, "name", "") or "").strip()
+            if qq == "all":
+                cleaned.append(comp)
+                continue
+            if qq.isdigit() and qq != "0" and qq in id_map:
+                # qq 本身在目标群可精确解析：不改动
+                cleaned.append(comp)
+                continue
+            if not name:
+                cleaned.append(comp)
+                continue
+            if name in ambiguous:
+                logger.warning(f"⚠️ 目标群 {group_id} 中存在多个昵称 {name!r}，@ 反查跳过（避免 @ 错人）")
+                cleaned.append(comp)
+                continue
+            found = name_map.get(name)
+            if found:
+                cleaned.append(At(qq=found, name=name))
+                logger.info(f"ℹ️ 已将昵称 {name!r} 反查为目标群成员 {found}（原目标 {qq or '空'}）")
+            else:
+                cleaned.append(comp)
         return cleaned
 
     def _should_forward(self, event: AstrMessageEvent, rule: dict = None) -> bool:
@@ -1853,14 +2496,14 @@ class MsgForward(star.Star):
                 return
 
             raw_chain = event.get_messages()
-            # 清洗无效的 @ 提及，避免目标平台用空 uid 查询群成员导致超时（retcode=1200）
+            # 清洗无效的 @ 提及（空目标），保留 qq 原样透传，昵称仅作兜底
             sanitized_chain = _sanitize_chain_for_forward(raw_chain)
             # 清洗 File 组件的本地路径：NapCat 读不到源端本地路径，仅保留 URL 走下载
             sanitized_chain = _sanitize_file_chain_for_forward(sanitized_chain)
             # 为无 URL 的 File 组件尝试从原始 OneBot 消息获取下载 URL（get_group_file_url）
             sanitized_chain = await self._resolve_file_urls(event, sanitized_chain)
-            # 开启 download_media_before_send 的规则本地化链，惰性构建一次供多条规则复用
-            prepared_chain = None
+            # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
+            at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
 
             for idx, rule in enumerate(rules):
@@ -1872,6 +2515,13 @@ class MsgForward(star.Star):
                     continue
                 # 逐规则过滤检查
                 if not self._should_forward(event, rule):
+                    continue
+
+                # 内容类型筛选（v0.5.0）：仅保留规则选中的类型，默认全选
+                allowed = _content_types_for(rule, self.config)
+                filtered_chain = _filter_chain_by_types(sanitized_chain, allowed)
+                if not filtered_chain:
+                    # 消息不含任何选中类型，跳过该规则（不转发、不占冷却）
                     continue
 
                 # 冷却检查
@@ -1886,40 +2536,45 @@ class MsgForward(star.Star):
                     queue_interval = 0
 
                 # 主消息链：默认透传（正常网络，媒体交给目标端自行处理）；
-                # 开启 download_media_before_send 时，发送前先本地化（原逻辑不变）。
+                # 开启 download_media_before_send 时，发送前先本地化。
                 if self._should_download_media(rule):
-                    if prepared_chain is None:
-                        prepared_chain = await _prepare_chain_for_forward(sanitized_chain)
-                    message_chain = prepared_chain
+                    message_chain = await _prepare_chain_for_forward(filtered_chain)
                 else:
-                    message_chain = sanitized_chain
+                    message_chain = filtered_chain
 
-                # 来源头（hide_header 时为空，不前置）
+                # 来源头：仅当「文字」在选中类型中才前置（hide_header 时始终不前置）。
+                # 只转发图片/视频等纯媒体时，消息里不含任何文字，来源头也不附带。
                 header_text = ""
-                if not rule.get("hide_header", False):
+                if _should_attach_header(rule, allowed):
                     header_text = self._format_origin_header(event, source_umo) + "\n\n\u200b"
-                new_chain = message_chain if not header_text else [Plain(text=header_text)] + message_chain
 
                 # 是否含媒体组件（决定失败时是否值得本地化后重试）
-                has_media = any(isinstance(c, (Image, Record, Video, File)) for c in sanitized_chain)
+                has_media = any(isinstance(c, (Image, Record, Video, File)) for c in filtered_chain)
                 # 规则级代理三态：use_proxy 关→直连；开且 proxy_url 空→系统代理；开且非空→该地址
                 use_proxy = bool(rule.get("use_proxy", False))
                 proxy_url = (rule.get("proxy_url") or "").strip() or None
+                # @昵称反查（v0.5.0 可选增强，默认关闭）：仅当选中 @提及 类型时生效
+                at_lookup = self._should_at_lookup(rule) and "at" in allowed
                 fallback_chain = None
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
+                    # 目标级链：先按目标平台清洗（跨平台降级为文本 @昵称），
+                    # 再做 @昵称反查（可选，按目标群成员反查），最后前置来源头
+                    base_chain = _sanitize_at_chain_for_target(message_chain, target, at_passthrough)
+                    if at_lookup:
+                        base_chain = await self._resolve_at_mentions(base_chain, target)
+                    new_chain = base_chain if not header_text else [Plain(text=header_text)] + base_chain
+
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
                     if queue_interval > 0:
                         # 队列模式下必须本地化媒体，防止源端临时文件延迟后被清理
-                        if prepared_chain is None:
-                            prepared_chain = await _prepare_chain_for_queue(
-                                sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url,
-                            )
-                        queue_chain = prepared_chain if not header_text else [Plain(text=header_text)] + prepared_chain
+                        queue_chain = await _prepare_chain_for_queue(
+                            base_chain, use_proxy=use_proxy, proxy_url=proxy_url,
+                        )
                         self._enqueue_send(
                             target, event.chain_result(queue_chain), queue_interval,
-                            prepared_chain, header_text, has_media,
+                            base_chain, header_text, has_media,
                             use_proxy, proxy_url,
                         )
                         continue
@@ -1939,7 +2594,7 @@ class MsgForward(star.Star):
                         # 第一层降级：AstrBot 核心重新本地化所有媒体
                         try:
                             if fallback_chain is None:
-                                prepared = await _prepare_chain_for_forward(sanitized_chain)
+                                prepared = await _prepare_chain_for_forward(filtered_chain)
                                 fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
                             await self.context.send_message(target, event.chain_result(fallback_chain))
                             logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
@@ -1949,7 +2604,7 @@ class MsgForward(star.Star):
                             # 第二层降级：远程 URL 媒体
                             if has_media:
                                 try:
-                                    localized = await _prepare_chain_fallback(sanitized_chain, use_proxy=use_proxy, proxy_url=proxy_url)
+                                    localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
                                     fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
                                     await self.context.send_message(target, event.chain_result(fb_chain))
                                     logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")

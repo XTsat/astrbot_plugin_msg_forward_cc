@@ -49,9 +49,10 @@
           "filter_mode": {
             "description": "过滤模式",
             "type": "string",
-            "hint": "仅对本规则生效。inherit=继承全局设置；off=不过滤；blacklist=黑名单；whitelist=白名单。",
+            "hint": "仅对本规则生效。继承全局=使用全局过滤设置；黑名单=命中则不转发；白名单=命中才转发。",
             "default": "inherit",
-            "options": ["inherit", "off", "blacklist", "whitelist"]
+            "options": ["inherit", "off", "blacklist", "whitelist"],
+            "labels": ["继承全局", "不过滤", "黑名单", "白名单"]
           },
           "filter_patterns": {
             "description": "过滤规则列表",
@@ -74,9 +75,27 @@
           "download_media_before_send": {
             "description": "发送媒体前先下载到本地",
             "type": "string",
-            "hint": "仅对本规则生效。inherit=继承全局设置；true=强制开启；false=强制关闭。",
+            "hint": "仅对本规则生效。继承全局=跟随全局设置，开启/关闭=强制本规则行为。",
             "default": "inherit",
-            "options": ["inherit", "true", "false"]
+            "options": ["inherit", "true", "false"],
+            "labels": ["继承全局", "开启", "关闭"]
+          },
+          "content_types": {
+            "description": "转发的内容类型",
+            "type": "list",
+            "hint": "仅对本规则生效。勾选需要转发的内容类型（多选），未勾选的类型会被过滤掉。全部不勾选=继承全局默认（全局默认全选）。例：只勾选「表情」则仅转发表情，只勾选「图片」则仅转发图片。",
+            "default": [],
+            "render_type": "checkbox",
+            "options": ["plain", "image", "face", "record", "video", "file", "at", "other"],
+            "labels": ["文字", "图片", "表情", "语音", "视频", "文件", "@提及", "其他"]
+          },
+          "at_nickname_lookup": {
+            "description": "按昵称反查 @ 对象",
+            "type": "string",
+            "hint": "仅对本规则生效。⚠️ 这是可选的增强功能（默认关闭）：开启后转发时拉取目标群成员列表，用昵称反查真实成员，从而精确 @ 到目标群的人——不是把所有 @ 都改成文本。关闭时 @ 仍按 qq 原样透传，仅当目标平台无法解析时才降级为文本 @昵称。群成员很多时会增加一次 API 调用（有缓存），可能变慢。",
+            "default": "inherit",
+            "options": ["inherit", "true", "false"],
+            "labels": ["继承全局", "开启", "关闭"]
           },
           "use_proxy": {
             "description": "媒体下载是否走代理",
@@ -103,9 +122,10 @@
   "filter_mode": {
     "description": "消息过滤模式",
     "type": "string",
-    "hint": "off=不过滤；blacklist=黑名单；whitelist=白名单。",
+    "hint": "黑名单=命中则不转发，白名单=命中才转发。",
     "default": "off",
-    "options": ["off", "blacklist", "whitelist"]
+    "options": ["off", "blacklist", "whitelist"],
+    "labels": ["不过滤", "黑名单", "白名单"]
   },
   "filter_patterns": {
     "description": "全局过滤规则列表（每行一条）",
@@ -148,6 +168,33 @@
     "type": "bool",
     "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
     "default": false
+  },
+  "default_content_types": {
+    "description": "默认转发的内容类型",
+    "type": "list",
+    "hint": "新建转发规则时默认勾选的内容类型（多选）。默认全选=转发所有内容。",
+    "default": ["plain", "image", "face", "record", "video", "file", "at", "other"],
+    "render_type": "checkbox",
+    "options": ["plain", "image", "face", "record", "video", "file", "at", "other"],
+    "labels": ["文字", "图片", "表情", "语音", "视频", "文件", "@提及", "其他"]
+  },
+  "at_nickname_lookup": {
+    "description": "按昵称反查 @ 对象（默认关闭）",
+    "type": "bool",
+    "hint": "⚠️ 默认关闭。开启后转发时拉取【目标群】成员列表，把 @昵称 反查为目标群真实成员后再 @，解决跨群转发时 @ 目标无法解析的问题。群成员很多时会增加一次 API 调用、转发变慢，且需要目标平台支持群成员查询（QQ 系有效，跨平台如微信/Telegram 无效）。每条规则可单独覆盖。",
+    "default": false
+  },
+  "at_nickname_lookup_cache_ttl": {
+    "description": "@ 昵称反查的群成员缓存时长（秒）",
+    "type": "int",
+    "hint": "仅在开启「按昵称反查 @ 对象」时生效。同一目标群在该秒数内复用已拉取的成员列表，避免每条消息都拉一次；0=不缓存（每次重新拉取，群大时可能变慢）。默认 300 秒。",
+    "default": 300
+  },
+  "at_passthrough_extra_platforms": {
+    "description": "额外允许 @ 透传的目标平台",
+    "type": "list",
+    "hint": "默认已包含 QQ 系平台（aiocqhttp / qq_official 等），这些平台会把 At 按 qq 原样透传、由协议端精确解析。若你使用其他自建 QQ 适配器，可在此填写其平台名（每行一个，同 UMO 第一段），让 @ 也按 qq 透传而不是降级为文本。跨平台（微信/Telegram 等）不要填。",
+    "default": []
   },
   "platform_name_map": {
     "description": "平台名称映射",

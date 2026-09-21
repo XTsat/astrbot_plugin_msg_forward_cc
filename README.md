@@ -32,7 +32,7 @@
 2. **重启 AstrBot**：我们推荐在安装本插件后手动重启一次 AstrBot。
 
 <details>
-<summary>📦 功能概念（UMO / 转发规则 / 来源信息控制 / 消息过滤 / 消息链）</summary>
+<summary>📦 功能概念（UMO / 转发规则 / 来源信息控制 / 消息过滤 / 内容类型 / 消息链）</summary>
 
 #### 1. UMO（Unified Message Origin）
 
@@ -74,6 +74,7 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 | `filter_patterns` | 过滤规则列表（留空=继承全局），每项 `regex:表达式` 或关键词 |
 | `queue_interval_seconds` | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `download_media_before_send` | 是否在发送媒体前先下载到本地（inherit=继承全局） |
+| `content_types` | 本规则转发的内容类型（多选，WebUI 显示中文、直接填中文也有效），空=继承全局 `default_content_types`，未选中的类型不转发 |
 | `use_proxy` | 媒体下载是否走代理（关闭直连；开启后地址留空走 AstrBot 自带代理，填写则走该地址） |
 | `proxy_url` | 媒体下载代理地址（仅 `use_proxy` 开启时生效，如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`） |
 
@@ -114,7 +115,28 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 
 > 全局用 WebUI 的 template_list 增删改，规则级在 WebUI 中填 JSON 数组字符串。通过 `/mf filter` 可查看当前配置。
 
-#### 5. 消息链（MessageChain）处理
+#### 5. 内容类型筛选（多选，默认全选）
+
+每条转发规则可指定**要转发的内容类型**，例如「只转发表情」「只转发文字」「只转发图片」；可多选，**默认全选**（与旧版行为一致）。未选中的类型在转发前被过滤掉；消息不含任何选中类型时整条跳过（不转发、不占冷却）。
+
+可选类型（8 类，覆盖全部消息组件）：
+
+| 类型 | 含义 | 匹配组件 |
+| ------ | ------ | --------- |
+| `plain` | 文字 | `Plain`（含来源信息头） |
+| `image` | 图片 | `Image`（普通图片；收藏的表情/表情包以图片形式到达时也归入此类） |
+| `face` | 表情 | `Face`（QQ 内置表情） |
+| `record` | 语音 | `Record` |
+| `video` | 视频 | `Video` |
+| `file` | 文件 | `File` |
+| `at` | @提及 | `At` / `AtAll` |
+| `other` | 其他 | 其余全部（回复 / 合并转发 / 分享 / 音乐 / 戳一戳 / 骰子等） |
+
+分**全局**和**逐规则**两层：全局 `default_content_types`（默认全选）作为新建规则的默认值；规则级 `content_types`（空=继承全局）可单独覆盖。**来源信息头跟随「文字」类型**：仅当选中 `plain` 时才附带来源头，只转发图片/视频等纯媒体时消息不含任何文字。
+
+> WebUI 勾选框直接显示**中文名称**（文字/图片/表情/语音/视频/文件/@提及/其他），配置文件中的存储值保持英文键（`plain` 等），旧配置完全兼容；配置里手动填中文（如 `["文字","表情"]`）与 `/mf content 2 表情` 等中文命令同样有效。通过 `/mf content` 查看配置、`/mf content default <类型...>` 设全局默认（`all`=全选）、`/mf content <编号> <类型...>` 设规则级（`inherit`=继承全局）；支持 `text`/`img`/`sticker`/`voice`/`mention` 等别名，`/mf content list` 查看可用类型。分类边界：「表情」仅指 QQ 内置表情（`Face` 组件）；收藏的表情/表情包以图片形式到达，归入「图片」类型——需要转发它们请勾选「图片」（可与「表情」同时勾选）。商城表情 `mface` 段无图片数据，被 AstrBot aiocqhttp 适配器直接丢弃，无法转发。
+
+#### 6. 消息链（MessageChain）处理
 
 插件会在转发前自动构造一条带来源信息的消息链，例如：
 
@@ -127,7 +149,16 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 
 文字、图片、表情等组件都会被完整复制到目标平台。
 
-> **@ 提及清洗**：转发前会清洗 `@` 提及组件——仅保留 `@全体成员`（`all`）与纯数字目标；空目标直接丢弃，非数字目标（如官方 Bot 的 openid、`qq_official` 等）降级为纯文本 `@昵称`。跨会话转发时源会话的 @ 目标在目标会话通常无法解析，若原样透传，目标平台（如 OneBot/NapCat）会用空 ID 查询群成员，导致内核调用超时（`retcode=1200 invoke timeout`），使整个转发失败。
+> **@ 提及处理（方案 A，默认行为）**：转发时 `@` 组件保留 `qq` 与 `name` **原样透传**，由目标协议端按 `qq` 自行精确解析，`name` 仅作为无法解析时的兜底 —— 昵称信息不再丢失。只有 `qq` 为空（无语义）时才降级为文本 `@昵称`：跨会话转发时空 ID 会让目标平台（如 OneBot/NapCat）去查询群成员，导致内核调用超时（`retcode=1200 invoke timeout`）而整个转发失败。
+>
+> 是否降级按**目标平台能力**判断，而不是按源端目标格式：
+>
+> - **QQ 系平台**（`aiocqhttp` / `qq_official` / `qq_official_webhook` 等）→ 按 `qq` 透传，同号场景可直接精确 @；自建 QQ 适配器可用 `at_passthrough_extra_platforms` 追加平台名
+> - **跨平台**（微信 / Telegram / Discord 等，其平台本身没有「群成员 qq」概念）→ 非数字目标降级为文本 `@昵称`，保证信息不丢失
+>
+> **@ 昵称反查（可选增强，默认关闭）**：开启后转发前拉取**目标群成员列表**，把 `@昵称` 反查为目标群真实成员的 `qq` 再精确 @，解决「换个群 @ 就指不到人」的问题。反查顺序是**先用 qq 精确匹配、匹配不到再用昵称兜底**：纯数字 `qq` 且目标群中确实存在该成员时原样不动，只有群内不存在该成员、或目标本身不是数字（`openid`/`uid`）时才按昵称反查。
+>
+> 代价与保护：需要目标平台支持群成员查询（仅 QQ 系有效），群成员多时多一次 API 调用；因此默认关闭，并做了**缓存与并发合并**（`at_nickname_lookup_cache_ttl`，默认 300 秒，同一群的并发请求合并为一次，缓存条数上限按最旧淘汰）、**重名保护**（同名多人时跳过反查，避免 @ 错人）、**失败静默降级**（拉取失败 / 无 QQ 协议端 / 目标非 QQ 群时按方案 A 透传，不影响转发）。用 `/mf at` 查看配置、`/mf at test <群号>` 实测反查命中。
 >
 > **媒体失败自动降级**：转发默认透传；若发送失败且消息含远程 URL 媒体，自动下载到本地重试一次（先正常网络、失败再 IPv4）；开启「发送媒体前先下载到本地」或队列模式时，本地化失败（如群文件未下载到本地）也会自动尝试从远程 URL 下载重建。下载仍失败则降级为 `[xxx转发失败：源文件不可达]` 占位文本。
 >
@@ -159,6 +190,17 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `mf cooldown <编号> <秒>` | 设置某条规则冷却时间（0=关闭该规则冷却） |
 | `mf cooldown <编号> inherit` | 重置某条规则冷却为继承全局默认 |
 | `mf filter` | 查看当前过滤配置（模式+正则） |
+| `mf content` | 查看内容类型筛选配置（全局默认 + 规则级覆盖） |
+| `mf content list` | 查看可选内容类型与别名 |
+| `mf content default <类型...>` | 设置全局默认内容类型（`all`=全选，例：/mf content default plain image） |
+| `mf content <编号> <类型...>` | 设置某条规则转发的内容类型（多选，未选中的不转发） |
+| `mf content <编号> inherit` | 重置某条规则内容类型为继承全局默认 |
+| `mf at` | 查看 @ 转发与昵称反查配置（全局开关、缓存时长、规则级设置） |
+| `mf at on` / `mf at off` | 全局开启/关闭 @ 昵称反查（默认关闭） |
+| `mf at <编号> on\|off` | 开启/关闭某条规则的 @ 昵称反查 |
+| `mf at <编号> inherit` | 重置某条规则的 @ 昵称反查为继承全局 |
+| `mf at cache <秒>` | 设置群成员列表缓存时长（0=每次重新拉取，默认 300） |
+| `mf at test <群号\|UMO>` | 测试目标群 @ 昵称反查（拉取成员列表并显示命中情况） |
 | `mf queue status` | 查看发送队列状态与配置 |
 | `mf queue on` / `mf queue off` | 启用/停用发送队列总开关 |
 | `mf queue interval <秒>` | 设置全局默认发送队列间隔（0=关闭） |
@@ -210,6 +252,10 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `default_cooldown_seconds` | int | `0` | 默认转发冷却时间（秒），每条规则可单独覆盖 |
 | `default_queue_interval_seconds` | int | `0` | 默认发送队列间隔（秒），开启后消息进入队列每隔该秒数转发一条，每条规则可单独覆盖 |
 | `queue_max_size` | int | `0` | 发送队列最大长度，0=不限制；达到上限后新消息被丢弃（记录 error 日志），队列中已有的消息不受影响 |
+| `default_content_types` | list | 全部类型 | 新建规则时默认勾选的内容类型（多选，WebUI 显示中文），规则级 `content_types` 可覆盖 |
+| `at_nickname_lookup` | bool | `false` | **@ 昵称反查（默认关闭）**：按目标群成员列表把 `@昵称` 反查为真实 `qq` 后精确 @，每条规则可单独覆盖 |
+| `at_nickname_lookup_cache_ttl` | int | `300` | @ 昵称反查的群成员列表缓存时长（秒），0=每次重新拉取 |
+| `at_passthrough_extra_platforms` | list | `[]` | 额外允许 `@` 按 qq 透传的目标平台（内置已含 QQ 系平台） |
 | `download_media_before_send` | bool | `false` | 发送前先将媒体下载到本地，跨设备转发找不到文件时开启，每条规则可单独覆盖 |
 
 #### `rules` 每条规则包含
@@ -226,6 +272,8 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `cooldown_seconds` | int | 转发冷却时间（秒），0=关闭本规则冷却；不填则继承全局默认值 |
 | `queue_interval_seconds` | int | 发送队列间隔（秒），0=关闭本规则队列（立即转发）；不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `download_media_before_send` | string | 是否在发送媒体前先下载到本地（inherit=继承全局），支持 inherit/true/false |
+| `content_types` | list | 本规则转发的内容类型（多选，WebUI 显示中文、存储值为英文键，直接填中文也有效），空=继承全局 `default_content_types` |
+| `at_nickname_lookup` | string | 是否开启 @ 昵称反查（inherit=继承全局），支持 inherit/true/false |
 
 #### `platform_name_map` 默认值
 
