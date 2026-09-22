@@ -22,8 +22,8 @@
 - **来源信息控制**：每条规则可独立设置显示/隐藏来源信息（`/mf hide`）。
 - **规则启停**：每条规则可独立启用/停用，停用后规则保留但不再转发（WebUI 开关或 `/mf toggle`）。
 - **消息过滤**：全局与规则级两层过滤（off/blacklist/whitelist），支持关键词与正则。
-- **转发冷却**：全局默认与规则级冷却时间，避免刷屏。
-- **发送队列**：全局默认与规则级队列间隔，匹配消息进入队列后每隔设定时间转发一条。
+- **转发冷却**：全局默认与规则级冷却时间，避免刷屏（与队列间隔互斥：队列模式下冷却不生效，列表以 `❄失效(队列中)` 标记）。
+- **发送队列**：全局默认与规则级队列间隔，匹配消息进入队列后每隔设定时间转发一条；支持规则级队列长度上限，达上限后新消息丢弃。
 - **媒体转发（失败自动降级）**：发送失败时自动下载远程媒体到本地重试。
 
 ### 🚀 快速开始
@@ -73,6 +73,7 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 | `filter_mode` | 过滤模式（inherit=继承全局） |
 | `filter_patterns` | 过滤规则列表（留空=继承全局），每项 `regex:表达式` 或关键词 |
 | `queue_interval_seconds` | 发送队列间隔（秒），0 或不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
+| `queue_max_size` | 发送队列长度（条），本规则在队列中允许积压的最大消息数；0 或不填=不限制（仅受全局总上限约束），达到后新消息丢弃 |
 | `download_media_before_send` | 是否在发送媒体前先下载到本地（inherit=继承全局） |
 | `content_types` | 本规则转发的内容类型（多选，WebUI 显示中文、直接填中文也有效），空=继承全局 `default_content_types`，未选中的类型不转发 |
 | `use_proxy` | 媒体下载是否走代理（关闭直连；开启后地址留空走 AstrBot 自带代理，填写则走该地址） |
@@ -164,6 +165,10 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 >
 > **队列持久化**：发送队列中的消息会同步写入 `astrbot/data/plugin_data/msg_forward_cc/queue.json`，AstrBot 重启或插件重载后自动恢复未发送完的消息，避免积压消息丢失。
 >
+> **队列长度上限（全局总上限 + 规则级独立上限）**：全局 `queue_max_size` 是**全部规则合计**的队列积压上限（总长度）；每条规则还可单独设置 `queue_max_size` 作为**本规则**的独立积压上限（一条多目标转发会产生多条队列条目，全部计入该规则）。两者同时生效，达到任一上限后新消息被丢弃（记录 error 日志），队列中已有的消息不受影响。规则未设置或设为 0 时该规则无独立上限。用 `/mf queue maxsize` 查看、`/mf queue maxsize <编号> <条数>` 设置、`/mf queue maxsize <编号> inherit` 重置，`/mf list` 中以 `📮≤N条` 标记设置了独立上限的规则。
+>
+> **冷却与队列的关系（队列优先，冷却失效）**：同一条规则同时配置冷却与队列间隔时，消息进入队列路径后**冷却检查会被整体跳过**——冷却判断与写入只在即时发送路径执行，后台 worker 不读冷却表，实际只有队列间隔在限流。两者语义本就重叠（冷却＝「发完 N 秒内不再发」，队列间隔＝「每 N 秒发一条」），无需叠加。为避免误判，这类规则的冷却会显示为 `❄失效(队列中)`（`/mf list` / `/mf listall`）与 `❄Ns（队列中失效）`（`/mf filter`），并在首次转发时向日志告警一次（按规则去重，不刷屏）。`queue_enabled` 总开关关闭时队列间隔被强制置 0，冷却照常生效；若确需冷却限流，请关闭该规则的队列间隔（`/mf queue set <编号> 0`）。
+>
 > **跨容器媒体转发（复用 AstrBot 内置文件服务）**：队列模式下媒体会被下载并保存到 AstrBot data 目录（`astrbot/data/plugin_data/msg_forward_cc/media/`，持久化重启不丢）。若 AstrBot 与目标端（如 NapCat）运行在不同容器，NapCat 读不到 AstrBot 的本地路径，且源端短效 URL 在队列延迟后可能过期。此时插件复用 AstrBot 内置文件服务：发送前把媒体注册到 `file_token_service`，生成 `{callback_api_base}/api/file/{token}` 免认证 URL 供 NapCat 下载（每次发送实时注册，避免单次 token 与过期问题）。**需在 AstrBot WebUI 配置 `callback_api_base`**（基础配置 → 回调地址，如 `http://<AstrBot容器IP>:6185`），未配置时回退为原始 URL 行为。
 
 </details>
@@ -201,10 +206,14 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `mf at <编号> inherit` | 重置某条规则的 @ 昵称反查为继承全局 |
 | `mf at cache <秒>` | 设置群成员列表缓存时长（0=每次重新拉取，默认 300） |
 | `mf at test <群号\|UMO>` | 测试目标群 @ 昵称反查（拉取成员列表并显示命中情况） |
-| `mf queue status` | 查看发送队列状态与配置 |
+| `mf queue status` | 查看发送队列状态与配置（含各规则间隔/长度上限/当前积压） |
 | `mf queue on` / `mf queue off` | 启用/停用发送队列总开关 |
 | `mf queue interval <秒>` | 设置全局默认发送队列间隔（0=关闭） |
-| `mf queue maxsize <条数>` | 设置发送队列最大长度（0=不限制） |
+| `mf queue maxsize` | 查看队列总上限与各规则长度上限 |
+| `mf queue maxsize <条数>` | 设置发送队列总上限（0=不限制） |
+| `mf queue maxsize default <条数>` | 同上（`default` 前缀与规则编号区分） |
+| `mf queue maxsize <编号> <条数>` | 设置某条规则的队列长度上限（0=不限制） |
+| `mf queue maxsize <编号> inherit` | 重置某条规则队列长度上限为继承全局 |
 | `mf queue retention <小时>` | 设置队列媒体缓存保留时长（0=默认24小时） |
 | `mf queue set <编号> <秒>` | 设置某条规则的队列间隔（0=关闭该规则队列） |
 | `mf queue set <编号> inherit` | 重置某条规则的队列间隔为继承全局默认 |
@@ -251,7 +260,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，否则=关键词） |
 | `default_cooldown_seconds` | int | `0` | 默认转发冷却时间（秒），每条规则可单独覆盖 |
 | `default_queue_interval_seconds` | int | `0` | 默认发送队列间隔（秒），开启后消息进入队列每隔该秒数转发一条，每条规则可单独覆盖 |
-| `queue_max_size` | int | `0` | 发送队列最大长度，0=不限制；达到上限后新消息被丢弃（记录 error 日志），队列中已有的消息不受影响 |
+| `queue_max_size` | int | `0` | 发送队列**总长度上限**（全部规则合计积压条数），0=不限制；达到上限后新消息被丢弃（记录 error 日志），队列中已有的消息不受影响；各规则可用规则级 `queue_max_size` 单独限制本规则积压 |
 | `default_content_types` | list | 全部类型 | 新建规则时默认勾选的内容类型（多选，WebUI 显示中文），规则级 `content_types` 可覆盖 |
 | `at_nickname_lookup` | bool | `false` | **@ 昵称反查（默认关闭）**：按目标群成员列表把 `@昵称` 反查为真实 `qq` 后精确 @，每条规则可单独覆盖 |
 | `at_nickname_lookup_cache_ttl` | int | `300` | @ 昵称反查的群成员列表缓存时长（秒），0=每次重新拉取 |
@@ -269,8 +278,9 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `hide_header` | bool | 是否隐藏来源信息头 |
 | `filter_mode` | string | 过滤模式（inherit=继承全局），支持 inherit/off/blacklist/whitelist |
 | `filter_patterns` | list | 过滤规则列表（留空=继承全局），每项格式：`regex:表达式` 或 关键词 |
-| `cooldown_seconds` | int | 转发冷却时间（秒），0=关闭本规则冷却；不填则继承全局默认值 |
+| `cooldown_seconds` | int | 转发冷却时间（秒），0=关闭本规则冷却；不填则继承全局默认值；规则处于队列模式时冷却不生效（显示 `❄失效(队列中)`） |
 | `queue_interval_seconds` | int | 发送队列间隔（秒），0=关闭本规则队列（立即转发）；不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
+| `queue_max_size` | int | 发送队列长度上限（条），本规则在队列中允许积压的最大消息数；0 或不填=不限制（仅受全局总上限约束）；达到后新消息被丢弃（记录 error 日志） |
 | `download_media_before_send` | string | 是否在发送媒体前先下载到本地（inherit=继承全局），支持 inherit/true/false |
 | `content_types` | list | 本规则转发的内容类型（多选，WebUI 显示中文、存储值为英文键，直接填中文也有效），空=继承全局 `default_content_types` |
 | `at_nickname_lookup` | string | 是否开启 @ 昵称反查（inherit=继承全局），支持 inherit/true/false |

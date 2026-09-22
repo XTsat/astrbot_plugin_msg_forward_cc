@@ -854,10 +854,14 @@ class MsgForward(star.Star):
 
         # 冷却计时器：key = "source_umo|target_umo"，value = 冷却结束时间戳
         self._cooldowns: dict[str, float] = {}
+        # 冷却失效提示：队列模式下冷却被跳过，按 rule_key 只告警一次（避免刷屏日志）
+        self._cooldown_warned: set = set()
 
         # 发送队列：FIFO 队列，队列间隔 > 0 时消息不立即转发，而是由后台 worker
         # 每隔设定秒数依次发送一条（与「冷却」的丢弃语义互补）
         self._send_queue: asyncio.Queue = asyncio.Queue()
+        # 队列积压按规则归集计数：rule_key → 当前积压条数（入队 +1，worker 取走 -1）
+        self._queue_rule_counts: dict[str, int] = {}
         self._queue_worker_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
         # 队列暂停标志：pause 后 worker 停止消费（积压消息暂不发送），resume 恢复
@@ -971,6 +975,16 @@ class MsgForward(star.Star):
         dst = ", ".join(MsgForward._umo_list(rule, "target_umo")) or "?"
         return f"{src} → {dst}"
 
+    @staticmethod
+    def _rule_key(rule: dict) -> str:
+        """规则的稳定标识（供队列积压按规则归集统计）。
+
+        由规则自身的 source_umo 与 target_umo 内容派生，不依赖规则编号，
+        因此规则增删、排序后已入队的消息仍能正确归属到对应规则。"""
+        srcs = "|".join(MsgForward._umo_list(rule, "source_umo"))
+        dsts = "|".join(MsgForward._umo_list(rule, "target_umo"))
+        return f"{srcs}=>{dsts}"
+
     def _add_rule(self, source_umo: str, target_umo: str, hide_header: bool) -> int:
         """新增一条转发规则并持久化，返回新规则的编号（1-based）。
 
@@ -1047,7 +1061,10 @@ class MsgForward(star.Star):
             "│   ├── queue status: 查看发送队列状态与配置\n"
             "│   ├── queue on / queue off: 启用/停用发送队列总开关\n"
             "│   ├── queue interval <秒>: 设置全局默认发送队列间隔（0=关闭）\n"
-            "│   ├── queue maxsize <条数>: 设置发送队列最大长度（0=不限制）\n"
+            "│   ├── queue maxsize <条数>: 设置发送队列总上限（0=不限制）\n"
+            "│   ├── queue maxsize default <条数>: 同上（与规则编号区分）\n"
+            "│   ├── queue maxsize <编号> <条数>: 设置某条规则队列长度上限（0=不限制）\n"
+            "│   ├── queue maxsize <编号> inherit: 重置为继承全局上限\n"
             "│   ├── queue retention <小时>: 队列媒体缓存保留时长（0=默认24小时）\n"
             "│   ├── queue set <编号> <秒>: 设置某条规则队列间隔（0=关闭该规则队列）\n"
             "│   ├── queue set <编号> inherit: 重置为继承全局默认\n"
@@ -1056,7 +1073,10 @@ class MsgForward(star.Star):
             "└── help: 显示此帮助\n\n"
             "冷却：转发一次后在该时间内不会再次转发，避免刷屏。\n"
             "队列：规则设置 queue_interval_seconds > 0 时进入队列，\n"
-            "每隔该秒数转发一条。\n"
+            "每隔该秒数转发一条；queue_max_size 控制该规则队列长度，\n"
+            "达上限后新消息丢弃（总上限同理）。\n"
+            "冷却与队列同时开启时冷却失效（队列间隔已在限流），\n"
+            "list 中以 ❄失效(队列中) 标记，日志会告警一次。\n"
             "@ 转发：默认 At 原样透传（目标端按 qq 精确解析）；开启昵称反查后\n"
             "会按目标群成员列表把 @昵称 换成真实 qq（默认关闭）。"
         )
@@ -1190,7 +1210,7 @@ class MsgForward(star.Star):
         return f"✅ 规则 #{rid}（{self._rule_name(rule)}）{status}"
 
     def _format_rules(self, items) -> list:
-        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列/@反查/内容类型状态）。
+        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列间隔/队列长度/@反查/内容类型状态）。
 
         供 /mf list 与 /mf listall 复用，避免两处重复；编号由调用方决定
         （list 传原始编号，listall 传 1..n 递增编号）。"""
@@ -1198,10 +1218,16 @@ class MsgForward(star.Star):
         for idx, r in items:
             en_status = "🟢" if r.get("enabled", True) else "⛔"
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
-            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
-            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
+            cd = self._cooldown_for(r)
             qi = self._queue_interval_for(r)
             qi_str = f"⏳{qi}s" if qi > 0 else ""
+            # 队列模式下冷却检查被跳过（队列分支先于冷却检查 continue），标记失效避免误判
+            if cd <= 0:
+                cd_str = ""
+            else:
+                cd_str = "❄失效(队列中)" if self._cooldown_ignored(r) else f"❄{cd}s"
+            qmax = self._rule_queue_max_size(r)
+            qmax_str = f"📮≤{qmax}条" if qmax > 0 else ""
             at_str = "🔔@反查" if self._should_at_lookup(r) else ""
             # 内容类型覆盖标记：仅当规则显式配置 content_types 时显示
             # （只选 1 类时显示类型名如 📦仅表情，多类显示类数如 📦3类）
@@ -1211,7 +1237,7 @@ class MsgForward(star.Star):
                 ct_str = f"📦仅{CONTENT_TYPES[first]}" if len(ct_keys) == 1 else f"📦{len(ct_keys)}类"
             else:
                 ct_str = ""
-            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, at_str, ct_str]
+            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, qmax_str, at_str, ct_str]
             lines.append(" ".join(p for p in parts if p))
         return lines
 
@@ -1657,10 +1683,16 @@ class MsgForward(star.Star):
         cd_desc = f"{default_cd}s" if int(default_cd) > 0 else "关闭"
         lines.append(f"\n📋 转发冷却：全局默认 ❄{cd_desc}")
         for idx, r in enumerate(rules, start=1):
-            cd = r.get("cooldown_seconds")
-            if cd is not None and int(cd) > 0:
-                lines.append(f"  #{idx} | {self._rule_name(r)} | ❄{cd}s")
-            elif cd is not None and int(cd) == 0:
+            if r.get("cooldown_seconds") is None:
+                continue
+            try:
+                cd_val = max(int(r.get("cooldown_seconds") or 0), 0)
+            except (TypeError, ValueError):
+                cd_val = 0
+            if cd_val > 0:
+                tail = "（队列中失效）" if self._cooldown_ignored(r) else ""
+                lines.append(f"  #{idx} | {self._rule_name(r)} | ❄{cd_val}s{tail}")
+            else:
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
 
         yield event.plain_result("\n".join(lines))
@@ -1687,7 +1719,7 @@ class MsgForward(star.Star):
             f"  总开关：{'🟢 已启用' if enabled else '⛔ 已停用'}",
             f"  消费状态：{'⏸️ 已暂停' if self._queue_paused else '▶️ 运行中'}",
             f"  默认间隔：{'⏳' + str(default_qi) + 's' if default_qi > 0 else '关闭'}",
-            f"  队列上限：{'无限制' if max_size <= 0 else str(max_size) + ' 条'}",
+            f"  队列总上限：{'无限制' if max_size <= 0 else str(max_size) + ' 条'}",
             f"  媒体缓存保留：{retention} 小时",
             f"  当前积压：{pending} 条",
         ]
@@ -1695,16 +1727,16 @@ class MsgForward(star.Star):
             lines.append("  ⚠️ 总开关已停用，即使规则设置了间隔也不会进入队列")
         if self._queue_paused:
             lines.append("  ⚠️ 队列已暂停，积压消息暂不发送（/mf queue resume 恢复）")
-        lines.append("\n📋 各规则队列间隔：")
-        rules = self.config.get("rules", [])
-        has_rule = False
-        for idx, r in enumerate(rules, start=1):
-            qi = self._queue_interval_for(r)
-            if qi > 0:
-                has_rule = True
-                lines.append(f"  #{idx} | {self._rule_name(r)} | ⏳{qi}s")
-        if not has_rule:
-            lines.append("  （无规则启用队列，全部立即转发）")
+        lines.append("\n📋 各规则队列（间隔 / 长度上限 / 当前积压）：")
+        lines.extend(self._queue_rule_table_lines())
+        lines.append(
+            "\n提示：下表规则已进入队列模式，其冷却 ❄ 会被跳过（队列间隔本身已在限流），"
+            "/mf list 中以 ❄失效(队列中) 标记"
+        )
+        lines.append(
+            "\n用法：/mf queue maxsize <条数>（或 default <条数>）设总上限；"
+            "/mf queue maxsize <编号> <条数|inherit> 设规则级长度上限"
+        )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1741,19 +1773,96 @@ class MsgForward(star.Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @queue.command("maxsize")
-    async def cmd_queue_maxsize(self, event: AstrMessageEvent, size: str):
-        """设置发送队列最大长度，0=不限制"""
+    async def cmd_queue_maxsize(self, event: AstrMessageEvent, size: str = ""):
+        """设置发送队列长度上限。
+
+        用法：
+          /mf queue maxsize                      查看总上限与各规则长度上限
+          /mf queue maxsize <条数>               设置全局队列总上限（0=不限制）
+          /mf queue maxsize default <条数>       同上（与规则编号区分）
+          /mf queue maxsize <编号> <条数>        设置某条规则的队列长度上限（0=不限制）
+          /mf queue maxsize <编号> inherit       重置为继承全局上限
+        """
+        args = (size or "").strip()
+        # 无参数：查看当前配置
+        if not args:
+            gmax = self._queue_global_max()
+            lines = [
+                f"📋 队列总上限：{'无限制' if gmax <= 0 else str(gmax) + ' 条'}",
+                "各规则队列长度上限（间隔 / 上限 / 当前积压）：",
+            ]
+            lines.extend(self._queue_rule_table_lines())
+            lines.append(
+                "\n用法：/mf queue maxsize <条数>（或 default <条数>）设总上限；"
+                "/mf queue maxsize <编号> <条数|inherit> 设规则级长度上限"
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        parts = args.split()
+        # default 前缀：设置全局总上限
+        if parts[0].lower() == "default":
+            if len(parts) != 2:
+                yield event.plain_result("❌ 用法：/mf queue maxsize default <条数>（非负整数）")
+                return
+            try:
+                val = int(parts[1])
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                yield event.plain_result("❌ 用法：/mf queue maxsize default <条数>（非负整数）")
+                return
+            self.config["queue_max_size"] = val
+            self.config.save_config()
+            desc = "不限制" if val == 0 else f"{val} 条"
+            yield event.plain_result(f"✅ 发送队列总上限已设为 {desc}")
+            return
+
+        # 单参数（纯数字）：兼容旧用法，设置全局总上限
+        if len(parts) == 1:
+            try:
+                val = int(parts[0])
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                yield event.plain_result(
+                    "❌ 用法：/mf queue maxsize <条数>（全局总上限）或 "
+                    "/mf queue maxsize <编号> <条数|inherit>（规则级）"
+                )
+                return
+            self.config["queue_max_size"] = val
+            self.config.save_config()
+            desc = "不限制" if val == 0 else f"{val} 条"
+            yield event.plain_result(f"✅ 发送队列总上限已设为 {desc}")
+            return
+
+        # 双参数：设置规则级队列长度上限
+        rid, arg = parts[0], parts[1].strip().lower()
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        if arg == "inherit":
+            # 删除键 → 恢复为继承全局上限（无独立上限）
+            rules[idx].pop("queue_max_size", None)
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）队列长度上限已重置为继承全局")
+            return
         try:
-            val = int(size)
+            val = int(arg)
             if val < 0:
                 raise ValueError
         except ValueError:
-            yield event.plain_result("❌ 队列上限必须是非负整数（条），如 /mf queue maxsize 100")
+            yield event.plain_result(
+                "❌ 用法：/mf queue maxsize <编号> <条数|inherit>，条数必须是非负整数，如 /mf queue maxsize 2 10"
+            )
             return
-        self.config["queue_max_size"] = val
+        rules[idx]["queue_max_size"] = val
+        self.config["rules"] = rules
         self.config.save_config()
-        desc = "不限制" if val == 0 else f"{val} 条"
-        yield event.plain_result(f"✅ 发送队列上限已设为 {desc}")
+        desc = "不限制（继承全局总上限）" if val == 0 else f"≤{val} 条"
+        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rules[idx])}）队列长度上限已设为 {desc}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @queue.command("retention")
@@ -1818,6 +1927,8 @@ class MsgForward(star.Star):
                 self._send_queue.task_done()
             except asyncio.QueueEmpty:
                 break
+        # 队列已空，按规则归集的积压计数一并清零
+        self._queue_rule_counts = {}
         # 同步清空磁盘持久化队列
         try:
             self._save_persisted_queue([])
@@ -2229,21 +2340,127 @@ class MsgForward(star.Star):
         except (TypeError, ValueError):
             return 0
 
+    def _cooldown_for(self, rule: dict) -> int:
+        """解析某条规则生效的转发冷却时间（秒）。
+
+        规则未设置（键不存在）时继承全局 default_cooldown_seconds；
+        显式设置为 0 时关闭本规则冷却，语义与 queue_interval_seconds 一致。"""
+        val = rule.get("cooldown_seconds")
+        if val is None:
+            val = self.config.get("default_cooldown_seconds", 0)
+        try:
+            return max(int(val) if val else 0, 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _cooldown_ignored(self, rule: dict) -> bool:
+        """判断该规则的冷却是否因进入队列模式而被跳过（实际失效）。
+
+        forward_message 中队列分支先于冷却检查 continue，冷却判断与写入都不再执行，
+        后台 worker 也不读冷却表——此时只有队列间隔在限流。
+        仅当总开关开启且规则实际处于队列模式（间隔 > 0）时成立；总开关关闭时
+        队列间隔被强制置 0，冷却仍正常生效。"""
+        return self._queue_interval_for(rule) > 0 and bool(self.config.get("queue_enabled", False))
+
+    def _queue_global_max(self) -> int:
+        """全局发送队列总上限（所有规则合计积压条数），0=不限制。"""
+        try:
+            return max(int(self.config.get("queue_max_size", 0) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _rule_queue_max_size(self, rule: dict) -> int:
+        """解析某条规则生效的队列长度上限（条）。
+
+        规则未设置 queue_max_size（键不存在）或为 0 时，该规则没有独立上限，
+        仅受全局 queue_max_size 总上限约束；> 0 时该规则最多积压该条数，
+        达到后新消息被丢弃（记录错误日志）。语义与 cooldown_seconds 一致。"""
+        val = rule.get("queue_max_size")
+        try:
+            return max(int(val) if val else 0, 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _queued_count_for_rule(self, rule_key: str) -> int:
+        """统计队列中属于某条规则的积压条数（按入队时记录的 rule_key 归集）。
+
+        计数在入队时 +1、worker 取走条目时 -1，不依赖 asyncio.Queue 的内部实现
+        （Queue.queue 自 Python 3.11 起废弃、3.13 已移除）。
+        同一规则的多目标转发会产生多条队列条目，全部计入该规则。"""
+        if not rule_key:
+            return 0
+        return self._queue_rule_counts.get(rule_key, 0)
+
+    def _dec_queue_count(self, rule_key: str):
+        """worker 取走（或清空）一条队列条目后递减该规则的积压计数。"""
+        if not rule_key:
+            return
+        n = self._queue_rule_counts.get(rule_key, 0)
+        if n <= 1:
+            self._queue_rule_counts.pop(rule_key, None)
+        else:
+            self._queue_rule_counts[rule_key] = n - 1
+
+    def _rule_queue_max_size_for_key(self, rule_key: str) -> int:
+        """按 rule_key 查找对应规则并返回其队列长度上限（0=无独立上限）。
+
+        规则已删除/找不到时返回 0，不再对新消息施加该规则的上限，
+        避免残留 key 导致消息被误丢弃。"""
+        if not rule_key:
+            return 0
+        for r in self.config.get("rules", []):
+            if isinstance(r, dict) and self._rule_key(r) == rule_key:
+                return self._rule_queue_max_size(r)
+        return 0
+
+    def _queue_rule_table_lines(self) -> list:
+        """生成「各规则队列」状态行：间隔 / 长度上限 / 当前积压。
+
+        仅列出启用了队列间隔或设置了独立长度上限的规则；都没有时返回占位提示。"""
+        lines = []
+        rules = self.config.get("rules", [])
+        has_rule = False
+        for idx, r in enumerate(rules, start=1):
+            qi = self._queue_interval_for(r)
+            qmax = self._rule_queue_max_size(r)
+            if qi <= 0 and qmax <= 0:
+                continue
+            has_rule = True
+            qi_txt = f"⏳{qi}s" if qi > 0 else "⏳关闭"
+            qmax_txt = f"📮≤{qmax}条" if qmax > 0 else "📮不限"
+            cnt = self._queued_count_for_rule(self._rule_key(r))
+            lines.append(f"  #{idx} | {self._rule_name(r)} | {qi_txt} {qmax_txt} | 积压 {cnt} 条")
+        if not has_rule:
+            lines.append("  （无规则启用队列或设置独立长度上限，全部立即转发）")
+        return lines
+
     def _enqueue_send(self, target: str, result: MessageEventResult, interval: int,
                       sanitized_chain, header_text: str, has_media: bool,
-                      use_proxy: bool, proxy_url):
+                      use_proxy: bool, proxy_url, rule_key: str = "", rule_label: str = ""):
         """把一次转发任务加入发送队列，交由后台 worker 按间隔依次发送。
 
         同时保存兜底所需的信息，供发送失败时在 worker 内本地化媒体后重试。
-        若队列已达上限（queue_max_size > 0），则拒绝入队并记录警告。
+        入队前依次检查两级上限，任一达到即拒绝入队并记录错误：
+          1. 全局 queue_max_size —— 所有规则合计的队列总上限；
+          2. 规则级 queue_max_size —— 本规则在队列中的独立积压上限（按 rule_key 归集）。
         入队后同步持久化到磁盘（queue.json），重启/重载后由 initialize 恢复。"""
-        max_size = self.config.get("queue_max_size", 0)
-        if max_size > 0 and self._send_queue.qsize() >= max_size:
+        global_max = self._queue_global_max()
+        if global_max > 0 and self._send_queue.qsize() >= global_max:
             logger.error(
-                f"❌ 发送队列已满（上限 {max_size} 条），本条消息被丢弃 → {target}。"
+                f"❌ 发送队列已满（总上限 {global_max} 条），本条消息被丢弃 → {target}。"
                 f"请调大 queue_max_size 或降低发送频率。"
             )
             return
+        rule_max = self._rule_queue_max_size_for_key(rule_key)
+        if rule_max > 0:
+            used = self._queued_count_for_rule(rule_key)
+            if used >= rule_max:
+                label = f"（{rule_label}）" if rule_label else ""
+                logger.error(
+                    f"❌ 规则队列已满{label}（上限 {rule_max} 条，已积压 {used} 条），"
+                    f"本条消息被丢弃 → {target}。请调大该规则的 queue_max_size 或降低发送频率。"
+                )
+                return
         uid = secrets.token_hex(8)
         item = {
             "uid": uid,
@@ -2255,8 +2472,11 @@ class MsgForward(star.Star):
             "has_media": has_media,
             "use_proxy": use_proxy,
             "proxy_url": proxy_url,
+            "rule_key": rule_key,
         }
         self._send_queue.put_nowait(item)
+        if rule_key:
+            self._queue_rule_counts[rule_key] = self._queue_rule_counts.get(rule_key, 0) + 1
         # 持久化：入队即写盘（序列化链组件），发送成功后由 worker 按 uid 移除
         try:
             persisted = self._load_persisted_queue()
@@ -2269,6 +2489,7 @@ class MsgForward(star.Star):
                 "has_media": has_media,
                 "use_proxy": use_proxy,
                 "proxy_url": proxy_url,
+                "rule_key": rule_key,
             })
             self._save_persisted_queue(persisted)
         except Exception as e:
@@ -2336,7 +2557,11 @@ class MsgForward(star.Star):
                     "has_media": bool(it.get("has_media", False)),
                     "use_proxy": bool(it.get("use_proxy", False)),
                     "proxy_url": it.get("proxy_url", None),
+                    "rule_key": it.get("rule_key", "") or "",
                 })
+                rk = it.get("rule_key", "") or ""
+                if rk:
+                    self._queue_rule_counts[rk] = self._queue_rule_counts.get(rk, 0) + 1
                 restored += 1
             except Exception as e:
                 logger.warning(f"⚠️ 恢复队列条目失败：{e}")
@@ -2354,6 +2579,7 @@ class MsgForward(star.Star):
                 while self._queue_paused:
                     await asyncio.sleep(0.5)
                 item = await self._send_queue.get()
+                self._dec_queue_count(item.get("rule_key", ""))
                 try:
                     await self._send_queued_item(item)
                 except Exception as e:
@@ -2480,7 +2706,8 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            rules = [r for r in self.config.get("rules", [])
+            # 带上 1-based 规则编号（与 /mf list 显示的编号一致），供队列上限日志提示等使用
+            rules = [(rid, r) for rid, r in enumerate(self.config.get("rules", []), start=1)
                      if source_umo in MsgForward._umo_list(r, "source_umo")]
             if not rules:
                 return
@@ -2496,13 +2723,15 @@ class MsgForward(star.Star):
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
 
-            for idx, rule in enumerate(rules):
+            for rid, rule in rules:
                 targets = MsgForward._umo_list(rule, "target_umo")
                 if not targets:
                     continue
                 # 规则启用开关：关闭的规则直接跳过（默认启用，兼容旧版规则）
                 if not rule.get("enabled", True):
                     continue
+                # 队列归集用的稳定规则标识（不依赖编号，规则增删/排序后仍有效）
+                rule_key = self._rule_key(rule)
                 # 逐规则过滤检查
                 if not self._should_forward(event, rule):
                     continue
@@ -2515,15 +2744,21 @@ class MsgForward(star.Star):
                     continue
 
                 # 冷却检查
-                cooldown_sec = rule.get("cooldown_seconds")
-                if cooldown_sec is None:
-                    cooldown_sec = self.config.get("default_cooldown_seconds", 0)
-                cooldown_sec = int(cooldown_sec) if cooldown_sec else 0
+                cooldown_sec = self._cooldown_for(rule)
 
                 # 发送队列间隔：> 0 时消息进入队列，由后台 worker 每隔该秒数发送一条
                 queue_interval = self._queue_interval_for(rule)
                 if queue_interval > 0 and not self.config.get("queue_enabled", False):
                     queue_interval = 0
+                # 队列模式下冷却检查与写入都会被跳过（队列分支先于冷却检查 continue），冷却实际失效；
+                # 同时配置两者容易误判，按 rule_key 只告警一次
+                if queue_interval > 0 and cooldown_sec > 0 and rule_key not in self._cooldown_warned:
+                    self._cooldown_warned.add(rule_key)
+                    logger.warning(
+                        f"⚠️ 规则 #{rid}（{self._rule_name(rule)}）同时设置了冷却 ❄{cooldown_sec}s 与队列间隔 "
+                        f"⏳{queue_interval}s：队列模式下冷却检查被跳过，实际只有队列间隔在限流。"
+                        f"如需冷却生效请关闭该规则的队列间隔（/mf queue set {rid} 0）"
+                    )
 
                 # 主消息链：默认透传（正常网络，媒体交给目标端自行处理）；
                 # 开启 download_media_before_send 时，发送前先本地化。
@@ -2566,6 +2801,7 @@ class MsgForward(star.Star):
                             target, event.chain_result(queue_chain), queue_interval,
                             base_chain, header_text, has_media,
                             use_proxy, proxy_url,
+                            rule_key=rule_key, rule_label=f"#{rid}",
                         )
                         continue
                     if cooldown_sec > 0:

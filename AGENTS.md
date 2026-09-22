@@ -69,11 +69,14 @@
 - 监听 `@filter.event_message_type(filter.EventMessageType.ALL)` 全部消息
 - 匹配 source_umo 相同的所有规则，逐规则：
   1. `_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
-  2. 冷却检查（规则 `cooldown_seconds` 优先，否则 `default_cooldown_seconds`；冷却期内跳过）
+  2. 冷却检查（`_cooldown_for(rule)`：规则 `cooldown_seconds` 显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期内跳过）
   3. 主链：默认透传 `sanitized_chain`（正常网络，媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
   4. 构造消息链：`hide_header` 为 true 直接透传；否则前置来源头（末尾加 `\n\n\u200b` 零宽空格避免连续换行问题）
   5. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳
   6. 失败自动降级：发送失败且消息含远程 URL 媒体时，用 `_prepare_chain_fallback` 本地化后重试一次；仍失败记录错误
+- 队列模式：规则的 `queue_interval_seconds` > 0 且 `queue_enabled` 为 true 时，消息不直接发送而是入队（`_enqueue_send`），由后台 worker 按该间隔依次发送；入队前做两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`（本规则独立上限），任一达到即丢弃并记录错误日志
+- 规则积压统计按 `MsgForward._rule_key(rule)`（由 source_umo/target_umo 内容派生的稳定标识）归集，不依赖规则编号；队列条目与 `queue.json` 持久化条目均记录 `rule_key`，规则增删/排序、重启恢复后归属仍正确
+- 队列模式下的冷却（有意设计，非 bug）：队列分支先于冷却检查 `continue`，冷却判断与写入只在即时发送路径执行、后台 worker 不读 `_cooldowns`，因此规则同时配置冷却与队列间隔时冷却**实际失效**，只有队列间隔在限流；`_cooldown_ignored(rule)` 判定（`queue_enabled` 开启且规则队列间隔 > 0），`_format_rules` / `cmd_filter_list` 显示 `❄失效(队列中)` / `❄Ns（队列中失效）` 标记，`forward_message` 按 `self._cooldown_warned`（rule_key 去重）只告警一次
 - 异常分类记录日志（ValueError = 非法 session 字符串），单规则失败不影响其他规则
 
 ### 6. 过滤系统
@@ -92,6 +95,9 @@
 - `header_template`（text）：来源头模板
 - `filter_mode`（string，off）、`filter_patterns`（text，每行一条）
 - `default_cooldown_seconds`（int，0）
+- `default_queue_interval_seconds`（int，0）+ `queue_enabled`（bool，false）+ `queue_media_retention_hours`（int，24）+ `queue_max_size`（int，0，全局队列**总**长度上限）：发送队列相关全局配置
+- `rules[].queue_interval_seconds`（int，0）：规则级队列间隔，> 0 且 `queue_enabled` 为 true 时进入队列模式
+- `rules[].queue_max_size`（int，0）：规则级队列长度上限（条），0 或不填=本规则不限制（仅受全局总上限约束）；达到后新消息丢弃并记录错误日志
 - `download_media_before_send`（bool，false）：发送前媒体先下载到本地
 - `rules[].use_proxy`（bool，false）+ `rules[].proxy_url`（string，空）：规则级媒体下载代理三态——use_proxy 关→直连；开且 proxy_url 空→走 AstrBot 自带代理（系统环境变量）；开且非空→走该地址（如 `http://127.0.0.1:7890`）
 
