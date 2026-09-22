@@ -245,7 +245,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | ------- | ------ | -------- | ------ |
 | `rules` | template_list | `[]` | 转发规则列表，可在 WebUI 直接增删改 |
 | `default_hide_header` | bool | `false` | 新建规则时默认是否隐藏来源信息头 |
-| `platform_name_map` | object | 见下方 | 自定义各平台在来源信息中的显示名称 |
+| `platform_names` | list | `["aiocqhttp=QQ"]` | 平台显示名映射，每项格式：`原始平台名=显示名`，未命中的平台自动使用内置名称 |
 | `header_template` | text | 见下方 | 来源信息头模板，支持变量替换 |
 | `filter_mode` | string | `off` | 消息过滤模式：off/blacklist/whitelist |
 | `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，否则=关键词） |
@@ -275,32 +275,36 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `content_types` | list | 本规则转发的内容类型（多选，WebUI 显示中文、存储值为英文键，直接填中文也有效），空=继承全局 `default_content_types` |
 | `at_nickname_lookup` | string | 是否开启 @ 昵称反查（inherit=继承全局），支持 inherit/true/false |
 
-#### `platform_name_map` 默认值
+#### `platform_names` 格式说明
 
-```json
-{
-  "default": "默认",
-  "aiocqhttp": "QQ",
-  "qq_official": "QQ官方机器人",
-  "qq_official_webhook": "QQ官方机器人(Webhook)",
-  "telegram": "Telegram",
-  "weixin_oc": "个人微信",
-  "wecom": "企业微信",
-  "weixin_official_account": "微信公众号",
-  "lark": "飞书",
-  "dingtalk": "钉钉",
-  "discord": "Discord",
-  "kook": "KOOK",
-  "slack": "Slack",
-  "vocechat": "VoceChat",
-  "line": "LINE",
-  "satori": "Satori",
-  "matrix": "Matrix",
-  "mattermost": "Mattermost",
-  "misskey": "Misskey",
-  "wecom_ai_bot": "企微AI机器人"
-}
+每项格式：`原始平台名=显示名`
+
+默认已包含全部常见平台的映射（见下方完整列表），可在 WebUI 中直接增删改：
+
 ```
+default=默认
+aiocqhttp=QQ
+qq_official=QQ官方机器人
+qq_official_webhook=QQ官方机器人(Webhook)
+telegram=Telegram
+weixin_oc=个人微信
+wecom=企业微信
+weixin_official_account=微信公众号
+lark=飞书
+dingtalk=钉钉
+discord=Discord
+kook=KOOK
+slack=Slack
+vocechat=VoceChat
+line=LINE
+satori=Satori
+matrix=Matrix
+mattermost=Mattermost
+misskey=Misskey
+wecom_ai_bot=企微AI机器人
+```
+
+未在此列表中的平台保持原名（原样显示）。删空列表则全部平台保持原名。
 
 #### `header_template` 可用变量
 

@@ -45,7 +45,7 @@
 ### 3. 插件主体 `MsgForward(star.Star)`
 
 - `__init__`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、store、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 冷却结束时间戳）
-- `_format_origin_header(event, umo)`：生成来源信息头。解析 UMO 三字段；平台友好名从 `platform_name_map` 配置（合并内置默认映射，覆盖全部 AstrBot 官方适配器与常见社区适配器，见 `_conf_schema.json`）；消息类型映射 GroupMessage→群组、FriendMessage→私聊；支持 `header_template` 模板变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式
+- `_format_origin_header(event, umo)`：生成来源信息头。解析 UMO 三字段；平台友好名全部从 `platform_names` 配置（list 格式，每项 `原始平台名=显示名`）读取，无隐藏代码默认值，兼容旧版 `platform_name_map` object 格式自动迁移；消息类型映射 GroupMessage→群组、FriendMessage→私聊；支持 `header_template` 模板变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式
 
 ### 4. 命令（`/mf` 前缀）
 
@@ -88,7 +88,7 @@
 
 - `default_hide_header`（bool，false）：新建规则默认隐藏来源头
 - `rules`（template_list，模板 `rule`：source_umo/target_umo/hide_header/filter_mode[inherit|off|blacklist|whitelist]/filter_patterns/cooldown_seconds）
-- `platform_name_map`（object）：平台显示名映射
+- `platform_names`（list，每项 `原始平台名=显示名`）：平台显示名映射，兼容旧版 `platform_name_map` 自动迁移
 - `header_template`（text）：来源头模板
 - `filter_mode`（string，off）、`filter_patterns`（text，每行一条）
 - `default_cooldown_seconds`（int，0）

@@ -903,32 +903,22 @@ class MsgForward(star.Star):
         sender_name = event.get_sender_name()
         sender_id = event.get_sender_id()
 
-        # 平台友好名称（从配置读取，合并默认值）
-        default_map = {
-            "default": "默认",
-            "aiocqhttp": "QQ",
-            "qq_official": "QQ官方机器人",
-            "qq_official_webhook": "QQ官方机器人(Webhook)",
-            "telegram": "Telegram",
-            "weixin_oc": "个人微信",
-            "wecom": "企业微信",
-            "weixin_official_account": "微信公众号",
-            "lark": "飞书",
-            "dingtalk": "钉钉",
-            "discord": "Discord",
-            "kook": "KOOK",
-            "slack": "Slack",
-            "vocechat": "VoceChat",
-            "line": "LINE",
-            "satori": "Satori",
-            "matrix": "Matrix",
-            "mattermost": "Mattermost",
-            "misskey": "Misskey",
-            "wecom_ai_bot": "企微AI机器人",
-        }
-        platform_map = self.config.get("platform_name_map", {}) or {}
-        default_map.update(platform_map)
-        source_platform_human = default_map.get(source_platform, source_platform)
+        # 平台友好名称（全部从配置 platform_names 列表读取）
+        # 迁移：旧版 platform_name_map（object 格式）优先转换为 list
+        old_map = self.config.get("platform_name_map", {})
+        if isinstance(old_map, dict) and old_map:
+            platform_names_raw = [f"{k}={v}" for k, v in old_map.items()]
+        else:
+            platform_names_raw = self.config.get("platform_names", []) or []
+
+        # 解析为 dict
+        platform_map = {}
+        for item in platform_names_raw:
+            if isinstance(item, str) and "=" in item:
+                key, _, value = item.partition("=")
+                platform_map[key.strip()] = value.strip()
+
+        source_platform_human = platform_map.get(source_platform, source_platform)
 
         # 消息类型友好名称
         if msg_type == "GroupMessage":

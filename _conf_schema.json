@@ -196,133 +196,31 @@
     "hint": "默认已包含 QQ 系平台（aiocqhttp / qq_official 等），这些平台会把 At 按 qq 原样透传、由协议端精确解析。若你使用其他自建 QQ 适配器，可在此填写其平台名（每行一个，同 UMO 第一段），让 @ 也按 qq 透传而不是降级为文本。跨平台（微信/Telegram 等）不要填。",
     "default": []
   },
-  "platform_name_map": {
+  "platform_names": {
     "description": "平台名称映射",
-    "type": "object",
-    "hint": "自定义各平台在来源信息中的显示名称。未配置的平台将使用其原始名称。",
-    "default": {
-      "default": "默认",
-      "aiocqhttp": "QQ",
-      "qq_official": "QQ官方机器人",
-      "qq_official_webhook": "QQ官方机器人(Webhook)",
-      "telegram": "Telegram",
-      "weixin_oc": "个人微信",
-      "wecom": "企业微信",
-      "weixin_official_account": "微信公众号",
-      "lark": "飞书",
-      "dingtalk": "钉钉",
-      "discord": "Discord",
-      "kook": "KOOK",
-      "slack": "Slack",
-      "vocechat": "VoceChat",
-      "line": "LINE",
-      "satori": "Satori",
-      "matrix": "Matrix",
-      "mattermost": "Mattermost",
-      "misskey": "Misskey",
-      "wecom_ai_bot": "企微AI机器人"
-    },
-    "items": {
-      "default": {
-        "description": "default（默认平台）",
-        "type": "string",
-        "default": "默认"
-      },
-      "aiocqhttp": {
-        "description": "aiocqhttp（QQ/OneBot V11）",
-        "type": "string",
-        "default": "QQ"
-      },
-      "qq_official": {
-        "description": "qq_official（QQ官方机器人）",
-        "type": "string",
-        "default": "QQ官方机器人"
-      },
-      "qq_official_webhook": {
-        "description": "qq_official_webhook（QQ官方机器人 Webhook）",
-        "type": "string",
-        "default": "QQ官方机器人(Webhook)"
-      },
-      "telegram": {
-        "description": "telegram（Telegram）",
-        "type": "string",
-        "default": "Telegram"
-      },
-      "weixin_oc": {
-        "description": "weixin_oc（个人微信）",
-        "type": "string",
-        "default": "个人微信"
-      },
-      "wecom": {
-        "description": "wecom（企业微信）",
-        "type": "string",
-        "default": "企业微信"
-      },
-      "weixin_official_account": {
-        "description": "weixin_official_account（微信公众号）",
-        "type": "string",
-        "default": "微信公众号"
-      },
-      "lark": {
-        "description": "lark（飞书）",
-        "type": "string",
-        "default": "飞书"
-      },
-      "dingtalk": {
-        "description": "dingtalk（钉钉）",
-        "type": "string",
-        "default": "钉钉"
-      },
-      "discord": {
-        "description": "discord（Discord）",
-        "type": "string",
-        "default": "Discord"
-      },
-      "kook": {
-        "description": "kook（KOOK）",
-        "type": "string",
-        "default": "KOOK"
-      },
-      "slack": {
-        "description": "slack（Slack）",
-        "type": "string",
-        "default": "Slack"
-      },
-      "vocechat": {
-        "description": "vocechat（VoceChat）",
-        "type": "string",
-        "default": "VoceChat"
-      },
-      "line": {
-        "description": "line（LINE）",
-        "type": "string",
-        "default": "LINE"
-      },
-      "satori": {
-        "description": "satori（Satori）",
-        "type": "string",
-        "default": "Satori"
-      },
-      "matrix": {
-        "description": "matrix（Matrix）",
-        "type": "string",
-        "default": "Matrix"
-      },
-      "mattermost": {
-        "description": "mattermost（Mattermost）",
-        "type": "string",
-        "default": "Mattermost"
-      },
-      "misskey": {
-        "description": "misskey（Misskey）",
-        "type": "string",
-        "default": "Misskey"
-      },
-      "wecom_ai_bot": {
-        "description": "wecom_ai_bot（企微AI机器人）",
-        "type": "string",
-        "default": "企微AI机器人"
-      }
-    }
+    "type": "list",
+    "hint": "把 {platform} 的原始平台名替换为自定义展示名。每项格式：原始平台名=显示名，例如 aiocqhttp=QQ、telegram=电报。未命中的平台保持原名（原样显示），删空则全部不改写。",
+    "default": [
+      "default=默认",
+      "aiocqhttp=QQ",
+      "qq_official=QQ官方机器人",
+      "qq_official_webhook=QQ官方机器人(Webhook)",
+      "telegram=Telegram",
+      "weixin_oc=个人微信",
+      "wecom=企业微信",
+      "weixin_official_account=微信公众号",
+      "lark=飞书",
+      "dingtalk=钉钉",
+      "discord=Discord",
+      "kook=KOOK",
+      "slack=Slack",
+      "vocechat=VoceChat",
+      "line=LINE",
+      "satori=Satori",
+      "matrix=Matrix",
+      "mattermost=Mattermost",
+      "misskey=Misskey",
+      "wecom_ai_bot=企微AI机器人"
+    ]
   }
 }
