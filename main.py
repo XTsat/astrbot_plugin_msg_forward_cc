@@ -611,19 +611,18 @@ def _deserialize_chain(data: list) -> list:
 
 
 def _sanitize_chain_for_forward(chain):
-    """转发前清洗 @ 提及组件（方案 A：At 原样透传，昵称仅作兜底）。
+    """转发前清洗 @ 提及组件（事件级无损清洗，不决定转发时的 At 策略）。
 
     处理顺序（逐组件）：
-      1. @全体（qq="all"）与纯数字目标 → 原样透传，交给目标协议端按 qq 解析；
+      1. @全体（qq="all"）与纯数字目标 → 保留 At 组件（供后续按策略透传/反查）；
       2. 非数字但非空的目标（如 openid / uid / "qq_official"）→ 同样保留 At 组件
-         与 qq 原样透传，让目标协议端自己按 qq 尝试解析（QQ→QQ 同号场景可直接命中）；
-         同时把 name 记录在 At.name 上，解析不到时由协议端降级显示昵称；
-      3. 空目标（qq 为空、None 或 "0"）→ 无任何可解析信息，且原样透传会让目标平台
+         与 qq 与 name；
+      3. 空目标（qq 为空、None 或 "0"）→ 无任何可解析信息，且透传会让目标平台
          （如 OneBot/NapCat）用空 uid 查询群成员，内核调用超时导致整个转发失败
          （retcode=1200 invoke timeout），故丢弃；有昵称则降级为纯文本 @昵称。
 
-    注意：本函数只补全 name、不把非数字目标改写成文本 —— 昵称信息不丢失，
-    真正的文本降级由 _sanitize_at_chain_for_target 在「按目标平台判断」后执行。"""
+    注意：转发时的 @ 策略（默认文本化 / 高级 @ 透传+反查）由 _textify_at_chain 与
+    _sanitize_at_chain_for_target / _resolve_at_mentions 在目标级执行，本函数只做清洗。"""
     if not chain:
         return chain
     cleaned = []
@@ -687,9 +686,10 @@ def _at_passthrough_platforms(config) -> set:
 
 
 def _sanitize_at_chain_for_target(chain, target: str, passthrough_platforms: set | None = None):
-    """按目标平台二次清洗 @ 提及：仅在「目标端无法按 qq 解析」时降级为文本 @昵称。
+    """高级 @ 模式下的目标级 At 处理：仅在「目标端无法按 qq 解析」时降级为文本 @昵称。
 
-    目标平台属于 QQ 系（见 _QQ_TARGET_PLATFORMS）时，At 原样透传（方案 A 主路径）：
+    （仅在 at_nickname_lookup 开启时被调用；默认关闭时 At 一律由 _textify_at_chain 转文本。）
+    目标平台属于 QQ 系（见 _QQ_TARGET_PLATFORMS）时，At 原样透传（高级 @ 主路径）：
     qq 数字命中即可精确 @，协议端解析不到时自己按 At.name 降级显示。
     目标平台为跨平台（微信 / Telegram / Discord 等）时，「@ + 源 qq」在该平台
     没有任何可解析含义，透传可能因空/非法目标查询成员而超时或报错，
@@ -722,6 +722,39 @@ def _sanitize_at_chain_for_target(chain, target: str, passthrough_platforms: set
             logger.info(f"ℹ️ 目标平台 {platform or '未知'} 无法解析 @({qq_str!r})，已降级为文本 @{name}")
         else:
             logger.warning(f"⚠️ 目标平台 {platform or '未知'} 无法解析且无昵称的 @ 目标已丢弃: {qq_str!r}")
+    return cleaned
+
+
+def _textify_at_chain(chain):
+    """把链中所有 At 组件一律转为纯文本 @昵称（默认 At 转发策略）。
+
+    默认不发送真实 At 组件：彻底规避目标协议端按 qq 解析、查询群成员时的
+    内核调用超时（retcod=-1200）与跨平台无法解析问题，信息以 @昵称 文本保留。
+      - @全体（qq="all"）→ "@全体成员"（name 非 "all" 时优先用 name）；
+      - 普通 At → "@昵称"（name 为空时用 qq 兜底；两者皆无则丢弃）。
+    开启高级 @（at_nickname_lookup）后不再走本函数，由
+    _sanitize_at_chain_for_target + _resolve_at_mentions 处理真实 At。"""
+    if not chain:
+        return chain
+    cleaned = []
+    for comp in chain:
+        if not isinstance(comp, At):
+            cleaned.append(comp)
+            continue
+        qq = str(getattr(comp, "qq", "") or "").strip()
+        name = (getattr(comp, "name", "") or "").strip()
+        if qq == "all":
+            label = name if name and name != "all" else "全体成员"
+            cleaned.append(Plain(text=f"@{label}"))
+            logger.info("ℹ️ @全体成员已按默认策略转为文本 @全体成员")
+            continue
+        if name:
+            cleaned.append(Plain(text=f"@{name}"))
+            continue
+        if qq and qq != "0":
+            cleaned.append(Plain(text=f"@{qq}"))
+            continue
+        logger.warning(f"⚠️ 丢弃无昵称且无有效目标的 @ 组件（qq={qq!r}）")
     return cleaned
 
 
@@ -1077,8 +1110,8 @@ class MsgForward(star.Star):
             "达上限后新消息丢弃（总上限同理）。\n"
             "冷却与队列同时开启时冷却失效（队列间隔已在限流），\n"
             "list 中以 ❄失效(队列中) 标记，日志会告警一次。\n"
-            "@ 转发：默认 At 原样透传（目标端按 qq 精确解析）；开启昵称反查后\n"
-            "会按目标群成员列表把 @昵称 换成真实 qq（默认关闭）。"
+            "@ 转发：默认 At 一律转为文本 @昵称（不发送真实 At，稳妥）；开启昵称反查\n"
+            "（高级 @）后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭）。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1519,7 +1552,7 @@ class MsgForward(star.Star):
         ttl = self._at_lookup_ttl()
         cache_size = len(self._group_member_cache)
         lines = [
-            f"🔔 @ 转发：At 原样透传（目标端按 qq 精确解析），昵称仅作兜底",
+            f"🔔 @ 转发：默认 At 转为文本 @昵称；开启高级 @（昵称反查）后按 qq 透传真实 At",
             f"🔍 昵称反查：{'✅ 全局开启' if enabled else '⛔ 全局关闭（默认）'}"
             + (f" | 缓存 {ttl}s" if ttl > 0 else " | 缓存关闭（每次重新拉取）"),
             f"💾 已缓存群成员列表：{cache_size} 个群",
@@ -1532,11 +1565,10 @@ class MsgForward(star.Star):
                 lines.append(f"  #{idx} | {self._rule_name(r)} | {'🔔开启' if self._should_at_lookup(r) else '关闭'}")
         else:
             lines.append("（所有规则继承全局昵称反查设置）")
-        lines.append(
-            "\n用法：/mf at on|off 全局开关；/mf at <编号> on|off|inherit 规则级；"
+        lines.append("\n用法：/mf at on|off 全局开关；/mf at <编号> on|off|inherit 规则级；"
             "/mf at cache <秒> 缓存时长；/mf at test <群号> 测试反查"
         )
-        lines.append("说明：反查仅在目标为 QQ 系群聊时生效，开启后每条消息多一次群成员查询（有缓存）。")
+        lines.append("说明：默认 At 转为文本 @昵称（不发送真实 At）；开启反查（高级 @）后在目标为 QQ 系群聊时按 qq 透传并反查真实成员，每条消息多一次群成员查询（有缓存）。")
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1545,7 +1577,7 @@ class MsgForward(star.Star):
         """全局开启 @昵称反查"""
         self.config["at_nickname_lookup"] = True
         self.config.save_config()
-        yield event.plain_result("✅ 已全局开启 @昵称反查（规则未单独设置时生效）")
+        yield event.plain_result("✅ 已全局开启高级 @（昵称反查，规则未单独设置时生效）")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @at.command("off")
@@ -1553,7 +1585,7 @@ class MsgForward(star.Star):
         """全局关闭 @昵称反查"""
         self.config["at_nickname_lookup"] = False
         self.config.save_config()
-        yield event.plain_result("✅ 已全局关闭 @昵称反查（At 仍按原样透传）")
+        yield event.plain_result("✅ 已全局关闭 @昵称反查（At 将一律转为文本 @昵称）")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @at.command("cache")
@@ -2061,8 +2093,10 @@ class MsgForward(star.Star):
     _group_member_inflight: dict = {}
 
     def _should_at_lookup(self, rule: dict) -> bool:
-        """判断某条规则是否开启 @昵称反查。
+        """判断某条规则是否开启「高级 @（昵称反查）」。
 
+        关闭（默认）：转发时 At 一律转为文本 @昵称，不发送真实 At 组件；
+        开启：QQ 系目标按 qq 透传真实 At，并按目标群成员列表反查昵称精确 @。
         规则显式设置为 true/false 时按规则值决定；inherit（或未设置）时继承全局配置。
         兼容旧版 bool 存储（True/False）。"""
         val = rule.get("at_nickname_lookup")
@@ -2196,7 +2230,7 @@ class MsgForward(star.Star):
         return name_map, id_map
 
     async def _resolve_at_mentions(self, chain, target: str) -> list:
-        """把链中「无法解析的 @ 提及」按昵称反查为目标群真实成员（v0.5.0 可选增强）。
+        """高级 @ 模式：把链中「无法解析的 @ 提及」按昵称反查为目标群真实成员。
 
         反查顺序（优先 qq 精确匹配，昵称仅作兜底）：
           1. 纯数字 qq / @全体 → 不动，直接透传（协议端可精确解析，无需反查）；
@@ -2784,11 +2818,14 @@ class MsgForward(star.Star):
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
-                    # 目标级链：先按目标平台清洗（跨平台降级为文本 @昵称），
-                    # 再做 @昵称反查（可选，按目标群成员反查），最后前置来源头
-                    base_chain = _sanitize_at_chain_for_target(message_chain, target, at_passthrough)
+                    # 目标级链：at_nickname_lookup 开启（高级 @）→ QQ 系按 qq 透传真实 At，
+                    # 并按目标群成员列表反查昵称精确 @；默认关闭 → At 一律转为文本 @昵称
+                    # （不发送真实 At 组件，彻底规避协议端 At 解析/群成员查询超时）
                     if at_lookup:
+                        base_chain = _sanitize_at_chain_for_target(message_chain, target, at_passthrough)
                         base_chain = await self._resolve_at_mentions(base_chain, target)
+                    else:
+                        base_chain = _textify_at_chain(message_chain)
                     new_chain = base_chain if not header_text else [Plain(text=header_text)] + base_chain
 
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
