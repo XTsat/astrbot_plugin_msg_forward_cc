@@ -42,8 +42,9 @@
 工具与数据路径（常量、MIME 映射）
 → 媒体工具函数（下载 / 重建 / 本地化 / 序列化）
 → 消息链清洗（@ 清洗、File 清洗、At 转发策略）
+→ 平台机器人消息接管（目前仅 Discord：挂载标记常量、轮询间隔、消息 ID 去重上限）
 → 存储层 MsgForwardStore（无锁简化）
-→ 插件主体 MsgForward（__init__ / 命令 / 转发主逻辑）
+→ 插件主体 MsgForward（__init__ / 命令 / Discord 客户端监听挂载 / 转发主逻辑）
 ```
 
 依赖方向：工具函数不依赖类实例（全模块级函数），类方法只调用模块级工具函数与 `self.config`。
@@ -83,8 +84,8 @@
 ### 2.5 插件主体 `MsgForward(star.Star)` 生命周期
 
 - `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）
-- `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务
-- `terminate()`：取消 worker 与清理任务
+- `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务 → 启动平台机器人消息接管轮询任务（`_discord_hook_loop`，目前仅 Discord，属默认行为、无配置项）
+- `terminate()`：取消 worker 与清理任务、取消接管轮询任务，并摘除本实例补挂的 Discord 监听（`_unhook_discord_clients`，避免重载后新旧实例重复转发）
 
 ### 2.6 核心数据流
 
@@ -454,4 +455,5 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - `/mf queue pause` 暂停 worker 消费（`_queue_paused`），持久化条目不被删除；`resume` 恢复
 - 媒体缓存清理：启动时全清 + 每小时按保留时长清理；`queue clear` 立即清空（积压 + 媒体 + 持久化）
 - 自定义下载器把媒体写入媒体缓存目录（`media/` 或系统临时目录兜底），与 AstrBot 自身临时文件行为一致
+- 平台机器人消息接管：各平台适配器默认都会下发机器人消息，插件照常转发、无需额外处理，**只有 Discord 是例外**（`client.py` 的 `on_message` 直接丢弃 `author.bot` 消息，Webhook 同属 bot），这类消息不进事件管道。为保持「源会话的消息都转发」在各平台一致，插件**默认**（无配置项）用 `client.add_listener(func, "on_message")` 给 Discord 客户端补挂监听（py-cord 的 `dispatch` 会同时调用适配器覆写的 `on_message` 与附加监听），构造 `DiscordPlatformEvent` 后**直接调用 `forward_message`**，不经过核心管道——因此不会顺带唤醒 LLM 或其他插件；想排除机器人消息用规则自带过滤/内容类型筛选即可。挂载标记 `_DISCORD_HOOK_ATTR`（`(实例, 监听函数)` 元组）写在客户端实例上，用于幂等挂载与重载摘除；客户端优先按 `client` 属性取、取不到再按能力探测（`add_listener` + `user`），平台未就绪/重连时由 15 秒轮询补齐，发现适配器却始终挂不上时约 1 分钟后告警一次（不静默失效）。`_discord_handled_ids` 有界集合按消息 ID 去重，兼容核心日后不再丢弃机器人消息的情况——**登记必须在 `await forward_message` 之后**，否则 `forward_message` 开头的去重守卫会把监听自己那次转发拦掉（v0.5.5 曾踩此坑，v0.5.6 修复并补端到端回归用例）
 - group 嵌套：`@mf.group("queue")` 注册子命令组（AstrBot filter API 支持），queue 命令均为 `@queue.command(...)`
