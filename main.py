@@ -8,6 +8,7 @@ import ssl
 import string
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -553,6 +554,48 @@ async def _prepare_chain_for_media_urls(chain) -> list:
                         comp = File(name=getattr(comp, "name", "") or "", url=url)
         new_chain.append(comp)
     return new_chain
+
+
+# ------------------------
+# 发送超时检测与重试（协议端调用超时，如 NapCat sendMsg）
+# ------------------------
+
+# 协议端调用超时属瞬时故障：短延迟后重发原链即可恢复，媒体重下载只会延长耗时、加重超时
+_SEND_TIMEOUT_RETRY_DELAY = 3.0
+_SEND_TIMEOUT_MAX_RETRIES = 2
+
+
+def _is_send_timeout(exc: Exception) -> bool:
+    """判断发送失败是否为协议端调用超时（如 NapCat sendMsg retcode-1208）。
+
+    NapCat 返回的 ActionFailed 带 retcode=1208（NTService 调用超时）与
+    "Timeout/Tineout: NTEvent ... sendMsg" 文案；1200 同为 QQ 内核调用超时
+    （历史上出现在群成员查询场景）。其余适配器以 timeout/超时 文案表达时同样命中。"""
+    retcode = getattr(exc, "retcode", None)
+    if retcode is not None and str(retcode) in ("1200", "1208"):
+        return True
+    text = str(exc).lower()
+    return "timeout" in text or "tineout" in text or "超时" in text
+
+
+async def _send_with_timeout_retry(send: Callable[[], Awaitable[None]],
+                                   max_retries: int = _SEND_TIMEOUT_MAX_RETRIES,
+                                   retry_delay: float = _SEND_TIMEOUT_RETRY_DELAY) -> tuple[bool, Exception | None]:
+    """发送并在「超时类失败」时短延迟重发原链，返回 (是否成功, 最后一次异常)。
+
+    send 为零参可调用，每次尝试时新建协程（避免复用已 await 的协程）；
+    非超时失败不重试、立即返回；超时重试耗尽后返回最后一次异常，由调用方继续媒体降级。"""
+    last_err: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            await send()
+            return True, None
+        except Exception as e:
+            last_err = e
+            if not _is_send_timeout(e) or attempt >= max_retries:
+                break
+            await asyncio.sleep(retry_delay)
+    return False, last_err
 
 
 # ------------------------
@@ -2714,6 +2757,17 @@ class MsgForward(star.Star):
         except ValueError as e:
             logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
         except Exception as e:
+            # 协议端调用超时（NapCat sendMsg 等）属瞬时故障：短延迟后重发原链
+            # （媒体 URL 已实时注册、token 尚在有效期内），避免立刻重下载媒体加重超时
+            if _is_send_timeout(e):
+                first_err = e
+                sent_ok, e = await _send_with_timeout_retry(
+                    lambda: self.context.send_message(target, MessageEventResult(chain=outgoing))
+                )
+                if sent_ok:
+                    self._remove_persisted_item(uid)
+                    logger.warning(f"⚠️ 队列转发超时（{first_err}），延迟后重试成功")
+                    return
             # 第一层降级：AstrBot 核心重新本地化所有媒体（覆盖本地临时路径过期）
             try:
                 prepared = await asyncio.wait_for(
@@ -2917,29 +2971,42 @@ class MsgForward(star.Star):
                     except ValueError as e:
                         logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                     except Exception as e:
-                        # 第一层降级：AstrBot 核心重新本地化所有媒体
-                        try:
-                            if fallback_chain is None:
-                                prepared = await _prepare_chain_for_forward(filtered_chain)
-                                fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
-                            await self.context.send_message(target, event.chain_result(fallback_chain))
-                            logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
-                            if cooldown_sec > 0:
-                                self._cooldowns[cd_key] = now + cooldown_sec
-                        except Exception as e2:
-                            # 第二层降级：远程 URL 媒体
-                            if has_media:
-                                try:
-                                    localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
-                                    fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
-                                    await self.context.send_message(target, event.chain_result(fb_chain))
-                                    logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
-                                    if cooldown_sec > 0:
-                                        self._cooldowns[cd_key] = now + cooldown_sec
-                                except Exception as e3:
-                                    logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e3}")
-                            else:
-                                logger.error(f"❌ 转发失败: {e2}")
+                        # 协议端调用超时（NapCat sendMsg 等）属瞬时故障：短延迟后原链重发，
+                        # 比立刻重下载媒体更有效（重下载只会延长耗时、加重超时）
+                        sent_ok = False
+                        if _is_send_timeout(e):
+                            first_err = e
+                            sent_ok, e = await _send_with_timeout_retry(
+                                lambda: self.context.send_message(target, event.chain_result(new_chain))
+                            )
+                            if sent_ok:
+                                if cooldown_sec > 0:
+                                    self._cooldowns[cd_key] = now + cooldown_sec
+                                logger.warning(f"⚠️ 转发超时（{first_err}），延迟后重试成功")
+                        if not sent_ok:
+                            # 第一层降级：AstrBot 核心重新本地化所有媒体
+                            try:
+                                if fallback_chain is None:
+                                    prepared = await _prepare_chain_for_forward(filtered_chain)
+                                    fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
+                                await self.context.send_message(target, event.chain_result(fallback_chain))
+                                logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
+                                if cooldown_sec > 0:
+                                    self._cooldowns[cd_key] = now + cooldown_sec
+                            except Exception as e2:
+                                # 第二层降级：远程 URL 媒体
+                                if has_media:
+                                    try:
+                                        localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
+                                        fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
+                                        await self.context.send_message(target, event.chain_result(fb_chain))
+                                        logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
+                                        if cooldown_sec > 0:
+                                            self._cooldowns[cd_key] = now + cooldown_sec
+                                    except Exception as e3:
+                                        logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e3}")
+                                else:
+                                    logger.error(f"❌ 转发失败: {e2}")
 
         except Exception as e:
             logger.error(f"❌ 转发逻辑异常: {e}")
