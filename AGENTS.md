@@ -23,9 +23,9 @@
 
 | 文件 | 必选 | 职责 |
 |------|------|------|
-| `main.py` | ✅ | 插件主体，全部逻辑（2889 行，单文件风格） |
+| `main.py` | ✅ | 插件主体，全部逻辑（3019 行，单文件风格） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（232 行） |
-| `metadata.yaml` | ✅ | 插件元数据（v0.5.2，支持 19 个平台） |
+| `metadata.yaml` | ✅ | 插件元数据（v0.5.4，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档 |
 | `CHANGELOG.md` | ✅ | 变更日志 |
 | `LICENSE` | ✅ | AGPL-3.0 |
@@ -66,6 +66,7 @@
 - `_get_file_service_base_url()` / `_file_service_available()` / `_register_file_with_service(local_path, timeout=3600)`：把本地媒体注册到 AstrBot 内置文件服务（读全局 `callback_api_base`），返回 `{base}/api/file/{token}` 可下载 URL；未配置或失败返回 None
 - `_local_media_path_of(comp)`：提取组件本地化文件路径（含 file:// URI 解码、媒体缓存目录相对路径查找）
 - `_prepare_chain_for_media_urls(chain)`：发送前把媒体实时注册文件服务生成 URL（队列场景 NapCat 跨容器读不到本地路径、源端短效 URL 过期，故每次发送重新注册 token）
+- `_is_send_timeout(exc)` / `_send_with_timeout_retry(send, ...)`：协议端调用超时检测与重试——超时（NapCat sendMsg `retcode=1208`/QQ 内核 `1200` 等）属瞬时故障，短延迟 3s 后原链重发至多 2 次，仍失败才进入媒体本地化降级；直发与队列发送两条路径共用
 - `_serialize_chain(chain)` / `_deserialize_chain(data)`：队列持久化时的消息链序列化/反序列化
 - `_sanitize_chain_for_forward(chain)`：事件级 @ 清洗（空目标丢弃/降级文本，纯数字与 all 保留透传）
 - `_sanitize_file_chain_for_forward(chain)`：清洗 File 组件本地路径，仅保留 URL 走下载
@@ -353,27 +354,35 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 #### 格式
 
-统一使用 **分组式**（与远端模板 scaffold 的 `CHANGELOG.md.template` 一致）：按分类用 `###` 子标题分组，条目用「加粗标题 + 冒号 + 说明」：
+统一使用 **分组式**（与远端模板 scaffold 的 `CHANGELOG.md.template` 一致）：按分类用 `###` 子标题分组，条目用「标题 + 冒号 + 说明」，**仅重点条目/重点内容才加粗**：
 
 ```markdown
 # Changelog
 
 ## [Unreleased]
 
+> 一句话总结这个版本（可选）
+
 ### 新增
-- **功能 A**：说明
+- 功能 A：说明
 - **功能 B**：说明
 
 ### 修复
-- **问题 C**：说明
+- 问题 C：说明
 
 ## v0.5.3 (2026-09-22)
 
+> 一句话总结这个版本（可选）
+
 ### 新增
-- **功能 D**：说明
+- 功能 D：说明
 ```
 
-分组子标题分类：`新增` / `修复` / `变更` / `移除` / `性能`（只保留本次有内容的分类，无内容的分类不写空标题）。
+分组子标题分类：`新增` / `修复` / `变更` / `移除` / `性能`（只保留本次有内容的分类，无内容的分类不写空标题）
+
+**加粗规则**：条目默认不加粗；写 changelog 时先识别本次改动中的**重点改动**（核心新功能、重要修复、破坏性变更等），只对重点改动用 `**加粗**` 标题强调，其余条目一律不加粗。
+
+**版本总结**：版本标题（`## [Unreleased]` / `## vX.Y.Z (YYYY-MM-DD)`）与分类子标题之间，可加一行 `> 引用` 形式的一句话总结（概括该版本/该批改动的主旨），可选，不强制。
 
 > ⚠️ 现状说明：本项目 `CHANGELOG.md` 存量条目为早期扁平式（`- 新增：xxx` 前缀风格），属于历史记录；**新增条目一律按分组式书写**。若整体迁移历史格式，需逐条保留他人记录、另行确认，严禁整文件覆盖。
 
@@ -387,7 +396,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 ### 7.2 README 维护
 
-- 本项目当前仅维护中文版 `README.md`（`README_en.md` 尚未建立）。**若建立英文版**：中文版为权威版本（源），任何修改先落中文版、再同步到英文版，**禁止反向同步**；章节结构保持一致，禁止逐字机翻
+- 本项目当前仅维护中文版 `README.md`（`README_en.md` 尚未建立）。**若建立英文版**：中文版为权威版本（源），任何修改先落中文版、再同步到英文版，**禁止反向同步**；章节结构保持一致，禁止逐字机翻；修改时逐条 diff，确保无内容遗漏或错位，禁止留下半翻译的句子
 - 正文按 4 大板块组织：一、功能/介绍；二、指令；三、配置；四、其它（安装/快速开始/依赖/常见问题/许可证等）
 - 头部格式（如未来对齐模板）：`<div align="center">` 内 h1 = `metadata.yaml` 的 `display_name`（跨平台消息转发）+ desc + tags + 语言切换链接，**元素间不留空行**
 - 何时必须更新（模板 7.2.3 表）：功能新增/删除 → 板块一；命令变化 → 板块二；配置项变化 → 板块三；依赖/版本变化、已知问题 → 板块四。纯内部重构/样式调整/无用户可见行为的 bug 修复可不动 README
@@ -401,16 +410,22 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 方法级 docstring 用中文说明用途/参数/返回（`_` 开头私有方法用途足够明显可省略）
 - 代码分区用 `# ---- 分区名 ----` 分隔条
 
+### 7.4 PR 描述规范
+
+- **PR 描述只写最终行为**：描述最终完成了什么，而不是过程中尝试了什么
+- 禁止提及：尝试过的方案、被否定的设计、从未合入的中间状态
+- 只写 diff 里看不出来的取舍理由（如「选用方案 A 因为性能比 B 高 20%」）
+
 ---
 
 ## 8. 提交与发布流程
 
 ### 8.1 提交规范
 
-- **提交信息用中文短句式**，与历史风格一致（如 `v0.5.2 规则级队列长度上限，冷却与队列同时开启时提示冷却失效`）
+- 提交信息遵循 **Conventional Commits**：`<type>(<scope>): <中文短句式 subject>`（如 `feat: 开放颜色配置项`、`fix: 失败发送通知补重试`、`docs: 补充配置说明`）
 - **禁止**将未完成的功能、多轮迭代中间状态、被废弃方案写进提交信息
 - **提交前必须先向用户展示改动内容和提交标题**，等用户确认后再执行 commit
-- 推荐顺序：完成功能代码 → 跑通验证 → 更新 CHANGELOG 与 README → 提交；文档更新与代码改动在同一提交中完成
+- 推荐顺序：完成功能代码 → 跑通验证 → 更新 CHANGELOG 与 README → 提交；文档更新与代码改动**在同一提交中完成**（不单独拆「补文档」提交）
 - 只有用户明确要求时才 commit / push
 
 ### 8.2 版本号规范
@@ -421,7 +436,8 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 ### 8.3 测试与验证
 
-- 项目无强制测试框架，改动后自检语法与逻辑即可：`python -c "import main"` 无语法错误
+- 项目无强制测试框架，改动后自检语法与逻辑即可：`python -c "import main"` 无语法错误；若项目已补充单测，改动后需保证测试通过
+- 格式检查：`python -m ruff format .`（如果项目历史有 ruff 提交）
 - 修改后对照 `/mf help` 的树状帮助确认命令出入（命令表有新增/删除时同步更新本文件 6.2 节）
 
 ---
@@ -437,8 +453,8 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - [ ] 版本号：功能/配置变化时 `metadata.yaml` 与 `CHANGELOG` 最新版本一致
 - [ ] 配置：新增配置项已在 `_conf_schema.json`（含中文 hint/options/labels）和代码中同步，调用 `save_config()`
 - [ ] 命令：新增/修改命令已同步本次 `mf help` 树与本文件 6.2 命令表
-- [ ] 本地测试：`python -c "import main"` 无语法错误
-- [ ] 提交信息：中文短句式，只描述最终行为；提交前向用户展示改动与标题
+- [ ] 本地测试：`python -c "import main"` 无语法错误（或 ruff 格式通过）
+- [ ] 提交信息：Conventional Commits 格式（`type: 中文短句式`），只描述最终行为；提交前向用户展示改动与标题
 
 ---
 
