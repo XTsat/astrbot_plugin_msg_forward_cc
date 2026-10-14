@@ -334,7 +334,7 @@ wecom_ai_bot=企微AI机器人
 
 以下为 AstrBot 支持的全部平台之间**双向转发**测试记录。每个平台一张折叠表，表内为该平台作为**来源**转发至各**目标平台**的测试结果；**反向**（目标平台 → 该平台）结果见对应目标平台的表格。
 
-> 本插件在 `metadata.yaml` 中声明支持 AstrBot 官方全部平台适配器（aiocqhttp / qq_official / qq_official_webhook / telegram / wecom / wecom_ai_bot / lark / dingtalk / discord / slack / kook / vocechat / weixin_official_account / weixin_oc / satori / misskey / line / matrix / mattermost），并声明最低 AstrBot 版本 **v4.5.0**（`astrbot_version: ">=4.5.0"`）。
+> 本插件在 `metadata.yaml` 中声明支持 AstrBot 官方全部平台适配器（aiocqhttp / qq_official / qq_official_webhook / telegram / wecom / wecom_ai_bot / lark / dingtalk / discord / slack / kook / vocechat / weixin_official_account / weixin_oc / satori / misskey / line / matrix / mattermost），并声明最低 AstrBot 版本 **v4.0.0**（`astrbot_version: ">=4.0.0"`）。
 
 > QQ官方机器人 同时覆盖 `qq_official` 与 `qq_official_webhook` 两个适配器。
 

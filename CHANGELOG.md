@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## v0.5.5 (2026-10-14)
+
+> 修复 NapCat sendMsg 超时导致的转发失败：协议端调用超时自动重试
 
 ### 修复
 
