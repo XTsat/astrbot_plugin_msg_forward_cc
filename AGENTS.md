@@ -3,7 +3,8 @@
 > 本文件是任何 AI 编码代理（agent）进入本项目时的**必读**工作说明书。
 > 它约定插件的架构、代码规范、文档维护规则。任何对代码、配置、行为的改动，都必须同时遵守本文档的规则。
 >
-> 本文件结构对齐远端规范仓库 [XTsat/agent-templates](https://github.com/XTsat/agent-templates) 的 `templates/astrbot-plugin/AGENTS.md`；更新本文件时先读取远端模板，保持章节结构与编写规范一致。
+> **来源**：本文件基于 [XTsat/agent-templates](https://github.com/XTsat/agent-templates) 的 `templates/astrbot-plugin/AGENTS.md`，最新版见该仓库 `main` 分支；已回填本项目的插件名、命令前缀、目录结构与特有约定。
+> 用户说「更新 AGENTS」时按此流程：① 拉取来源模板最新版 → ② 与本地逐节比对 → ③ 合并（保留本项目已回填的内容）→ ④ 展示 diff 与改动清单，等用户确认后再落盘。**禁止整文件覆盖**。
 
 ---
 
@@ -23,9 +24,9 @@
 
 | 文件 | 必选 | 职责 |
 |------|------|------|
-| `main.py` | ✅ | 插件主体，全部逻辑（3019 行，单文件风格） |
+| `main.py` | ✅ | 插件主体，全部逻辑（3326 行，单文件风格） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（232 行） |
-| `metadata.yaml` | ✅ | 插件元数据（v0.5.4，支持 19 个平台） |
+| `metadata.yaml` | ✅ | 插件元数据（v0.5.5，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档 |
 | `CHANGELOG.md` | ✅ | 变更日志 |
 | `LICENSE` | ✅ | AGPL-3.0 |
@@ -40,6 +41,8 @@
 
 ```
 工具与数据路径（常量、MIME 映射）
+→ 内容类型筛选（组件 → 类型键、按类型过滤）
+→ 合并转发（聊天记录）展开（拉取内容重建 / 目标平台降级 / 节点递归遍历）
 → 媒体工具函数（下载 / 重建 / 本地化 / 序列化）
 → 消息链清洗（@ 清洗、File 清洗、At 转发策略）
 → 存储层 MsgForwardStore（无锁简化）
@@ -48,7 +51,19 @@
 
 依赖方向：工具函数不依赖类实例（全模块级函数），类方法只调用模块级工具函数与 `self.config`。
 
-### 2.3 媒体处理工具函数（模块级）
+### 2.3 合并转发（聊天记录）展开（模块级）
+
+- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`）
+- `_onebot_bot_of(event)` / `_unwrap_onebot_data(ret)` / `_forward_messages_of(payload)`：取事件所属 OneBot 协议端、归一化 action 返回值、提取节点消息列表
+- `_media_url_in_segment(data)`：从 OneBot 媒体段取可下载 http(s) URL（url 优先，file 为 URL 时兜底）
+- `_forward_segment_to_components(seg)`：把节点里的一个 OneBot 消息段转换为 AstrBot 组件（At 转文本、嵌套转发/卡片转文本占位、表情与 JSON 卡片保留）
+- `_build_forward_nodes(messages)`：把 `get_forward_msg` 返回的节点消息重建为 `Nodes`；兼容 `{"type": "node", "data": {...}}` 包裹格式，空内容节点跳过
+- `_fetch_forward_nodes(event, forward_id)`：拉取合并转发内容并重建 `Nodes`（先按 `id` 再按 `message_id` 调用，兼容不同协议端）；失败返回 None 由调用方降级
+- `_expand_forward_components(event, chain)`：把链中的 `Forward`（仅带源会话 resId）展开为重建的 `Nodes`、`Node` 包成 `Nodes`；拉取失败降级为 `[聊天记录]` 文本，绝不透传无效 forward 段
+- `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL）
+- `_chain_has_media(chain)`：链中是否含媒体组件（含节点内媒体），决定发送失败时是否值得本地化重试
+
+### 2.4 媒体处理工具函数（模块级）
 
 - `_comp_type_name(comp)` / `_comp_content_type(comp)`：组件 → 内容类型键 / Content-Type
 - `_content_types_for(rule, config)`：解析规则内容类型筛选（规则级覆盖 → 全局默认 → 全选）
@@ -76,26 +91,27 @@
 - `load_json(path)` / `save_json(path, data)`：健壮文件读写，分类记录错误（FileNotFoundError/JSONDecodeError/OSError/TypeError）；原子写入（先写 `.tmp` 再 replace，`ensure_ascii=False, indent=2`）
 - `gen_code(n=6)`：`secrets` 生成绑定码（小写字母+数字）
 
-### 2.4 存储层 `MsgForwardStore`
+### 2.5 存储层 `MsgForwardStore`
 
 - 维护 `pending.json`，提供 `load_pending / save_pending / add_pending / pop_pending`（pop 不存在的 code 抛 KeyError）
 - 无锁简化（见源码注释），数据量小、单进程访问
 
-### 2.5 插件主体 `MsgForward(star.Star)` 生命周期
+### 2.6 插件主体 `MsgForward(star.Star)` 生命周期
 
 - `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）
 - `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务
 - `terminate()`：取消 worker 与清理任务
 
-### 2.6 核心数据流
+### 2.7 核心数据流
 
 ```
 事件进入 forward_message（@filter.event_message_type(ALL)）
 → 匹配 source_umo 命中的所有规则（多源：每行一条 UMO）
 → 清洗链（@ 清洗 → File 清洗 → 无 URL File 调 API 取下载 URL）
+→ 合并转发展开（Forward → 拉取内容重建 Nodes；失败/跨平台降级为 [聊天记录]）
 → 逐规则：启停检查 → 过滤 → 内容类型筛选 → 冷却/队列分支
-→ 逐目标：At 策略（默认文本化 / 反查精确 @）→ 前置来源头 → 发送（或入队）
-→ 失败两层降级重试 → 冷却写入 / 队列 worker 按间隔发送
+→ 逐目标：At 策略（默认文本化 / 反查精确 @）→ 合并转发目标平台降级 → 前置来源头 → 发送（或入队）
+→ 失败三级兜底重试（超时重试 → 媒体本地化 → 远程 URL）→ 冷却写入 / 队列 worker 按间隔发送
 ```
 
 ---
@@ -103,7 +119,7 @@
 ## 3. 技术栈与依赖
 
 - **Python 3.10+**（AstrBot 4.x 最低要求），现代联合类型写法（`dict | None`、`list[dict]`）
-- **AstrBot API**：`astrbot.api.star`（star, Context, Star, StarTools）、`astrbot.api.event`（filter, AstrMessageEvent）、`astrbot.api`（logger, AstrBotConfig）、`astrbot.core.message.components`（At, Plain, Image, Record, Video, File, Face）、`astrbot.core.message.message_event_result`（MessageEventResult）
+- **AstrBot API**：`astrbot.api.star`（star, Context, Star, StarTools）、`astrbot.api.event`（filter, AstrMessageEvent）、`astrbot.api`（logger, AstrBotConfig）、`astrbot.core.message.components`（At, Plain, Image, Record, Video, File, Face, Forward, Json, Node, Nodes）、`astrbot.core.message.message_event_result`（MessageEventResult）
 - **依赖管理**：不引入新依赖，纯标准库（json/re/secrets/time/pathlib/string/tempfile/ssl/socket/urllib）+ AstrBot API；`aiohttp` / `certifi` 在 `_download_url_to_local` 内惰性 import（AstrBot 运行时已自带，仅用于兜底媒体下载，import 失败时降级为占位文本，不影响其余功能）；`astrbot.core.astrbot_config` / `astrbot.core.file_token_service` 在文件服务函数内惰性 import
 - **禁止引入**：不引入与原功能无关的依赖，非必要不新增 `requirements.txt`
 
@@ -116,6 +132,7 @@
 - Python 3.10+ 现代联合类型写法（`str | None`、`list[dict]`、`tuple[str, str]`）
 - 函数签名完整类型注解（参数 + 返回类型）；用 `yield` 返回结果的命令/事件处理方法标注为 `AsyncGenerator[MessageEventResult, None]`
 - 现有历史代码部分命令方法未标注返回类型（现状差距）；**新增/修改代码严格执行完整注解，不主动大规模重构旧代码**
+- 禁止 `Any` 作为类型注解（调用方签名强制要求时除外），禁止 `# type: ignore`
 
 ### 4.2 命名约定
 
@@ -308,6 +325,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 2. `_sanitize_chain_for_forward`：清洗无效 @（空目标丢弃/降级文本；纯数字与 all 保留）
 3. `_sanitize_file_chain_for_forward`：File 组件仅保留 URL
 4. `_resolve_file_urls`：无 URL 的 File 尝试从原始 OneBot 消息获取下载 URL（`get_group_file_url`）
+5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `Nodes`；拉取失败降级为 `[聊天记录]` 文本
 
 逐规则流程：
 1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
@@ -315,13 +333,13 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
 4. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
 5. 主链：默认透传 `sanitized_chain`（媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
-6. 逐目标：At 策略（反查开启且选中 @ 类型 → `_sanitize_at_chain_for_target` + `_resolve_at_mentions` 精确 @；默认 → `_textify_at_chain` 转文本）；`_should_attach_header` 判定后前置来源头（末尾 `\n\n\u200b` 零宽空格避免连续换行问题）
+6. 逐目标：At 策略（反查开启且选中 @ 类型 → `_sanitize_at_chain_for_target` + `_resolve_at_mentions` 精确 @；默认 → `_textify_at_chain` 转文本）；`_degrade_forward_for_target` 在目标平台不支持 `Nodes` 时把合并转发降级为 `[聊天记录]` 文本；`_should_attach_header` 判定后前置来源头（末尾 `\n\n\u200b` 零宽空格避免连续换行问题）
 7. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳；单目标失败不影响其他目标
-8. 失败两层自动降级：第一层 AstrBot 核心重新本地化所有媒体重试；仍失败且含媒体时第二层 `_prepare_chain_fallback`（远程 URL 本地化，走规则级代理三态）重试；仍失败记录错误
+8. 失败三级兜底：① 超时类失败（`_is_send_timeout`）先用 `_send_with_timeout_retry` 原链短延迟（3s）重发至多 2 次；② 仍失败 → AstrBot 核心重新本地化所有媒体重试；③ 仍失败且含媒体 → `_prepare_chain_fallback`（远程 URL 本地化，走规则级代理三态）重试；仍失败记录错误
 
 **队列模式下的冷却（有意设计，非 bug）**：队列分支先于冷却检查 `continue`，冷却判断与写入只在即时发送路径执行、后台 worker 不读 `_cooldowns`，因此规则同时配置冷却与队列间隔时冷却**实际失效**，只有队列间隔在限流；`_cooldown_ignored(rule)` 判定（`queue_enabled` 开启且规则队列间隔 > 0），`_format_rules` / `cmd_filter_list` 显示 `❄失效(队列中)` / `❄Ns（队列中失效）` 标记，`forward_message` 按 `_cooldown_warned`（rule_key 去重）只告警一次。
 
-**队列 worker（`_queue_worker` / `_send_queued_item`）**：FIFO 消费 `_send_queue`，按条目 interval 间隔发送；发送前若 `has_media` 则实时注册文件服务 URL（`_prepare_chain_for_media_urls`），失败走同样两层降级；`_queue_paused` 时停止消费；发送成功/丢弃后 `_remove_persisted_item` 并从 `_queue_rule_counts` 减计数。队列持久化条目记录 `rule_key`、序列化链、header_text、has_media、代理三态。
+**队列 worker（`_queue_worker` / `_send_queued_item`）**：FIFO 消费 `_send_queue`，按条目 interval 间隔发送；发送前若 `has_media` 则实时注册文件服务 URL（`_prepare_chain_for_media_urls`），失败走同样的超时重试与两级媒体降级；`_queue_paused` 时停止消费；发送成功/丢弃后 `_remove_persisted_item` 并从 `_queue_rule_counts` 减计数。队列持久化条目记录 `rule_key`、序列化链、header_text、has_media、代理三态。
 
 ### 6.6 过滤系统
 
@@ -334,6 +352,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 ### 6.7 内容类型筛选与 @ 转发
 
 - 内容类型键：`plain` 文字 / `image` 图片 / `face` 表情（仅 QQ 内置表情 Face 组件）/ `record` 语音 / `video` 视频 / `file` 文件 / `at` @提及 / `other` 其他；QQ 收藏的表情/表情包以图片形式到达，归入「图片」
+- 合并转发（聊天记录，`Nodes`）归入「其他」类型：勾选「其他」才会转发聊天记录；目标平台不支持合并转发（非 `aiocqhttp` / `satori`）时降级为 `[聊天记录]` 文本
 - 纯媒体转发（未选中「文字」）时不附带来源信息头（`_should_attach_header`）
 - @ 转发默认策略：At 一律转为文本 `@昵称`（不发送真实 At 组件，彻底规避协议端解析/群成员查询超时）
 - @昵称反查（可选增强，默认关闭）：开启后按目标群成员列表把 `@昵称` 反查为目标群真实 `qq` 再精确 @；反查顺序「qq 精确匹配优先，昵称兜底」；群成员列表按群缓存（`at_nickname_lookup_cache_ttl` 默认 300s），昵称重名跳过反查，拉取失败/无 QQ 协议端/目标非 QQ 群时静默降级，不影响转发
@@ -384,6 +403,24 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 **版本总结**：版本标题（`## [Unreleased]` / `## vX.Y.Z (YYYY-MM-DD)`）与分类子标题之间，可加一行 `> 引用` 形式的一句话总结（概括该版本/该批改动的主旨），可选，不强制。
 
+#### 写作视角（面向用户）
+
+CHANGELOG 的读者是**插件使用者**（服务器管理员、群成员），不是开发者。条目只写「用户能感知到的变化」，不写内部实现：
+
+- **写用户视角的结果**：用户能做什么、会看到什么、行为/默认值/配置有什么不同。
+- **禁止内部实现细节**：类名/函数名、方法拆分、数据结构、算法、缓存与并发策略、日志埋点、依赖升级、重构过程，一律不写。
+- **禁止出现代码标识符与文件路径**；用户直接接触的**命令名**、**配置项 key** 除外。
+- **无用户感知的改动不记入 CHANGELOG**：纯内部重构、格式化、注释与测试调整等，写了用户也读不懂、也用不上。
+- 判断标准：使用者读完一条，能决定「要不要升级、升级后有什么不同」。
+
+正反例：
+
+```markdown
+### 修复
+- ✅ 协议端调用超时自动重试：发送超时后短延迟重发原消息，不再直接重下载媒体、加重协议端负担
+- ❌ 新增 `_send_with_timeout_retry` 并在发送路径接入 `_is_send_timeout` 判定
+```
+
 > ⚠️ 现状说明：本项目 `CHANGELOG.md` 存量条目为早期扁平式（`- 新增：xxx` 前缀风格），属于历史记录；**新增条目一律按分组式书写**。若整体迁移历史格式，需逐条保留他人记录、另行确认，严禁整文件覆盖。
 
 #### 版本号联动
@@ -396,13 +433,76 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 ### 7.2 README 维护
 
-- 本项目当前仅维护中文版 `README.md`（`README_en.md` 尚未建立）。**若建立英文版**：中文版为权威版本（源），任何修改先落中文版、再同步到英文版，**禁止反向同步**；章节结构保持一致，禁止逐字机翻；修改时逐条 diff，确保无内容遗漏或错位，禁止留下半翻译的句子
-- 正文按 4 大板块组织：一、功能/介绍；二、指令；三、配置；四、其它（安装/快速开始/依赖/常见问题/许可证等）
-- 头部格式（如未来对齐模板）：`<div align="center">` 内 h1 = `metadata.yaml` 的 `display_name`（跨平台消息转发）+ desc + tags + 语言切换链接，**元素间不留空行**
-- 何时必须更新（模板 7.2.3 表）：功能新增/删除 → 板块一；命令变化 → 板块二；配置项变化 → 板块三；依赖/版本变化、已知问题 → 板块四。纯内部重构/样式调整/无用户可见行为的 bug 修复可不动 README
+#### 7.2.1 写作视角（面向用户）
+
+README 的读者是**插件使用者**（服务器管理员、群成员），不是开发者。只写用户能直接用到的东西：
+
+- **该写的**：能做什么（能力清单）、怎么装、怎么配（配置表）、怎么用（指令表与示例）、出问题怎么办（常见问题、前置条件与限制）。
+- **不该写的**：实现原理与设计理念、架构分层与模块划分、算法与数据结构、内部调用流程、类名/函数名/文件路径、性能优化手段、依赖内部实现。
+- **代码只贴用户要用的最小片段**：安装命令、配置项、指令示例；不贴内部实现代码。
+- **技术细节翻译成用户语言**：不写「用 `asyncio.Queue` 做 FIFO 消费」，写「发送队列按设定间隔逐条发送，可暂停 / 恢复」。
+- 判断标准：使用者只读 README，就能独立完成安装 → 配置 → 使用 → 排障。
+
+正反例：
+
+```markdown
+- ✅ 支持转发语音、视频、文件，并可勾选需要转发的内容类型
+- ❌ 媒体组件经 `_rebuild_media_component` 重建为 dataclass 节点后由队列 worker 发送
+```
+
+#### 7.2.2 头部表头格式
+
+本项目当前仅维护中文版 `README.md`（`README_en.md` 尚未建立），现有头部为单行标题；未来对齐模板时按以下格式（**元素间不留空行**）：
+
+```html
+<div align="center">
+<h1>跨平台消息转发</h1>
+<p><strong>在不同聊天平台及群聊之间自动转发与同步消息</strong></p>
+<p><sub>消息转发 &nbsp;&nbsp; 跨平台 &nbsp;&nbsp; 群聊桥接 &nbsp;&nbsp; 聊天 &nbsp;&nbsp; 消息 &nbsp;&nbsp; 同步 &nbsp;&nbsp; 转发 &nbsp;&nbsp; 过滤 &nbsp;&nbsp; 工具</sub></p>
+<p><strong>中文</strong> &nbsp;/&nbsp; <a href="README_en.md">English</a></p>
+</div>
+```
+
+- **h1**：取 `metadata.yaml` 的 `display_name`（跨平台消息转发）
+- **desc**：取 `metadata.yaml` 的 `desc`
+- **tags**：取 `metadata.yaml` 的 `tags`（中文标签，用 `&nbsp;&nbsp;` 分隔）
+
+#### 7.2.3 README 四大结构
+
+正文按 4 大板块组织，当前 README 将「指令」与「配置」合并在「二、指令与配置」，「平台兼容性测试」归入「其它」，新增内容按所属板块归位：
+
+| 板块 | 内容 |
+|------|------|
+| 一、功能/介绍 | 功能介绍、特性列表、用户使用场景 |
+| 二、指令 | 命令表格（命令、权限、说明）、使用示例 |
+| 三、配置 | 配置项表格（配置项、类型、默认值、说明） |
+| 四、其它 | 安装、快速开始、运行环境与依赖、常见问题、平台兼容性、许可证、鸣谢 |
+
+更新后通读一遍 README，确保与新行为一致（默认值、超时说明、数据目录等）。
+
+#### 7.2.4 何时必须更新 README
+
+| 改动类型 | 必须更新的板块 |
+|----------|--------------|
+| 功能新增/删除 | 一、功能/介绍 |
+| 使用方式/命令变化 | 二、指令 |
+| 配置项变化 | 三、配置 |
+| 依赖/版本要求变化 | 四、其它（安装/依赖部分） |
+| 已知问题/行为变化 | 四、其它（常见问题部分） |
+
+**何时不需要更新 README**：纯内部重构（行为完全不变）、样式调整、无用户可见行为的 bug 修复。
+
+#### 7.2.5 双语文档同步
+
+- 本项目当前只有中文版 `README.md`；**若建立英文版** `README_en.md`：中文版是**权威版本（源）**，所有改动先落中文版、再同步到英文版，**禁止反向同步**；章节结构保持一致，禁止逐字机翻、禁止留下半翻译的句子
+- 头部语言切换链接互相指向对方文件
+- 修改时逐条 diff，确保无内容遗漏或错位
+
+#### 7.2.6 格式与多会话约束
+
 - 配置项在 README/CHANGELOG 中引用时，**中文名在前、英文 key 在后**：统一「中文名（`key`）」形式
 - **禁止无意义的换行**：HTML 头部区块内元素间不留空行；正文一段文字保持一行；空行只用于分隔标题、表格、列表、代码块等结构性区块
-- **多会话并行修改**：更新 README 前先读取当前文件，保留他人内容，严禁整文件覆盖
+- **多会话并行修改**：更新 `README.md` / `README_en.md` 前必须先读取当前文件内容，保留他人内容，只追加/修改自己的部分，严禁整文件覆盖
 
 ### 7.3 注释规范
 
@@ -424,9 +524,15 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 - 提交信息遵循 **Conventional Commits**：`<type>(<scope>): <中文短句式 subject>`（如 `feat: 开放颜色配置项`、`fix: 失败发送通知补重试`、`docs: 补充配置说明`）
 - **禁止**将未完成的功能、多轮迭代中间状态、被废弃方案写进提交信息
-- **提交前必须先向用户展示改动内容和提交标题**，等用户确认后再执行 commit
+- **提交前必须先向用户展示改动内容和提交标题**，等用户确认后再执行 commit；展示内容至少包含：待提交文件清单、改动概要（如 `git diff --stat`）、提交标题；涉及推送时另附提交 hash 与目标分支
 - 推荐顺序：完成功能代码 → 跑通验证 → 更新 CHANGELOG 与 README → 提交；文档更新与代码改动**在同一提交中完成**（不单独拆「补文档」提交）
 - 只有用户明确要求时才 commit / push
+- **授权一次性，不延续**（「上一轮说过推送」≠ 本轮可以提交）：
+  - 用户的确认**只对当次动作生效**；下一次改动必须重新展示改动内容与提交标题，重新确认
+  - 展示后改动内容又变了（用户提了新要求、你又改了文件，哪怕只改一行），**原确认立即失效**，必须重新展示并再次确认
+  - 下列情形**都不算授权**：上一轮 / 上一个任务 / 上一个会话说过「提交」「推送」；会话恢复（resume / fork）后继承的历史授权；用户对功能或代码表示满意；用户正在讨论其它需求；用户未回复
+  - 授权范围逐项独立：确认 commit ≠ 授权 push；确认推送某分支 ≠ 授权后续继续提交或推送；确认一个提交 ≠ 授权 `--amend` 或追加提交
+  - 执行前自检：能指出用户**本轮**对**本次改动**的明确同意原话；指不出来就先问，不要执行
 
 ### 8.2 版本号规范
 
@@ -447,14 +553,15 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - [ ] 架构：单文件 + 分区注释风格与既有代码一致；新工具函数放在模块级分区
 - [ ] 注释：只写 non-obvious reason，无残留中间状态、无被注释掉的旧代码
 - [ ] 类型：新增/修改函数完整类型注解，禁止 `Any` 与 `# type: ignore`
-- [ ] 日志：`logger.info/error/warning` + ❌/⚠️ emoji；异常分类记录；无空 catch
-- [ ] CHANGELOG：`[Unreleased]` 已追加分组式条目，保留了他人的既有记录（含扁平式历史条目）
-- [ ] README：涉及用户可见变更时已同步更新（4 大板块）
+- [ ] 日志：`logger.info/error/warning` + ❌/⚠️ emoji，新增日志带 `[astrbot_plugin_msg_forward_cc]` 前缀；异常分类记录；无空 catch
+- [ ] CHANGELOG：`[Unreleased]` 已追加分组式条目，条目面向用户（无内部实现细节），保留了他人的既有记录（含扁平式历史条目）
+- [ ] README：涉及用户可见变更时已同步更新（4 大板块），且面向用户书写（无实现原理与内部细节）
 - [ ] 版本号：功能/配置变化时 `metadata.yaml` 与 `CHANGELOG` 最新版本一致
 - [ ] 配置：新增配置项已在 `_conf_schema.json`（含中文 hint/options/labels）和代码中同步，调用 `save_config()`
 - [ ] 命令：新增/修改命令已同步本次 `mf help` 树与本文件 6.2 命令表
 - [ ] 本地测试：`python -c "import main"` 无语法错误（或 ruff 格式通过）
 - [ ] 提交信息：Conventional Commits 格式（`type: 中文短句式`），只描述最终行为；提交前向用户展示改动与标题
+- [ ] 提交/推送：已取得用户对本次改动的明确确认（一次性授权，未沿用上一轮）
 
 ---
 
@@ -466,7 +573,9 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 转发对同一 source 的规则是循环顺序执行，无并发锁；存储层注释「无锁简化」
 - 媒体转发默认不下载（`download_media_before_send=false`），跨设备转发提示找不到文件时才开启；NapCat 等容器场景读不到源端本地路径时依赖 File URL + 文件服务
 - 队列模式下媒体必须本地化（`_prepare_chain_for_queue` 无条件执行，不受 `download_media_before_send` 影响），防止源端临时文件延迟后被清理；发送前用文件服务实时注册 URL（NapCat 跨容器 + 短效 token 双重问题）
-- 队列持久化恢复（`_restore_persisted_queue`）在 `initialize()` 中执行，恢复后按 `rule_key` 重算规则级积压计数，上限判断保持有效
+- 队列持久化恢复（`_restore_persisted_queue`）在 `initialize()` 中执行，恢复后按 `rule_key` 重算规则级积压计数，上限判断保持有效；无法还原的空条目（旧版未序列化合并转发）从 `queue.json` 清除，避免永久残留
+- 合并转发（聊天记录）：`Forward` 组件只携带源会话的 resId，直接透传会在目标端生成打不开的卡片（并露出 `#000000`、`34` 等模板字段），因此必须先拉取内容重建 `Nodes` 再发送；嵌套合并转发在卡片里无法取回内容，降级为 `[聊天记录]` 文本；只有 `aiocqhttp` / `satori` 目标能发送 `Nodes`，其他平台降级为文本
+- 合并转发节点内媒体：直接发送由 AstrBot `Node.to_dict()` 转 base64 内嵌；队列模式由 `_prepare_chain_for_queue` 递归本地化，发送前 `_prepare_chain_for_media_urls` 递归注册文件服务 URL
 - `/mf queue pause` 暂停 worker 消费（`_queue_paused`），持久化条目不被删除；`resume` 恢复
 - 媒体缓存清理：启动时全清 + 每小时按保留时长清理；`queue clear` 立即清空（积压 + 媒体 + 持久化）
 - 自定义下载器把媒体写入媒体缓存目录（`media/` 或系统临时目录兜底），与 AstrBot 自身临时文件行为一致
