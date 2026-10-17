@@ -347,6 +347,8 @@ wecom_ai_bot=企微AI机器人
 
 > 说明：测试需要两个会话均接入本插件并建立转发规则（如 `/mf bindraw qq 654321 tg 123456`）。同平台不同会话之间（如 QQ 群 A → QQ 群 B）同样需要测试。
 
+已测试的 aiocqhttp 协议端：snowluma、LLOneBot、NapCat
+
 <details>
 <summary>aiocqhttp</summary>
 
