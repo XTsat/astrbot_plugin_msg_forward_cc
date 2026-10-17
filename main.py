@@ -183,9 +183,9 @@ _FORWARD_MAX_DEPTH = 2
 class _ForwardNodes(Nodes):
     """合并转发组件：自定义 OneBot 序列化。
 
-    AstrBot 内置 `Nodes.to_dict` 不支持节点内嵌套聊天记录；aiocqhttp 适配器对
-    `Nodes` 直接调用 `to_dict()`，因此覆写该方法生成目标协议端可直接上传的 payload
-    （嵌套记录输出为嵌套 node 数组）。"""
+    AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录；
+    aiocqhttp 适配器对 `Nodes` 直接调用 `to_dict()`，因此覆写该方法生成目标协议端
+    可直接上传的 payload（保留原始发送时间，嵌套记录输出为嵌套 node 数组）。"""
 
     async def to_dict(self) -> dict:
         return {"messages": [await _node_to_onebot_dict(node) for node in self.nodes]}
@@ -218,8 +218,10 @@ async def _component_to_onebot_segment(comp: BaseMessageComponent) -> dict:
 
 
 async def _node_to_onebot_dict(node: Node) -> dict:
-    """把单个合并转发节点序列化为 OneBot node 段。"""
+    """把单个合并转发节点序列化为 OneBot node 段（含原始发送时间）。"""
     data = {"user_id": str(node.uin or "0"), "nickname": node.name or ""}
+    if isinstance(node.time, int) and node.time > 0:
+        data["time"] = node.time
     nested = _sole_nested_forward(node.content or [])
     if nested is not None:
         data["content"] = [await _node_to_onebot_dict(n) for n in nested.nodes]
@@ -236,11 +238,11 @@ def _nodes_without_nested(nodes: Nodes) -> _ForwardNodes:
             Plain(text=_FORWARD_PLACEHOLDER) if isinstance(c, Nodes | Node) else c
             for c in node.content or []
         ]
-        rebuilt.append(Node(content=content, uin=node.uin, name=node.name))
+        rebuilt.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
     return _ForwardNodes(rebuilt)
 
 
-async def _expand_nested_forwards(event, nodes: Nodes, *, depth: int) -> _ForwardNodes:
+async def _expand_nested_forwards(event, nodes: Nodes, *, keep_time: bool, depth: int) -> _ForwardNodes:
     """递归展开节点内嵌套的聊天记录；层数超限或拉取失败时降级为文本占位。"""
     if depth <= 0:
         return _nodes_without_nested(nodes)
@@ -253,12 +255,12 @@ async def _expand_nested_forwards(event, nodes: Nodes, *, depth: int) -> _Forwar
                 continue
             nested_id = str(getattr(comp, "id", "") or "")
             nested = (
-                await _fetch_forward_nodes(event, nested_id, depth=depth - 1)
+                await _fetch_forward_nodes(event, nested_id, keep_time=keep_time, depth=depth - 1)
                 if nested_id
                 else None
             )
             content.append(nested if nested is not None else Plain(text=_FORWARD_PLACEHOLDER))
-        rebuilt.append(Node(content=content, uin=node.uin, name=node.name))
+        rebuilt.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
     return _ForwardNodes(rebuilt)
 
 
@@ -366,8 +368,11 @@ def _forward_segment_to_components(seg) -> list:
     return []
 
 
-def _build_forward_nodes(messages: list) -> _ForwardNodes | None:
-    """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。"""
+def _build_forward_nodes(messages: list, *, keep_time: bool = True) -> _ForwardNodes | None:
+    """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。
+
+    keep_time=True 时把每条消息的原始发送时间写进 Node.time，由自定义序列化带给
+    目标协议端；否则不携带时间（部分平台会统一显示为转发时的时间）。"""
     nodes = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -378,6 +383,7 @@ def _build_forward_nodes(messages: list) -> _ForwardNodes | None:
             segments = msg.get("content")
         uin = sender.get("user_id") or msg.get("user_id") or ""
         name = sender.get("card") or sender.get("nickname") or msg.get("nickname") or ""
+        node_time = _forward_node_time(msg.get("time")) if keep_time else 0
         # 兼容 {"type": "node", "data": {...}} 包裹格式
         node_data = msg.get("data") if msg.get("type") == "node" else None
         if isinstance(node_data, dict):
@@ -385,6 +391,8 @@ def _build_forward_nodes(messages: list) -> _ForwardNodes | None:
             segments = node_data.get("content") if isinstance(node_data.get("content"), list) else segments
             uin = node_data.get("user_id") or node_sender.get("user_id") or uin
             name = node_data.get("nickname") or node_sender.get("card") or node_sender.get("nickname") or name
+            if keep_time:
+                node_time = node_time or _forward_node_time(node_data.get("time"))
         if not isinstance(segments, list):
             continue
         content = []
@@ -392,14 +400,24 @@ def _build_forward_nodes(messages: list) -> _ForwardNodes | None:
             content.extend(_forward_segment_to_components(seg))
         if not content:
             continue
-        nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or "")))
+        nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or ""), time=node_time))
     return _ForwardNodes(nodes) if nodes else None
+
+
+def _forward_node_time(raw) -> int:
+    """归一化节点消息的发送时间（秒级时间戳），无法解析时返回 0。"""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 < value < 4294967295 else 0
 
 
 async def _fetch_forward_nodes(
     event,
     forward_id: str,
     *,
+    keep_time: bool = True,
     depth: int = _FORWARD_MAX_DEPTH,
 ) -> _ForwardNodes | None:
     """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 _ForwardNodes。
@@ -425,27 +443,28 @@ async def _fetch_forward_nodes(
             continue
         if _forward_messages_of(payload):
             break
-    nodes = _build_forward_nodes(_forward_messages_of(payload or {}))
+    nodes = _build_forward_nodes(_forward_messages_of(payload or {}), keep_time=keep_time)
     if nodes is None:
         logger.warning(
             f"⚠️ [astrbot_plugin_msg_forward_cc] 合并转发内容拉取失败或为空（{forward_id[:24]}…），将降级为文本占位：{last_error}"
         )
         return None
     logger.info(f"ℹ️ [astrbot_plugin_msg_forward_cc] 已展开合并转发：{len(nodes.nodes)} 条聊天记录")
-    return await _expand_nested_forwards(event, nodes, depth=depth)
+    return await _expand_nested_forwards(event, nodes, keep_time=keep_time, depth=depth)
 
 
-async def _expand_forward_components(event, chain) -> list:
+async def _expand_forward_components(event, chain, *, keep_time: bool = True) -> list:
     """把链中的合并转发组件统一展开为可跨会话发送的 _ForwardNodes。
 
     Forward 仅携带源会话 resId，需拉取内容重建；Node 包成 Nodes 以便统一发送；
-    拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。"""
+    拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。
+    keep_time 控制是否保留聊天记录里每条消息的原始发送时间。"""
     if not chain:
         return chain
     expanded = []
     for comp in chain:
         if isinstance(comp, Forward):
-            nodes = await _fetch_forward_nodes(event, getattr(comp, "id", ""))
+            nodes = await _fetch_forward_nodes(event, getattr(comp, "id", ""), keep_time=keep_time)
             expanded.append(nodes if nodes is not None else Plain(text=_FORWARD_PLACEHOLDER))
         elif isinstance(comp, Node):
             expanded.append(_ForwardNodes([comp]))
@@ -465,12 +484,12 @@ async def _map_chain_components(chain, mapper) -> list:
     for comp in chain:
         if isinstance(comp, Node):
             content = await _map_chain_components(comp.content or [], mapper)
-            mapped.append(Node(content=content, uin=comp.uin, name=comp.name))
+            mapped.append(Node(content=content, uin=comp.uin, name=comp.name, time=comp.time))
         elif isinstance(comp, Nodes):
             nodes = []
             for node in comp.nodes:
                 content = await _map_chain_components(node.content or [], mapper)
-                nodes.append(Node(content=content, uin=node.uin, name=node.name))
+                nodes.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
             # 保留子类（_ForwardNodes 的自定义序列化不能被降级成内置 Nodes）
             mapped.append(type(comp)(nodes))
         else:
@@ -927,6 +946,7 @@ def _serialize_node(node) -> dict:
     return {
         "uin": str(getattr(node, "uin", "") or ""),
         "name": str(getattr(node, "name", "") or ""),
+        "time": int(getattr(node, "time", 0) or 0),
         "content": _serialize_chain(getattr(node, "content", None) or []),
     }
 
@@ -938,7 +958,12 @@ def _deserialize_node(data) -> Node | None:
     content = _deserialize_chain(data.get("content") or [])
     if not content:
         return None
-    return Node(content=content, uin=str(data.get("uin") or "0"), name=str(data.get("name") or ""))
+    return Node(
+        content=content,
+        uin=str(data.get("uin") or "0"),
+        name=str(data.get("name") or ""),
+        time=_forward_node_time(data.get("time")),
+    )
 
 
 def _serialize_chain(chain) -> list:
@@ -3268,7 +3293,10 @@ class MsgForward(star.Star):
             sanitized_chain = await self._resolve_file_urls(event, sanitized_chain)
             # 合并转发（聊天记录）展开：源会话的 forward resId 在目标端无效，
             # 需拉取真实内容重建 Nodes，交给目标平台重新上传（否则显示坏卡片）
-            sanitized_chain = await _expand_forward_components(event, sanitized_chain)
+            keep_forward_time = bool(self.config.get("forward_keep_time", True))
+            sanitized_chain = await _expand_forward_components(
+                event, sanitized_chain, keep_time=keep_forward_time
+            )
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
