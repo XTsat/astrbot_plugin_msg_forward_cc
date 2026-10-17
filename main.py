@@ -19,7 +19,7 @@ from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
 from astrbot.core.message.components import (
-    At, Plain, Image, Record, Video, File, Face, Forward, Json, Node, Nodes,
+    At, BaseMessageComponent, Plain, Image, Record, Video, File, Face, Forward, Json, Node, Nodes,
 )
 from astrbot.core.message.message_event_result import MessageEventResult
 
@@ -176,6 +176,91 @@ _FORWARD_PLACEHOLDER = "[聊天记录]"
 # AstrBot 中可直接发送 Nodes（合并转发）的目标平台适配器类型
 _NODES_TARGET_PLATFORMS = {"aiocqhttp", "satori"}
 
+# 嵌套聊天记录最多再展开的层数（协议端合并转发上限 3 层，留一层余量）
+_FORWARD_MAX_DEPTH = 2
+
+
+class _ForwardNodes(Nodes):
+    """合并转发组件：自定义 OneBot 序列化。
+
+    AstrBot 内置 `Nodes.to_dict` 不支持节点内嵌套聊天记录；aiocqhttp 适配器对
+    `Nodes` 直接调用 `to_dict()`，因此覆写该方法生成目标协议端可直接上传的 payload
+    （嵌套记录输出为嵌套 node 数组）。"""
+
+    async def to_dict(self) -> dict:
+        return {"messages": [await _node_to_onebot_dict(node) for node in self.nodes]}
+
+
+def _sole_nested_forward(content: list[BaseMessageComponent]) -> Nodes | None:
+    """节点内容只有一条合并转发时返回它。
+
+    OneBot 协议端只支持「节点内容 = 纯嵌套 node 数组」这种嵌套形式；节点内混排文本
+    与嵌套转发无法表达，调用方需降级为文本占位。"""
+    if len(content) == 1 and isinstance(content[0], Nodes):
+        return content[0]
+    return None
+
+
+async def _component_to_onebot_segment(comp: BaseMessageComponent) -> dict:
+    """把节点内容里的一个组件序列化为 OneBot 消息段（与 AstrBot 内置逻辑保持一致）。"""
+    if isinstance(comp, Image | Record):
+        # 媒体段必须转 base64 内嵌：源端 URL 是短效的，目标端下载时往往已过期
+        bs64 = await comp.convert_to_base64()
+        return {"type": comp.type.lower(), "data": {"file": f"base64://{bs64}"}}
+    if isinstance(comp, Plain):
+        return await comp.to_dict()
+    if isinstance(comp, File):
+        return await comp.to_dict()
+    if isinstance(comp, Nodes | Node):
+        # 混排场景无法用嵌套 node 数组表达，降级为文本占位（避免生成打不开的卡片）
+        return {"type": "text", "data": {"text": _FORWARD_PLACEHOLDER}}
+    return comp.toDict()
+
+
+async def _node_to_onebot_dict(node: Node) -> dict:
+    """把单个合并转发节点序列化为 OneBot node 段。"""
+    data = {"user_id": str(node.uin or "0"), "nickname": node.name or ""}
+    nested = _sole_nested_forward(node.content or [])
+    if nested is not None:
+        data["content"] = [await _node_to_onebot_dict(n) for n in nested.nodes]
+    else:
+        data["content"] = [await _component_to_onebot_segment(c) for c in node.content or []]
+    return {"type": "node", "data": data}
+
+
+def _nodes_without_nested(nodes: Nodes) -> _ForwardNodes:
+    """把节点内未展开的嵌套聊天记录降级为文本占位（透传源 resId 只会生成坏卡片）。"""
+    rebuilt = []
+    for node in nodes.nodes:
+        content = [
+            Plain(text=_FORWARD_PLACEHOLDER) if isinstance(c, Nodes | Node) else c
+            for c in node.content or []
+        ]
+        rebuilt.append(Node(content=content, uin=node.uin, name=node.name))
+    return _ForwardNodes(rebuilt)
+
+
+async def _expand_nested_forwards(event, nodes: Nodes, *, depth: int) -> _ForwardNodes:
+    """递归展开节点内嵌套的聊天记录；层数超限或拉取失败时降级为文本占位。"""
+    if depth <= 0:
+        return _nodes_without_nested(nodes)
+    rebuilt = []
+    for node in nodes.nodes:
+        content: list[BaseMessageComponent] = []
+        for comp in node.content or []:
+            if not isinstance(comp, Forward):
+                content.append(comp)
+                continue
+            nested_id = str(getattr(comp, "id", "") or "")
+            nested = (
+                await _fetch_forward_nodes(event, nested_id, depth=depth - 1)
+                if nested_id
+                else None
+            )
+            content.append(nested if nested is not None else Plain(text=_FORWARD_PLACEHOLDER))
+        rebuilt.append(Node(content=content, uin=node.uin, name=node.name))
+    return _ForwardNodes(rebuilt)
+
 
 def _onebot_bot_of(event) -> object | None:
     """取事件所属的 OneBot 协议端实例（Forward 组件只会由 OneBot 平台产生）。"""
@@ -270,7 +355,9 @@ def _forward_segment_to_components(seg) -> list:
             return [Plain(text=_FORWARD_PLACEHOLDER)]
         return [Plain(text="[卡片消息]")]
     if seg_type == "forward":
-        return [Plain(text=_FORWARD_PLACEHOLDER)]
+        # 带 resId 的嵌套聊天记录保留 Forward，交给 _expand_nested_forwards 递归展开
+        nested_id = str(data.get("id") or data.get("res_id") or data.get("forward_id") or "")
+        return [Forward(id=nested_id)] if nested_id else [Plain(text=_FORWARD_PLACEHOLDER)]
     if seg_type == "markdown":
         text = str(data.get("content") or data.get("markdown") or "")
         return [Plain(text=text)] if text else []
@@ -279,8 +366,8 @@ def _forward_segment_to_components(seg) -> list:
     return []
 
 
-def _build_forward_nodes(messages: list) -> Nodes | None:
-    """把 get_forward_msg 返回的节点消息重建为 Nodes（合并转发组件）。"""
+def _build_forward_nodes(messages: list) -> _ForwardNodes | None:
+    """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。"""
     nodes = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -306,15 +393,21 @@ def _build_forward_nodes(messages: list) -> Nodes | None:
         if not content:
             continue
         nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or "")))
-    return Nodes(nodes) if nodes else None
+    return _ForwardNodes(nodes) if nodes else None
 
 
-async def _fetch_forward_nodes(event, forward_id: str) -> Nodes | None:
-    """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 Nodes。
+async def _fetch_forward_nodes(
+    event,
+    forward_id: str,
+    *,
+    depth: int = _FORWARD_MAX_DEPTH,
+) -> _ForwardNodes | None:
+    """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 _ForwardNodes。
 
     合并转发的 resId 只在源会话有效，直接透传会让目标端生成一张打不开的聊天记录
     卡片；拉取真实内容后重建 Nodes，由目标平台重新上传（AstrBot 的 aiocqhttp 适配器
-    对 Nodes 走 send_group_forward_msg）。拉取失败返回 None，由调用方降级为文本占位。"""
+    对 Nodes 走 send_group_forward_msg）。节点内嵌套的聊天记录会递归展开（层数上限
+    depth），拉取失败返回 None，由调用方降级为文本占位。"""
     forward_id = str(forward_id or "").strip()
     if not forward_id:
         return None
@@ -339,11 +432,11 @@ async def _fetch_forward_nodes(event, forward_id: str) -> Nodes | None:
         )
         return None
     logger.info(f"ℹ️ [astrbot_plugin_msg_forward_cc] 已展开合并转发：{len(nodes.nodes)} 条聊天记录")
-    return nodes
+    return await _expand_nested_forwards(event, nodes, depth=depth)
 
 
 async def _expand_forward_components(event, chain) -> list:
-    """把链中的合并转发组件统一展开为可跨会话发送的 Nodes。
+    """把链中的合并转发组件统一展开为可跨会话发送的 _ForwardNodes。
 
     Forward 仅携带源会话 resId，需拉取内容重建；Node 包成 Nodes 以便统一发送；
     拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。"""
@@ -355,7 +448,7 @@ async def _expand_forward_components(event, chain) -> list:
             nodes = await _fetch_forward_nodes(event, getattr(comp, "id", ""))
             expanded.append(nodes if nodes is not None else Plain(text=_FORWARD_PLACEHOLDER))
         elif isinstance(comp, Node):
-            expanded.append(Nodes([comp]))
+            expanded.append(_ForwardNodes([comp]))
         else:
             expanded.append(comp)
     return expanded
@@ -378,7 +471,8 @@ async def _map_chain_components(chain, mapper) -> list:
             for node in comp.nodes:
                 content = await _map_chain_components(node.content or [], mapper)
                 nodes.append(Node(content=content, uin=node.uin, name=node.name))
-            mapped.append(Nodes(nodes))
+            # 保留子类（_ForwardNodes 的自定义序列化不能被降级成内置 Nodes）
+            mapped.append(type(comp)(nodes))
         else:
             mapped.append(await mapper(comp))
     return mapped
@@ -909,11 +1003,11 @@ def _deserialize_chain(data: list) -> list:
             elif t == "nodes":
                 nodes = [n for n in (_deserialize_node(x) for x in item.get("nodes") or []) if n]
                 if nodes:
-                    chain.append(Nodes(nodes))
+                    chain.append(_ForwardNodes(nodes))
             elif t == "node":
                 node = _deserialize_node(item.get("node"))
                 if node:
-                    chain.append(Nodes([node]))
+                    chain.append(_ForwardNodes([node]))
         except Exception:
             continue
     return chain

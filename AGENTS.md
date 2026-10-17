@@ -24,7 +24,7 @@
 
 | 文件 | 必选 | 职责 |
 |------|------|------|
-| `main.py` | ✅ | 插件主体，全部逻辑（3326 行，单文件风格） |
+| `main.py` | ✅ | 插件主体，全部逻辑（3420 行，单文件风格） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（232 行） |
 | `metadata.yaml` | ✅ | 插件元数据（v0.5.5，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档 |
@@ -42,7 +42,7 @@
 ```
 工具与数据路径（常量、MIME 映射）
 → 内容类型筛选（组件 → 类型键、按类型过滤）
-→ 合并转发（聊天记录）展开（拉取内容重建 / 目标平台降级 / 节点递归遍历）
+→ 合并转发（聊天记录）展开（拉取内容重建 / 嵌套递归展开 / 目标平台降级）
 → 媒体工具函数（下载 / 重建 / 本地化 / 序列化）
 → 消息链清洗（@ 清洗、File 清洗、At 转发策略）
 → 存储层 MsgForwardStore（无锁简化）
@@ -53,14 +53,18 @@
 
 ### 2.3 合并转发（聊天记录）展开（模块级）
 
-- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`）
+- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS` / `_FORWARD_MAX_DEPTH`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`） / 嵌套聊天记录最多再展开的层数（协议端上限 3 层，取 2）
+- `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`
+- `_sole_nested_forward(content)` / `_nodes_without_nested(nodes)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
+- `_component_to_onebot_segment(comp)` / `_node_to_onebot_dict(node)`：节点内容组件 → OneBot 消息段（媒体转 base64、混排嵌套降级文本）/ 单个节点 → node 段（嵌套记录输出为嵌套 node 数组）
+- `_expand_nested_forwards(event, nodes, depth)`：递归展开节点内嵌套的聊天记录，层数超限或拉取失败降级为文本占位
 - `_onebot_bot_of(event)` / `_unwrap_onebot_data(ret)` / `_forward_messages_of(payload)`：取事件所属 OneBot 协议端、归一化 action 返回值、提取节点消息列表
 - `_media_url_in_segment(data)`：从 OneBot 媒体段取可下载 http(s) URL（url 优先，file 为 URL 时兜底）
-- `_forward_segment_to_components(seg)`：把节点里的一个 OneBot 消息段转换为 AstrBot 组件（At 转文本、嵌套转发/卡片转文本占位、表情与 JSON 卡片保留）
-- `_build_forward_nodes(messages)`：把 `get_forward_msg` 返回的节点消息重建为 `Nodes`；兼容 `{"type": "node", "data": {...}}` 包裹格式，空内容节点跳过
-- `_fetch_forward_nodes(event, forward_id)`：拉取合并转发内容并重建 `Nodes`（先按 `id` 再按 `message_id` 调用，兼容不同协议端）；失败返回 None 由调用方降级
-- `_expand_forward_components(event, chain)`：把链中的 `Forward`（仅带源会话 resId）展开为重建的 `Nodes`、`Node` 包成 `Nodes`；拉取失败降级为 `[聊天记录]` 文本，绝不透传无效 forward 段
-- `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL）
+- `_forward_segment_to_components(seg)`：把节点里的一个 OneBot 消息段转换为 AstrBot 组件（At 转文本、带 resId 的嵌套转发保留为 `Forward` 交给递归展开、无 resId 的卡片转文本占位、表情与 JSON 卡片保留）
+- `_build_forward_nodes(messages)`：把 `get_forward_msg` 返回的节点消息重建为 `_ForwardNodes`；兼容 `{"type": "node", "data": {...}}` 包裹格式，空内容节点跳过
+- `_fetch_forward_nodes(event, forward_id, depth=_FORWARD_MAX_DEPTH)`：拉取合并转发内容并重建 `_ForwardNodes`（先按 `id` 再按 `message_id` 调用，兼容不同协议端），随后递归展开嵌套记录；失败返回 None 由调用方降级
+- `_expand_forward_components(event, chain)`：把链中的 `Forward`（仅带源会话 resId）展开为重建的 `_ForwardNodes`、`Node` 包成 `_ForwardNodes`；拉取失败降级为 `[聊天记录]` 文本，绝不透传无效 forward 段
+- `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL），并保留 `_ForwardNodes` 子类（自定义序列化不能被降级成内置 `Nodes`）
 - `_chain_has_media(chain)`：链中是否含媒体组件（含节点内媒体），决定发送失败时是否值得本地化重试
 
 ### 2.4 媒体处理工具函数（模块级）
@@ -108,7 +112,7 @@
 事件进入 forward_message（@filter.event_message_type(ALL)）
 → 匹配 source_umo 命中的所有规则（多源：每行一条 UMO）
 → 清洗链（@ 清洗 → File 清洗 → 无 URL File 调 API 取下载 URL）
-→ 合并转发展开（Forward → 拉取内容重建 Nodes；失败/跨平台降级为 [聊天记录]）
+→ 合并转发展开（Forward → 拉取内容重建 Nodes，递归展开嵌套记录；失败/跨平台降级为 [聊天记录]）
 → 逐规则：启停检查 → 过滤 → 内容类型筛选 → 冷却/队列分支
 → 逐目标：At 策略（默认文本化 / 反查精确 @）→ 合并转发目标平台降级 → 前置来源头 → 发送（或入队）
 → 失败三级兜底重试（超时重试 → 媒体本地化 → 远程 URL）→ 冷却写入 / 队列 worker 按间隔发送
@@ -325,7 +329,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 2. `_sanitize_chain_for_forward`：清洗无效 @（空目标丢弃/降级文本；纯数字与 all 保留）
 3. `_sanitize_file_chain_for_forward`：File 组件仅保留 URL
 4. `_resolve_file_urls`：无 URL 的 File 尝试从原始 OneBot 消息获取下载 URL（`get_group_file_url`）
-5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `Nodes`；拉取失败降级为 `[聊天记录]` 文本
+5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `_ForwardNodes`，递归展开节点内嵌套记录；拉取失败降级为 `[聊天记录]` 文本
 
 逐规则流程：
 1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
@@ -574,7 +578,9 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - 媒体转发默认不下载（`download_media_before_send=false`），跨设备转发提示找不到文件时才开启；NapCat 等容器场景读不到源端本地路径时依赖 File URL + 文件服务
 - 队列模式下媒体必须本地化（`_prepare_chain_for_queue` 无条件执行，不受 `download_media_before_send` 影响），防止源端临时文件延迟后被清理；发送前用文件服务实时注册 URL（NapCat 跨容器 + 短效 token 双重问题）
 - 队列持久化恢复（`_restore_persisted_queue`）在 `initialize()` 中执行，恢复后按 `rule_key` 重算规则级积压计数，上限判断保持有效；无法还原的空条目（旧版未序列化合并转发）从 `queue.json` 清除，避免永久残留
-- 合并转发（聊天记录）：`Forward` 组件只携带源会话的 resId，直接透传会在目标端生成打不开的卡片（并露出 `#000000`、`34` 等模板字段），因此必须先拉取内容重建 `Nodes` 再发送；嵌套合并转发在卡片里无法取回内容，降级为 `[聊天记录]` 文本；只有 `aiocqhttp` / `satori` 目标能发送 `Nodes`，其他平台降级为文本
+- 合并转发（聊天记录）：`Forward` 组件只携带源会话的 resId，直接透传会在目标端生成打不开的卡片（并露出 `#000000`、`34` 等模板字段），因此必须先拉取内容重建 `Nodes` 再发送；只有 `aiocqhttp` / `satori` 目标能发送 `Nodes`，其他平台降级为文本
+- 合并转发的嵌套：AstrBot 内置 `Nodes.to_dict` 表达不了嵌套记录，故用 `_ForwardNodes` 子类覆写 `to_dict`（aiocqhttp 适配器对 `Nodes` 正是调 `to_dict()`）；嵌套记录只有被协议端返回为带 resId 的 `forward` 段时才能递归展开（重建为嵌套 node 数组，协议端上限 3 层，本项目取 2），若源记录里的嵌套卡片只是预览 xml（无 resId，例如旧版坏卡片）则只能降级为 `[聊天记录]` 文本
+- 合并转发节点的内容形态：节点内容只能是「纯嵌套 node 数组」或「普通消息段数组」，同一节点里混排文本与嵌套记录无法表达（`_component_to_onebot_segment` 会把嵌套记录降级为文本占位）；节点内媒体仍由 `_component_to_onebot_segment` 转 base64 内嵌
 - 合并转发节点内媒体：直接发送由 AstrBot `Node.to_dict()` 转 base64 内嵌；队列模式由 `_prepare_chain_for_queue` 递归本地化，发送前 `_prepare_chain_for_media_urls` 递归注册文件服务 URL
 - `/mf queue pause` 暂停 worker 消费（`_queue_paused`），持久化条目不被删除；`resume` 恢复
 - 媒体缓存清理：启动时全清 + 每小时按保留时长清理；`queue clear` 立即清空（积压 + 媒体 + 持久化）
