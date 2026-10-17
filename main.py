@@ -18,7 +18,9 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-from astrbot.core.message.components import At, Plain, Image, Record, Video, File, Face
+from astrbot.core.message.components import (
+    At, Plain, Image, Record, Video, File, Face, Forward, Json, Node, Nodes,
+)
 from astrbot.core.message.message_event_result import MessageEventResult
 
 
@@ -162,6 +164,236 @@ def _should_attach_header(rule: dict, allowed: set) -> bool:
     if rule.get("hide_header", False):
         return False
     return "plain" in allowed
+
+
+# ------------------------
+# 合并转发（聊天记录）展开
+# ------------------------
+
+# 无法展开 / 目标平台不支持合并转发时的文本占位
+_FORWARD_PLACEHOLDER = "[聊天记录]"
+
+# AstrBot 中可直接发送 Nodes（合并转发）的目标平台适配器类型
+_NODES_TARGET_PLATFORMS = {"aiocqhttp", "satori"}
+
+
+def _onebot_bot_of(event) -> object | None:
+    """取事件所属的 OneBot 协议端实例（Forward 组件只会由 OneBot 平台产生）。"""
+    bot = getattr(event, "bot", None)
+    if bot is not None and hasattr(bot, "call_action"):
+        return bot
+    return None
+
+
+def _unwrap_onebot_data(ret) -> dict:
+    """把 OneBot action 返回值归一化为 data 字典（部分实现直接返回 data）。"""
+    if not isinstance(ret, dict):
+        return {}
+    data = ret.get("data")
+    if isinstance(data, dict):
+        return data
+    return ret
+
+
+def _forward_messages_of(payload) -> list:
+    """从 get_forward_msg 返回值中取出节点消息列表。"""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("messages", "message", "content"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _media_url_in_segment(data: dict) -> str:
+    """取 OneBot 媒体段 data 中可下载的 http(s) URL（url 优先，file 为 URL 时兜底）。"""
+    for key in ("url", "file"):
+        value = data.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+    return ""
+
+
+def _forward_segment_to_components(seg) -> list:
+    """把合并转发节点里的一个 OneBot 消息段转换为 AstrBot 组件。
+
+    只重建目标端可安全发送的类型：At 转文本（历史内容里的 @ 不应触发目标群成员
+    解析）、嵌套合并转发与卡片转文本占位（AstrBot 无 Xml 组件，嵌套转发的内容也
+    无法从卡片中取得）。"""
+    if not isinstance(seg, dict):
+        return []
+    seg_type = str(seg.get("type") or "")
+    data = seg.get("data")
+    if not isinstance(data, dict):
+        data = {}
+
+    if seg_type in ("text", "plain"):
+        text = data.get("text")
+        return [Plain(text=str(text))] if text else []
+    if seg_type == "image":
+        url = _media_url_in_segment(data)
+        return [Image(file=url, url=url)] if url else [Plain(text="[图片]")]
+    if seg_type == "record":
+        url = _media_url_in_segment(data)
+        return [Record(file=url, url=url)] if url else [Plain(text="[语音]")]
+    if seg_type == "video":
+        url = _media_url_in_segment(data)
+        return [Video(file=url, url=url)] if url else [Plain(text="[视频]")]
+    if seg_type == "file":
+        name = str(data.get("name") or data.get("file_name") or data.get("file") or "文件")
+        url = _media_url_in_segment(data)
+        return [File(name=name, url=url)] if url else [Plain(text=f"[文件:{name}]")]
+    if seg_type == "at":
+        qq = str(data.get("qq") or "").strip()
+        if qq == "all":
+            return [Plain(text="@全体成员")]
+        label = str(data.get("name") or "").strip() or qq
+        return [Plain(text=f"@{label}")] if label else []
+    if seg_type == "face":
+        try:
+            return [Face(id=int(data.get("id")))]
+        except (TypeError, ValueError):
+            return []
+    if seg_type == "json":
+        raw = data.get("data")
+        if isinstance(raw, (dict, str)) and raw:
+            try:
+                return [Json(data=raw)]
+            except Exception:
+                return [Plain(text="[卡片消息]")]
+        return [Plain(text="[卡片消息]")]
+    if seg_type == "xml":
+        raw = str(data.get("data") or "")
+        if "聊天记录" in raw or "viewMultiMsg" in raw:
+            return [Plain(text=_FORWARD_PLACEHOLDER)]
+        return [Plain(text="[卡片消息]")]
+    if seg_type == "forward":
+        return [Plain(text=_FORWARD_PLACEHOLDER)]
+    if seg_type == "markdown":
+        text = str(data.get("content") or data.get("markdown") or "")
+        return [Plain(text=text)] if text else []
+    if seg_type == "mface":
+        return [Plain(text="[表情]")]
+    return []
+
+
+def _build_forward_nodes(messages: list) -> Nodes | None:
+    """把 get_forward_msg 返回的节点消息重建为 Nodes（合并转发组件）。"""
+    nodes = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
+        segments = msg.get("message")
+        if not isinstance(segments, list):
+            segments = msg.get("content")
+        uin = sender.get("user_id") or msg.get("user_id") or ""
+        name = sender.get("card") or sender.get("nickname") or msg.get("nickname") or ""
+        # 兼容 {"type": "node", "data": {...}} 包裹格式
+        node_data = msg.get("data") if msg.get("type") == "node" else None
+        if isinstance(node_data, dict):
+            node_sender = node_data.get("sender") if isinstance(node_data.get("sender"), dict) else {}
+            segments = node_data.get("content") if isinstance(node_data.get("content"), list) else segments
+            uin = node_data.get("user_id") or node_sender.get("user_id") or uin
+            name = node_data.get("nickname") or node_sender.get("card") or node_sender.get("nickname") or name
+        if not isinstance(segments, list):
+            continue
+        content = []
+        for seg in segments:
+            content.extend(_forward_segment_to_components(seg))
+        if not content:
+            continue
+        nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or "")))
+    return Nodes(nodes) if nodes else None
+
+
+async def _fetch_forward_nodes(event, forward_id: str) -> Nodes | None:
+    """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 Nodes。
+
+    合并转发的 resId 只在源会话有效，直接透传会让目标端生成一张打不开的聊天记录
+    卡片；拉取真实内容后重建 Nodes，由目标平台重新上传（AstrBot 的 aiocqhttp 适配器
+    对 Nodes 走 send_group_forward_msg）。拉取失败返回 None，由调用方降级为文本占位。"""
+    forward_id = str(forward_id or "").strip()
+    if not forward_id:
+        return None
+    bot = _onebot_bot_of(event)
+    if bot is None:
+        return None
+    payload = None
+    last_error = None
+    # 不同协议端对参数名要求不同（NapCat / LLOneBot 用 id，go-cqhttp 用 message_id）
+    for params in ({"id": forward_id}, {"message_id": forward_id}):
+        try:
+            payload = _unwrap_onebot_data(await bot.call_action("get_forward_msg", **params))
+        except Exception as e:
+            last_error = e
+            continue
+        if _forward_messages_of(payload):
+            break
+    nodes = _build_forward_nodes(_forward_messages_of(payload or {}))
+    if nodes is None:
+        logger.warning(
+            f"⚠️ [astrbot_plugin_msg_forward_cc] 合并转发内容拉取失败或为空（{forward_id[:24]}…），将降级为文本占位：{last_error}"
+        )
+        return None
+    logger.info(f"ℹ️ [astrbot_plugin_msg_forward_cc] 已展开合并转发：{len(nodes.nodes)} 条聊天记录")
+    return nodes
+
+
+async def _expand_forward_components(event, chain) -> list:
+    """把链中的合并转发组件统一展开为可跨会话发送的 Nodes。
+
+    Forward 仅携带源会话 resId，需拉取内容重建；Node 包成 Nodes 以便统一发送；
+    拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。"""
+    if not chain:
+        return chain
+    expanded = []
+    for comp in chain:
+        if isinstance(comp, Forward):
+            nodes = await _fetch_forward_nodes(event, getattr(comp, "id", ""))
+            expanded.append(nodes if nodes is not None else Plain(text=_FORWARD_PLACEHOLDER))
+        elif isinstance(comp, Node):
+            expanded.append(Nodes([comp]))
+        else:
+            expanded.append(comp)
+    return expanded
+
+
+async def _map_chain_components(chain, mapper) -> list:
+    """对链中组件逐个应用异步变换 mapper，Node/Nodes 的内容递归处理。
+
+    合并转发（Nodes）节点内的媒体同样需要本地化 / 注册 URL，否则队列延迟后源端
+    媒体失效；节点元信息（uin / name）保持不变。"""
+    if not chain:
+        return chain
+    mapped = []
+    for comp in chain:
+        if isinstance(comp, Node):
+            content = await _map_chain_components(comp.content or [], mapper)
+            mapped.append(Node(content=content, uin=comp.uin, name=comp.name))
+        elif isinstance(comp, Nodes):
+            nodes = []
+            for node in comp.nodes:
+                content = await _map_chain_components(node.content or [], mapper)
+                nodes.append(Node(content=content, uin=node.uin, name=node.name))
+            mapped.append(Nodes(nodes))
+        else:
+            mapped.append(await mapper(comp))
+    return mapped
+
+
+def _chain_has_media(chain) -> bool:
+    """链中是否含媒体组件（含合并转发节点内的媒体）。"""
+    for comp in chain or []:
+        if isinstance(comp, (Image, Record, Video, File)):
+            return True
+        if isinstance(comp, Node) and _chain_has_media(comp.content):
+            return True
+        if isinstance(comp, Nodes) and any(_chain_has_media(n.content) for n in comp.nodes):
+            return True
+    return False
 
 
 def _extract_remote_url(comp) -> str | None:
@@ -331,16 +563,14 @@ async def _rebuild_media_component(comp, use_proxy: bool = False, proxy_url: str
 
 
 async def _prepare_chain_for_forward(chain, use_proxy: bool = False, proxy_url: str | None = None):
-    """转发前对消息链做「本地化」预处理，返回新的可安全跨会话发送的链。"""
-    if not chain:
-        return chain
-    prepared = []
-    for comp in chain:
+    """转发前对消息链做「本地化」预处理，返回新的可安全跨会话发送的链。
+
+    合并转发（Nodes）节点内的媒体一并本地化，避免目标端读不到源端临时文件。"""
+    async def _localize(comp):
         if isinstance(comp, (Image, Record, Video, File)):
-            prepared.append(await _rebuild_media_component(comp, use_proxy=use_proxy, proxy_url=proxy_url))
-        else:
-            prepared.append(comp)
-    return prepared
+            return await _rebuild_media_component(comp, use_proxy=use_proxy, proxy_url=proxy_url)
+        return comp
+    return await _map_chain_components(chain, _localize)
 
 
 async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str | None = None):
@@ -352,37 +582,32 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
     兜底下载器，用于规避宿主机 IPv6 无默认路由 / DNS no-data 时核心 download_file
     连接远程源报 `Cannot connect ... ssl:default [None]`（aio-libs/aiohttp#9447）的问题。
     代理三态：use_proxy=False 直连；use_proxy=True 且 proxy_url 空走系统代理；非空走该地址。
+    合并转发（Nodes）节点内的媒体同样处理。
     """
-    if not chain:
-        return chain
-    prepared = []
-    for comp in chain:
-        if isinstance(comp, (Image, Record, Video, File)):
-            remote_url = _extract_remote_url(comp)
-            if remote_url:
-                comp_type = _comp_type_name(comp)
-                try:
-                    local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
-                    prepared.append(_rebuild_from_local_path(comp, local_path))
-                except Exception as e:
-                    logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
-                    prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
+    async def _localize(comp):
+        if not isinstance(comp, (Image, Record, Video, File)):
+            return comp
+        remote_url = _extract_remote_url(comp)
+        if remote_url:
+            comp_type = _comp_type_name(comp)
+            try:
+                local_path = await _download_url_to_local(comp, remote_url, use_proxy=use_proxy, proxy_url=proxy_url)
+                return _rebuild_from_local_path(comp, local_path)
+            except Exception as e:
+                logger.warning(f"⚠️ 转发失败后本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
+                return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
+        # 无远程 URL，尝试本地文件路径兜底（File 用 get_file，其余用 convert_to_file_path）
+        try:
+            if isinstance(comp, File):
+                local_path = await comp.get_file()
             else:
-                # 无远程 URL，尝试本地文件路径兜底（File 用 get_file，其余用 convert_to_file_path）
-                try:
-                    if isinstance(comp, File):
-                        local_path = await comp.get_file()
-                    else:
-                        local_path = await comp.convert_to_file_path()
-                    if local_path:
-                        prepared.append(_rebuild_from_local_path(comp, local_path))
-                    else:
-                        prepared.append(comp)
-                except Exception:
-                    prepared.append(comp)
-        else:
-            prepared.append(comp)
-    return prepared
+                local_path = await comp.convert_to_file_path()
+            if local_path:
+                return _rebuild_from_local_path(comp, local_path)
+        except Exception:
+            pass
+        return comp
+    return await _map_chain_components(chain, _localize)
 
 
 async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: str | None = None):
@@ -391,16 +616,16 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
     优先用 AstrBot 核心 convert_to_file_path() 获取本地缓存路径（适配器层已缓存，
     通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到 AstrBot data 目录下的
     msg_forward_cc_media 自有目录（持久化，重启不丢），确保队列延迟后仍可访问。
+    合并转发（Nodes）节点内的媒体同样本地化，队列延迟后仍可发送。
     """
     if not chain:
         return chain
-    prepared = []
     tmp_dir = _get_media_cache_dir()
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    for comp in chain:
+
+    async def _localize(comp):
         if not isinstance(comp, (Image, Record, Video, File)):
-            prepared.append(comp)
-            continue
+            return comp
         comp_type = _comp_type_name(comp)
         try:
             # 用 AstrBot 核心获取本地路径（适配器层已缓存，通常很快）
@@ -416,8 +641,7 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
                 shutil.copy2(local_path, dest)
                 # keep_local=True：保留本地路径，发送前由 _prepare_chain_for_media_urls
                 # 注册 AstrBot 文件服务 token 生成跨容器可下载的 URL
-                prepared.append(_rebuild_from_local_path(comp, dest, keep_local=True))
-                continue
+                return _rebuild_from_local_path(comp, dest, keep_local=True)
         except Exception:
             pass  # convert_to_file_path 失败，尝试远程 URL
 
@@ -426,16 +650,15 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
         if remote_url:
             try:
                 local_path = await _download_url_to_local(comp, remote_url, use_proxy, proxy_url)
-                prepared.append(_rebuild_from_local_path(comp, local_path, keep_local=True))
-                continue
+                return _rebuild_from_local_path(comp, local_path, keep_local=True)
             except Exception as e:
                 logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），将以占位文本代替：{e}")
-                prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
-                continue
+                return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
 
         logger.warning(f"⚠️ 队列本地化媒体失败（{comp_type}），无法获取文件，将以占位文本代替")
-        prepared.append(Plain(text=f"[{comp_type}转发失败：源文件不可达]"))
-    return prepared
+        return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
+
+    return await _map_chain_components(chain, _localize)
 
 
 # ------------------------
@@ -538,22 +761,25 @@ async def _prepare_chain_for_media_urls(chain) -> list:
     读不到本地路径、源端短效 URL 又会在队列延迟后过期，这里在「发送前」实时注册
     新 token（每次发送、每个目标都重新注册，避免单次 token 与 300s 过期问题）。
     Image/Record 由 aiocqhttp 转 base64 内嵌，无需文件服务；仅处理 Video/File。
+    合并转发（Nodes）节点内的 Video/File 同样注册。
     callback_api_base 未配置时返回原链（回退原始 URL 行为）。"""
     if not chain or not _file_service_available():
         return chain
-    new_chain = []
-    for comp in chain:
-        if isinstance(comp, (Video, File)):
-            local_path = _local_media_path_of(comp)
-            if local_path:
-                url = await _register_file_with_service(local_path)
-                if url:
-                    if isinstance(comp, Video):
-                        comp = Video(file=url, url=url)
-                    else:
-                        comp = File(name=getattr(comp, "name", "") or "", url=url)
-        new_chain.append(comp)
-    return new_chain
+
+    async def _register(comp):
+        if not isinstance(comp, (Video, File)):
+            return comp
+        local_path = _local_media_path_of(comp)
+        if not local_path:
+            return comp
+        url = await _register_file_with_service(local_path)
+        if not url:
+            return comp
+        if isinstance(comp, Video):
+            return Video(file=url, url=url)
+        return File(name=getattr(comp, "name", "") or "", url=url)
+
+    return await _map_chain_components(chain, _register)
 
 
 # ------------------------
@@ -602,11 +828,31 @@ async def _send_with_timeout_retry(send: Callable[[], Awaitable[None]],
 # 消息链序列化（队列持久化）
 # ------------------------
 
+def _serialize_node(node) -> dict:
+    """把单个合并转发节点序列化为可 JSON 存储的 dict（含节点内组件）。"""
+    return {
+        "uin": str(getattr(node, "uin", "") or ""),
+        "name": str(getattr(node, "name", "") or ""),
+        "content": _serialize_chain(getattr(node, "content", None) or []),
+    }
+
+
+def _deserialize_node(data) -> Node | None:
+    """把序列化的合并转发节点还原为 Node；内容为空时返回 None。"""
+    if not isinstance(data, dict):
+        return None
+    content = _deserialize_chain(data.get("content") or [])
+    if not content:
+        return None
+    return Node(content=content, uin=str(data.get("uin") or "0"), name=str(data.get("name") or ""))
+
+
 def _serialize_chain(chain) -> list:
     """把消息链组件序列化为可 JSON 存储的 dict 列表（供队列持久化）。
 
-    仅覆盖队列转发涉及的组件类型（Plain/Image/Record/Video/File/At）；
-    其余组件类型原样保留（无法序列化时跳过，避免阻塞入队）。"""
+    覆盖队列转发涉及的组件类型（Plain/Image/Record/Video/File/At/Face/Json/Nodes/Node）；
+    合并转发（Nodes）递归序列化节点内容，保证队列延迟后仍能重新上传聊天记录。
+    其余组件类型跳过（队列持久化不覆盖）。"""
     out = []
     for comp in chain:
         try:
@@ -622,6 +868,14 @@ def _serialize_chain(chain) -> list:
                 out.append({"t": "file", "name": comp.name or "", "file_": comp.file_ or "", "url": comp.url or ""})
             elif isinstance(comp, At):
                 out.append({"t": "at", "qq": str(comp.qq), "name": comp.name or ""})
+            elif isinstance(comp, Face):
+                out.append({"t": "face", "id": int(comp.id)})
+            elif isinstance(comp, Json):
+                out.append({"t": "json", "data": comp.data})
+            elif isinstance(comp, Nodes):
+                out.append({"t": "nodes", "nodes": [_serialize_node(n) for n in comp.nodes]})
+            elif isinstance(comp, Node):
+                out.append({"t": "node", "node": _serialize_node(comp)})
             else:
                 # 无法序列化的组件类型：跳过（队列持久化不覆盖）
                 continue
@@ -648,6 +902,18 @@ def _deserialize_chain(data: list) -> list:
                 chain.append(File(name=item.get("name", ""), file=item.get("file_", ""), url=item.get("url", "")))
             elif t == "at":
                 chain.append(At(qq=item.get("qq", ""), name=item.get("name", "")))
+            elif t == "face":
+                chain.append(Face(id=int(item.get("id", 0))))
+            elif t == "json":
+                chain.append(Json(data=item.get("data") or {}))
+            elif t == "nodes":
+                nodes = [n for n in (_deserialize_node(x) for x in item.get("nodes") or []) if n]
+                if nodes:
+                    chain.append(Nodes(nodes))
+            elif t == "node":
+                node = _deserialize_node(item.get("node"))
+                if node:
+                    chain.append(Nodes([node]))
         except Exception:
             continue
     return chain
@@ -2139,6 +2405,32 @@ class MsgForward(star.Star):
             cleaned.append(comp)
         return cleaned
 
+    def _target_platform_type(self, target: str) -> str:
+        """解析目标 UMO 对应平台适配器的类型（如 aiocqhttp）；无法解析返回空串。"""
+        platform_id = str(target).split(":", 1)[0].strip()
+        if not platform_id:
+            return ""
+        try:
+            inst = self.context.get_platform_inst(platform_id)
+            if inst is None:
+                return ""
+            return str(inst.meta().name or "").lower()
+        except Exception:
+            return ""
+
+    def _degrade_forward_for_target(self, chain: list, target: str) -> list:
+        """目标平台不支持发送 Nodes（合并转发）时，降级为文本占位。
+
+        合并转发只有 QQ 系（aiocqhttp）与 satori 适配器能重新上传，跨平台目标
+        （Telegram / Discord / 微信等）发送 Nodes 会因无对应组件而报错，故降级为
+        [聊天记录] 文本，至少不丢失「这里有一条聊天记录」的信息。"""
+        if not chain or not any(isinstance(c, (Node, Nodes)) for c in chain):
+            return chain
+        if self._target_platform_type(target) in _NODES_TARGET_PLATFORMS:
+            return chain
+        logger.info(f"ℹ️ [astrbot_plugin_msg_forward_cc] 目标平台不支持合并转发，已降级为文本占位 → {target}")
+        return [Plain(text=_FORWARD_PLACEHOLDER) if isinstance(c, (Node, Nodes)) else c for c in chain]
+
     # ----- @昵称反查 qq（v0.5.0 可选增强，默认关闭） -----
 
     # 群成员列表缓存：group_id → (拉取时间戳, {昵称/群名片: user_id}, {user_id: 昵称})
@@ -2639,16 +2931,22 @@ class MsgForward(star.Star):
         """重启/重载后把磁盘上未发送完的队列条目重新入队。
 
         媒体组件保持序列化时的 URL/路径；若本地化媒体已随清理被删除，
-        仍按原样入队，由 worker 发送失败时走媒体兜底降级。"""
+        仍按原样入队，由 worker 发送失败时走媒体兜底降级。
+        无法还原的条目（旧版本未序列化合并转发导致 chain 为空）从磁盘清除，
+        避免永久残留在 queue.json 里。"""
         items = self._load_persisted_queue()
         if not items:
             return
         restored = 0
+        dropped = 0
+        kept = []
         for it in items:
             try:
                 chain = _deserialize_chain(it.get("chain", []))
                 if not chain:
+                    dropped += 1
                     continue
+                kept.append(it)
                 header_text = it.get("header_text", "") or ""
                 # sanitized_chain 不含来源头；result 才前置来源头（与入队时一致）
                 result_chain = ([Plain(text=header_text)] + chain) if header_text else chain
@@ -2670,7 +2968,11 @@ class MsgForward(star.Star):
                     self._queue_rule_counts[rk] = self._queue_rule_counts.get(rk, 0) + 1
                 restored += 1
             except Exception as e:
+                dropped += 1
                 logger.warning(f"⚠️ 恢复队列条目失败：{e}")
+        if dropped:
+            self._save_persisted_queue(kept)
+            logger.warning(f"⚠️ [astrbot_plugin_msg_forward_cc] 已清理 {dropped} 条无法恢复的队列条目（内容为空或已损坏）")
         if restored:
             logger.info(f"✅ 已从磁盘恢复 {restored} 条未发送完的队列消息")
 
@@ -2870,6 +3172,9 @@ class MsgForward(star.Star):
             sanitized_chain = _sanitize_file_chain_for_forward(sanitized_chain)
             # 为无 URL 的 File 组件尝试从原始 OneBot 消息获取下载 URL（get_group_file_url）
             sanitized_chain = await self._resolve_file_urls(event, sanitized_chain)
+            # 合并转发（聊天记录）展开：源会话的 forward resId 在目标端无效，
+            # 需拉取真实内容重建 Nodes，交给目标平台重新上传（否则显示坏卡片）
+            sanitized_chain = await _expand_forward_components(event, sanitized_chain)
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
@@ -2924,8 +3229,8 @@ class MsgForward(star.Star):
                 if _should_attach_header(rule, allowed):
                     header_text = self._format_origin_header(event, source_umo) + "\n\n\u200b"
 
-                # 是否含媒体组件（决定失败时是否值得本地化后重试）
-                has_media = any(isinstance(c, (Image, Record, Video, File)) for c in filtered_chain)
+                # 是否含媒体组件（含合并转发节点内的媒体，决定失败时是否值得本地化后重试）
+                has_media = _chain_has_media(filtered_chain)
                 # 规则级代理三态：use_proxy 关→直连；开且 proxy_url 空→系统代理；开且非空→该地址
                 use_proxy = bool(rule.get("use_proxy", False))
                 proxy_url = (rule.get("proxy_url") or "").strip() or None
@@ -2943,6 +3248,8 @@ class MsgForward(star.Star):
                         base_chain = await self._resolve_at_mentions(base_chain, target)
                     else:
                         base_chain = _textify_at_chain(message_chain)
+                    # 目标平台不支持合并转发时降级为文本占位（跨平台目标）
+                    base_chain = self._degrade_forward_for_target(base_chain, target)
                     new_chain = base_chain if not header_text else [Plain(text=header_text)] + base_chain
 
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
