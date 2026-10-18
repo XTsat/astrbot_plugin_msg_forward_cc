@@ -181,6 +181,14 @@
     "hint": "开启后，聊天记录里每条消息显示原本的发送时间；关闭则显示为转发时的时间。仅在目标平台支持聊天记录（QQ 系）时生效。",
     "default": true
   },
+  "forward_card_preview": {
+    "description": "聊天记录卡片预览",
+    "type": "string",
+    "hint": "转发聊天记录时，记录里的卡片（小程序 / 分享卡）在预览行里显示什么：仅标题=只显示卡片标题（默认，不显示简介、来源、上传者等其它信息）；不显示=统一显示「[卡片消息]」。",
+    "default": "title",
+    "options": ["title", "off"],
+    "labels": ["仅标题", "不显示（[卡片消息]）"]
+  },
   "default_content_types": {
     "description": "默认转发的内容类型",
     "type": "list",
