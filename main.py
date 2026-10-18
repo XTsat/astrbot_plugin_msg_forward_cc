@@ -390,6 +390,7 @@ async def _expand_nested_forwards(
     keep_time: bool,
     depth: int,
     show_card_title: bool = True,
+    avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
 ) -> _ForwardNodes:
     """递归展开节点内嵌套的聊天记录；层数超限或拉取失败时降级为文本占位。"""
     if depth <= 0:
@@ -409,6 +410,7 @@ async def _expand_nested_forwards(
                     keep_time=keep_time,
                     depth=depth - 1,
                     show_card_title=show_card_title,
+                    avatar_resolver=avatar_resolver,
                 )
                 if nested_id
                 else None
@@ -446,6 +448,84 @@ def _forward_messages_of(payload) -> list:
             if isinstance(value, list):
                 return value
     return []
+
+
+def _forward_node_sender_name(msg: dict) -> str:
+    """取聊天记录节点的发送者显示名（群名片优先、昵称兜底，兼容 node 包裹格式）。"""
+    for holder in (msg.get("data"), msg):
+        if not isinstance(holder, dict):
+            continue
+        sender = holder.get("sender") if isinstance(holder.get("sender"), dict) else {}
+        for key in ("card", "nickname"):
+            value = str(sender.get(key) or "").strip()
+            if value:
+                return value
+        for key in ("nickname", "name"):
+            value = str(holder.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _forward_node_sender_group(msg: dict) -> str:
+    """取聊天记录节点消息的来源群号（非群消息返回空串）。"""
+    for holder in (msg, msg.get("data")):
+        if not isinstance(holder, dict):
+            continue
+        group_id = holder.get("group_id")
+        if group_id:
+            return str(group_id)
+    return ""
+
+
+def _set_forward_node_sender_uin(msg: dict, uin: str) -> None:
+    """回写节点消息发送者的 QQ 号（同时覆盖顶层与 node 包裹格式的字段）。"""
+    for holder in (msg, msg.get("data")):
+        if not isinstance(holder, dict):
+            continue
+        holder["user_id"] = uin
+        sender = holder.get("sender")
+        if isinstance(sender, dict):
+            sender["user_id"] = uin
+
+
+async def _resolve_forward_sender_uins(
+    messages: list,
+    name_map_lookup: Callable[[str], Awaitable[dict]] | None,
+) -> int:
+    """把聊天记录节点发送者 QQ 号修正为真实值（尽力而为），返回修正条数。
+
+    部分协议端（如 SnowLuma）读取合并转发时会把所有节点的发送者 user_id 写成同一个
+    占位值，QQ 端只能显示默认头像；这里按发送者显示名从「节点来源群」的成员列表反查
+    真实 QQ 号，只采用唯一匹配。机器人不在来源群、昵称重名或取不到成员列表时保持
+    原值，由调用方按协议端返回的信息发送。"""
+    if not messages or name_map_lookup is None:
+        return 0
+    group_maps: dict[str, dict] = {}
+
+    async def _name_map_of(group_id: str) -> dict:
+        if group_id not in group_maps:
+            try:
+                group_maps[group_id] = await name_map_lookup(group_id) or {}
+            except Exception:
+                group_maps[group_id] = {}
+        return group_maps[group_id]
+
+    fixed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        name = _forward_node_sender_name(msg)
+        if not name:
+            continue
+        group_id = _forward_node_sender_group(msg)
+        if not group_id:
+            continue
+        uin = str((await _name_map_of(group_id)).get(name) or "").strip()
+        if uin:
+            _set_forward_node_sender_uin(msg, uin)
+            fixed += 1
+    return fixed
 
 
 def _media_url_in_segment(data: dict) -> str:
@@ -579,13 +659,18 @@ async def _fetch_forward_nodes(
     keep_time: bool = True,
     depth: int = _FORWARD_MAX_DEPTH,
     show_card_title: bool = True,
+    avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
 ) -> _ForwardNodes | None:
     """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 _ForwardNodes。
 
     合并转发的 resId 只在源会话有效，直接透传会让目标端生成一张打不开的聊天记录
     卡片；拉取真实内容后重建 Nodes，由目标平台重新上传（AstrBot 的 aiocqhttp 适配器
     对 Nodes 走 send_group_forward_msg）。节点内嵌套的聊天记录会递归展开（层数上限
-    depth），拉取失败返回 None，由调用方降级为文本占位。"""
+    depth），拉取失败返回 None，由调用方降级为文本占位。
+
+    avatar_resolver 非空时用于按发送者昵称反查真实 QQ 号（见
+    `_resolve_forward_sender_uins`），让目标 QQ 端显示每条消息发送者的真实头像；
+    为 None 表示直接沿用协议端返回的发送者信息。"""
     forward_id = str(forward_id or "").strip()
     if not forward_id:
         return None
@@ -603,8 +688,21 @@ async def _fetch_forward_nodes(
             continue
         if _forward_messages_of(payload):
             break
+    messages = _forward_messages_of(payload or {})
+    if avatar_resolver is not None and messages:
+        try:
+            fixed = await _resolve_forward_sender_uins(messages, avatar_resolver)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ [astrbot_plugin_msg_forward_cc] 聊天记录发送者昵称反查失败，沿用协议端返回的 QQ 号：{e}"
+            )
+        else:
+            if fixed:
+                logger.info(
+                    f"ℹ️ [astrbot_plugin_msg_forward_cc] 已按昵称反查补回 {fixed} 条聊天记录的发送者 QQ 号（用于显示真实头像）"
+                )
     nodes = _build_forward_nodes(
-        _forward_messages_of(payload or {}),
+        messages,
         keep_time=keep_time,
         show_card_title=show_card_title,
     )
@@ -620,6 +718,7 @@ async def _fetch_forward_nodes(
         keep_time=keep_time,
         depth=depth,
         show_card_title=show_card_title,
+        avatar_resolver=avatar_resolver,
     )
 
 
@@ -629,13 +728,14 @@ async def _expand_forward_components(
     *,
     keep_time: bool = True,
     show_card_title: bool = True,
+    avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
 ) -> list:
     """把链中的合并转发组件统一展开为可跨会话发送的 _ForwardNodes。
 
     Forward 仅携带源会话 resId，需拉取内容重建；Node 包成 Nodes 以便统一发送；
     拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。
     keep_time 控制是否保留聊天记录里每条消息的原始发送时间；show_card_title
-    控制卡片预览行是否显示真实标题。"""
+    控制卡片预览行是否显示真实标题；avatar_resolver 见 `_fetch_forward_nodes`。"""
     if not chain:
         return chain
     expanded = []
@@ -646,6 +746,7 @@ async def _expand_forward_components(
                 getattr(comp, "id", ""),
                 keep_time=keep_time,
                 show_card_title=show_card_title,
+                avatar_resolver=avatar_resolver,
             )
             expanded.append(nodes if nodes is not None else Plain(text=_FORWARD_PLACEHOLDER))
         elif isinstance(comp, Node):
@@ -2747,13 +2848,19 @@ class MsgForward(star.Star):
 
     # ----- @昵称反查 qq（v0.5.0 可选增强，默认关闭） -----
 
-    # 群成员列表缓存：group_id → (拉取时间戳, {昵称/群名片: user_id}, {user_id: 昵称})
+    # 群成员列表缓存：group_id → (拉取时间戳, {昵称/群名片: user_id}, {user_id: 昵称},
+    # {昵称/群名片: user_id}（仅同群唯一匹配）)
     # 反查 @ 时优先用缓存，避免每条消息都拉一次成员列表
     _group_member_cache: dict = {}
     _GROUP_MEMBER_CACHE_TTL = 300  # 秒
     _GROUP_MEMBER_CACHE_MAX = 32   # 最多缓存的群数，超出按最旧淘汰
     # 同一群的并发拉取合并：group_id → asyncio 任务（避免瞬间多条消息各拉一次）
     _group_member_inflight: dict = {}
+
+    # 聊天记录发送者头像反查用的「全群名册」：显示名 → QQ 号（同名对应多人的不收）
+    _forward_book: dict = {}
+    _forward_book_at: float = 0.0
+    _forward_book_inflight: object | None = None
 
     def _should_at_lookup(self, rule: dict) -> bool:
         """判断某条规则是否开启「高级 @（昵称反查）」。
@@ -2792,32 +2899,40 @@ class MsgForward(star.Star):
             return None
         return cached
 
-    def _member_cache_put(self, group_id: str, name_map: dict, id_map: dict):
-        """写入群成员缓存，并按上限淘汰最旧的条目。"""
-        self._group_member_cache[group_id] = (time.time(), name_map, id_map)
+    def _member_cache_put(self, group_id: str, name_map: dict, id_map: dict, unique_map: dict | None = None):
+        """写入群成员缓存，并按上限淘汰最旧的条目。
+
+        unique_map 只保留「显示名 → QQ 号」唯一匹配的键，供聊天记录头像反查使用
+        （昵称重名时不能确定是哪个人，宁可不动）。"""
+        self._group_member_cache[group_id] = (time.time(), name_map, id_map, unique_map or {})
         max_size = self._GROUP_MEMBER_CACHE_MAX
         if max_size > 0 and len(self._group_member_cache) > max_size:
             oldest = sorted(self._group_member_cache.items(), key=lambda kv: kv[1][0])
             for key, _ in oldest[:len(self._group_member_cache) - max_size]:
                 self._group_member_cache.pop(key, None)
 
-    async def _fetch_group_member_list(self, group_id: str):
+    def _aiocqhttp_adapters(self) -> list:
+        """取已加载的 aiocqhttp 平台实例列表（不可用时返回空列表）。"""
+        try:
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
+        except Exception as e:
+            logger.warning(f"⚠️ 无法加载 aiocqhttp 适配器，群成员反查不可用：{e}")
+            return []
+        try:
+            return [p for p in self.context.platform_manager.get_insts()
+                    if isinstance(p, AiocqhttpAdapter)]
+        except Exception as e:
+            logger.warning(f"⚠️ 获取平台实例失败，群成员反查降级：{e}")
+            return []
+
+    async def _fetch_group_member_list(self, group_id: str, quiet: bool = False):
         """调用 get_group_member_list 拉取目标群成员列表（不缓存、不抛异常）。
 
         逐个已加载平台尝试：按群号数字匹配 AiocqhttpAdapter；匹配不到时回退到
         首个 AiocqhttpAdapter（兼容非 QQ 协议端 / 群号非纯数字的 UMO）。
-        全部失败返回 None，由调用方降级为文本 @昵称。"""
-        try:
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
-        except Exception as e:
-            logger.warning(f"⚠️ 无法加载 aiocqhttp 适配器，@ 昵称反查不可用：{e}")
-            return None
-        try:
-            adapters = [p for p in self.context.platform_manager.get_insts()
-                        if isinstance(p, AiocqhttpAdapter)]
-        except Exception as e:
-            logger.warning(f"⚠️ 获取平台实例失败，@ 昵称反查降级为文本：{e}")
-            return None
+        全部失败返回 None，由调用方降级为文本 @昵称。quiet=True 时不记录告警，
+        供「聊天记录发送者头像反查」使用（记录可能来自机器人已退出的群）。"""
+        adapters = self._aiocqhttp_adapters()
         if not adapters:
             return None
         candidates = []
@@ -2837,7 +2952,10 @@ class MsgForward(star.Star):
                     group_id=int(group_id),
                 )
             except Exception as e:
-                logger.warning(f"⚠️ 拉取群成员列表失败（群 {group_id}），@ 昵称反查降级为文本：{e}")
+                if quiet:
+                    logger.debug(f"ℹ️ 无法获取群 {group_id} 成员列表（聊天记录头像反查跳过）：{e}")
+                else:
+                    logger.warning(f"⚠️ 拉取群成员列表失败（群 {group_id}），@ 昵称反查降级为文本：{e}")
                 continue
             if isinstance(ret, dict):
                 # 部分协议端把成员列表包在 {"data": [...]} / {"members": [...]} 里
@@ -2849,29 +2967,35 @@ class MsgForward(star.Star):
                 return ret
         return None
 
-    async def _get_group_member_name_map(self, group_id: str):
+    async def _get_group_member_name_map(self, group_id: str, quiet: bool = False):
         """拉取（或取缓存）目标群成员列表，返回 (昵称→user_id, user_id→昵称) 映射。
 
         群名片（card）优先、昵称（nickname）兜底；同名时后者覆盖前者。
         缓存有效期由 at_nickname_lookup_cache_ttl 控制；同一群的并发拉取会合并。
-        失败返回 (None, None)（不抛异常，由调用方降级为文本 @昵称）。"""
+        失败返回 (None, None)（不抛异常，由调用方降级为文本 @昵称）。
+        quiet=True 时不记录告警，并把「取不到成员列表」的失败结果也缓存一个周期，
+        避免每条聊天记录都重复请求机器人已退出的群。"""
         cached = self._member_cache_get(group_id)
         if cached:
             return cached[1], cached[2]
         inflight = self._group_member_inflight.get(group_id)
         if inflight is None:
-            inflight = asyncio.ensure_future(self._fetch_group_member_list(group_id))
+            inflight = asyncio.ensure_future(self._fetch_group_member_list(group_id, quiet))
             self._group_member_inflight[group_id] = inflight
             inflight.add_done_callback(lambda _t, gid=group_id: self._group_member_inflight.pop(gid, None))
         try:
             ret = await asyncio.shield(inflight)
         except Exception as e:
-            logger.warning(f"⚠️ 拉取群成员列表失败（群 {group_id}），@ 昵称反查降级为文本：{e}")
+            if not quiet:
+                logger.warning(f"⚠️ 拉取群成员列表失败（群 {group_id}），@ 昵称反查降级为文本：{e}")
             return None, None
         if not ret:
+            if quiet:
+                self._member_cache_put(group_id, {}, {}, {})
             return None, None
         name_map = {}
         id_map = {}
+        candidates: dict[str, set[str]] = {}
         for m in ret:
             if not isinstance(m, dict):
                 continue
@@ -2884,13 +3008,110 @@ class MsgForward(star.Star):
             if display:
                 id_map[uid] = display
             # 群名片优先，昵称作为独立的可匹配键（同名时后出现的覆盖）
-            if card:
-                name_map[card] = uid
-            if nickname:
-                name_map[nickname] = uid
-        self._member_cache_put(group_id, name_map, id_map)
-        logger.info(f"ℹ️ 已拉取群 {group_id} 成员列表：{len(id_map)} 人（缓存 {self._at_lookup_ttl()}s）")
+            for name in (card, nickname):
+                if not name:
+                    continue
+                name_map[name] = uid
+                candidates.setdefault(name, set()).add(uid)
+        # 只保留唯一匹配：同名成员无法确定是哪个人，直接放弃（宁可显示默认头像也不错挂）
+        unique_map = {name: next(iter(uids)) for name, uids in candidates.items() if len(uids) == 1}
+        self._member_cache_put(group_id, name_map, id_map, unique_map)
+        if not quiet:
+            logger.info(f"ℹ️ 已拉取群 {group_id} 成员列表：{len(id_map)} 人（缓存 {self._at_lookup_ttl()}s）")
         return name_map, id_map
+
+    async def _group_unique_name_map(self, group_id: str) -> dict:
+        """某个群的「显示名 → QQ 号」映射（只含同群唯一匹配），供头像反查用。
+
+        复用 @ 昵称反查的成员列表缓存（缓存时长同 at_nickname_lookup_cache_ttl）。
+        机器人不在该群时返回空 dict 且不记录告警；失败结果同样缓存一个周期，
+        避免每条聊天记录都重复请求机器人已退出的群。"""
+        cached = self._member_cache_get(group_id)
+        if cached is None:
+            await self._get_group_member_name_map(group_id, quiet=True)
+            cached = self._member_cache_get(group_id)
+        if not cached:
+            return {}
+        return cached[3] if len(cached) > 3 else {}
+
+    async def _forward_name_book(self) -> dict:
+        """机器人所在全部群的「显示名 → QQ 号」名册（同名对应多人的名称不收录）。
+
+        聊天记录里的发送者可能来自机器人所在的其它群，只按记录来源群反查覆盖太低，
+        因此额外维护一份全群名册：合并各群「唯一匹配」的名称，同一名称在不同群指向
+        不同 QQ 号时视为不可靠、直接丢弃。名册按 at_nickname_lookup_cache_ttl
+        （不短于 5 分钟）缓存；首次建立需要拉取各群成员列表，群多时会慢一次，
+        因此最多扫描 `_GROUP_MEMBER_CACHE_MAX` 个群。拉取失败或没有 QQ 协议端时
+        返回空 dict，不影响转发。"""
+        ttl = max(self._at_lookup_ttl(), self._GROUP_MEMBER_CACHE_TTL)
+        if self._forward_book_at and time.time() - self._forward_book_at < ttl:
+            return self._forward_book
+        if self._forward_book_inflight is None:
+            task = asyncio.ensure_future(self._build_forward_name_book())
+            self._forward_book_inflight = task
+            task.add_done_callback(lambda _t: setattr(MsgForward, "_forward_book_inflight", None))
+        try:
+            return await asyncio.shield(self._forward_book_inflight)
+        except Exception as e:
+            logger.warning(f"⚠️ [astrbot_plugin_msg_forward_cc] 构建聊天记录头像名册失败，本轮不反查头像：{e}")
+            return {}
+
+    async def _build_forward_name_book(self) -> dict:
+        """扫描机器人所在的群，建立聊天记录头像反查用的全群名册（见 `_forward_name_book`）。"""
+        adapters = self._aiocqhttp_adapters()
+        groups: list = []
+        for platform in adapters[:1]:
+            try:
+                ret = await platform.bot.call_action(action="get_group_list")
+            except Exception as e:
+                logger.debug(f"ℹ️ 获取机器人群列表失败（聊天记录头像反查跳过）：{e}")
+                continue
+            if isinstance(ret, dict):
+                for key in ("data", "groups", "list"):
+                    if isinstance(ret.get(key), list):
+                        ret = ret[key]
+                        break
+            if isinstance(ret, list):
+                groups = ret
+                break
+        group_ids = []
+        for group in groups[: self._GROUP_MEMBER_CACHE_MAX]:
+            if not isinstance(group, dict):
+                continue
+            group_id = str(group.get("group_id") or "").strip()
+            if group_id:
+                group_ids.append(group_id)
+        owners: dict[str, set[str]] = {}
+        # 分批并发拉取（单批 5 个群），避免群多时串行等待过久、也避免一次打爆协议端
+        for start in range(0, len(group_ids), 5):
+            chunk = group_ids[start:start + 5]
+            for name_map in await asyncio.gather(
+                *(self._group_unique_name_map(gid) for gid in chunk)
+            ):
+                for name, uin in name_map.items():
+                    owners.setdefault(name, set()).add(uin)
+        scanned = len(group_ids)
+        book = {name: next(iter(uins)) for name, uins in owners.items() if len(uins) == 1}
+        self._forward_book = book
+        self._forward_book_at = time.time()
+        logger.info(
+            f"ℹ️ [astrbot_plugin_msg_forward_cc] 聊天记录头像名册就绪：扫描 {scanned} 个群、{len(book)} 个昵称"
+            f"（缓存 {int(max(self._at_lookup_ttl(), self._GROUP_MEMBER_CACHE_TTL))}s）"
+        )
+        return book
+
+    async def _forward_node_name_map(self, group_id: str) -> dict:
+        """聊天记录发送者「显示名 → QQ 号」映射：全群名册 + 记录来源群（来源群优先）。
+
+        记录来源群内唯一匹配最可靠（同群名片不会挂到别人身上），其次才是全群名册；
+        两者都查不到的发送者保持协议端返回的 QQ 号，头像可能仍是默认头像。"""
+        own = await self._group_unique_name_map(group_id)
+        book = await self._forward_name_book()
+        if not own:
+            return book
+        merged = dict(book)
+        merged.update(own)
+        return merged
 
     async def _resolve_at_mentions(self, chain, target: str) -> list:
         """高级 @ 模式：把链中「无法解析的 @ 提及」按昵称反查为目标群真实成员。
@@ -3031,6 +3252,16 @@ class MsgForward(star.Star):
         其余情况（含默认 title 与非法值）均显示标题。"""
         mode = str(self.config.get("forward_card_preview", "title") or "").strip().lower()
         return mode != "off"
+
+    def _forward_avatar_enabled(self) -> bool:
+        """转发聊天记录时是否按发送者昵称反查真实 QQ 号（用于显示真实头像）。
+
+        配置 forward_node_avatar 默认开启；关闭后直接沿用协议端返回的发送者信息，
+        不再为反查额外拉取群成员列表。"""
+        val = self.config.get("forward_node_avatar", True)
+        if isinstance(val, str):
+            return val.strip().lower() not in ("false", "0", "off", "no")
+        return bool(val)
 
     def _queue_interval_for(self, rule: dict) -> int:
         """解析某条规则生效的发送队列间隔（秒）。
@@ -3502,11 +3733,16 @@ class MsgForward(star.Star):
             keep_forward_time = bool(self.config.get("forward_keep_time", True))
             # 卡片预览：默认显示卡片标题；配置关闭时统一显示 [卡片消息]
             show_card_title = self._show_card_title()
+            # 聊天记录发送者头像：按昵称反查真实 QQ 号（配置关闭时不反查，沿用协议端返回值）
+            avatar_resolver = (
+                self._forward_node_name_map if self._forward_avatar_enabled() else None
+            )
             sanitized_chain = await _expand_forward_components(
                 event,
                 sanitized_chain,
                 keep_time=keep_forward_time,
                 show_card_title=show_card_title,
+                avatar_resolver=avatar_resolver,
             )
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)

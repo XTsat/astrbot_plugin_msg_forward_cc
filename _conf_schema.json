@@ -189,6 +189,12 @@
     "options": ["title", "off"],
     "labels": ["仅标题", "不显示（[卡片消息]）"]
   },
+  "forward_node_avatar": {
+    "description": "转发聊天记录时获取发送者头像",
+    "type": "bool",
+    "hint": "开启后，转发聊天记录时会按每条消息的发送者昵称，从群成员列表反查真实 QQ 号，让 QQ 端显示发送者的真实头像（默认开启）。部分协议端（如 SnowLuma）读取聊天记录时发送者 QQ 号不可用，只能靠昵称反查：机器人不在消息来源群、昵称重名或成员已改名时无法修正，仍会显示默认头像。关闭后直接沿用协议端返回的发送者信息，不再额外拉取群成员列表。",
+    "default": true
+  },
   "default_content_types": {
     "description": "默认转发的内容类型",
     "type": "list",
