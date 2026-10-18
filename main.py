@@ -537,6 +537,54 @@ def _media_url_in_segment(data: dict) -> str:
     return ""
 
 
+class _ForwardFileRef:
+    """聊天记录里待解析下载直链的群文件段。
+
+    群文件消息段一般只带 file_id、没有直链，重建聊天记录时无法直接变成 File 组件；
+    这里先占位保存，由 `_build_forward_nodes` 在异步层用 get_group_file_url 换 URL，
+    换不到（机器人不在文件所属群等）再降级为文字占位。"""
+
+    __slots__ = ("name", "file_id", "busid")
+
+    def __init__(self, name: str, file_id: str, busid: object = None) -> None:
+        self.name = name
+        self.file_id = file_id
+        self.busid = busid
+
+
+async def _resolve_group_file_url(
+    bot: object | None, group_id: str, file_id: str, busid: object = None
+) -> str | None:
+    """调 get_group_file_url 把群文件 file_id 换成可下载直链，失败返回 None。
+
+    机器人不在文件所属群时协议端会直接拒绝（如 SnowLuma 返回「非群成员」），
+    调用方据此换其它群 / busid 兜底，仍失败则降级为文字占位。"""
+    if bot is None or not file_id:
+        return None
+    params: dict = {"file_id": file_id}
+    try:
+        if not group_id:
+            return None
+        params["group_id"] = int(group_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        busid_value = int(busid) if busid not in (None, "") else 0
+    except (TypeError, ValueError):
+        busid_value = 0
+    if busid_value > 0:
+        params["busid"] = busid_value
+    try:
+        data = _unwrap_onebot_data(await bot.call_action("get_group_file_url", **params))
+    except Exception as e:
+        logger.debug(
+            f"[astrbot_plugin_msg_forward_cc] 群文件直链获取失败（群 {group_id}，文件 {file_id}）：{e}"
+        )
+        return None
+    url = str(data.get("url") or "").strip()
+    return url if url.startswith(("http://", "https://")) else None
+
+
 def _forward_segment_to_components(seg) -> list:
     """把合并转发节点里的一个 OneBot 消息段转换为 AstrBot 组件。
 
@@ -565,7 +613,13 @@ def _forward_segment_to_components(seg) -> list:
     if seg_type == "file":
         name = str(data.get("name") or data.get("file_name") or data.get("file") or "文件")
         url = _media_url_in_segment(data)
-        return [File(name=name, url=url)] if url else [Plain(text=f"[文件:{name}]")]
+        if url:
+            return [File(name=name, url=url)]
+        file_id = str(data.get("file_id") or data.get("id") or "").strip()
+        if file_id:
+            # 群文件段只有 file_id：留给异步层换直链，换到才重建 File（聊天记录里的文件才能原样转发）
+            return [_ForwardFileRef(name, file_id, data.get("busid"))]
+        return [Plain(text=f"[文件:{name}]")]
     if seg_type == "at":
         qq = str(data.get("qq") or "").strip()
         if qq == "all":
@@ -602,16 +656,48 @@ def _forward_segment_to_components(seg) -> list:
     return []
 
 
-def _build_forward_nodes(
+def _forward_file_resolver(
+    bot: object | None, event
+) -> Callable[[_ForwardFileRef, str], Awaitable[str | None]]:
+    """构造「聊天记录内群文件 → 下载直链」的解析器。
+
+    转发聊天记录时 QQ 会把记录里的文件重传到接收会话的群文件，节点自带的来源群号
+    反而可能取不到（协议端按群校验文件归属），因此再用接收记录的会话群号与几个常见
+    busid 兜底；全部失败返回 None，由调用方降级为文字占位。"""
+    source_group = str(getattr(getattr(event, "message_obj", None), "group_id", "") or "")
+
+    async def _resolve(ref: _ForwardFileRef, group_id: str) -> str | None:
+        candidates: list[tuple[str, object]] = []
+        # 接收记录的会话群优先：QQ 转发聊天记录时会把记录里的文件重传到该群文件，
+        # 按接收群取直链通常一次即中；节点来源群（机器人可能不在）作为兜底。
+        for gid in (source_group, group_id):
+            if not gid:
+                continue
+            for busid in (ref.busid, None, 102, 104):
+                if (gid, busid) not in candidates:
+                    candidates.append((gid, busid))
+        for gid, busid in candidates:
+            url = await _resolve_group_file_url(bot, gid, ref.file_id, busid)
+            if url:
+                return url
+        return None
+
+    return _resolve
+
+
+async def _build_forward_nodes(
     messages: list,
     *,
     keep_time: bool = True,
     show_card_title: bool = True,
+    file_url_resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None = None,
 ) -> _ForwardNodes | None:
     """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。
 
     keep_time=True 时把每条消息的原始发送时间写进 Node.time，由自定义序列化带给
-    目标协议端；否则不携带时间（部分平台会统一显示为转发时的时间）。"""
+    目标协议端；否则不携带时间（部分平台会统一显示为转发时的时间）。
+    file_url_resolver 非空时用于把节点内只有 file_id 的群文件段换成下载直链
+    （入参为文件占位与节点来源群号），换不到时该文件降级为文字占位。"""
     nodes = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -623,6 +709,7 @@ def _build_forward_nodes(
         uin = sender.get("user_id") or msg.get("user_id") or ""
         name = sender.get("card") or sender.get("nickname") or msg.get("nickname") or ""
         node_time = _forward_node_time(msg.get("time")) if keep_time else 0
+        node_group = str(msg.get("group_id") or "")
         # 兼容 {"type": "node", "data": {...}} 包裹格式
         node_data = msg.get("data") if msg.get("type") == "node" else None
         if isinstance(node_data, dict):
@@ -630,6 +717,7 @@ def _build_forward_nodes(
             segments = node_data.get("content") if isinstance(node_data.get("content"), list) else segments
             uin = node_data.get("user_id") or node_sender.get("user_id") or uin
             name = node_data.get("nickname") or node_sender.get("card") or node_sender.get("nickname") or name
+            node_group = node_group or str(node_data.get("group_id") or "")
             if keep_time:
                 node_time = node_time or _forward_node_time(node_data.get("time"))
         if not isinstance(segments, list):
@@ -637,10 +725,41 @@ def _build_forward_nodes(
         content = []
         for seg in segments:
             content.extend(_forward_segment_to_components(seg))
+        content = await _resolve_forward_file_refs(content, file_url_resolver, node_group)
         if not content:
             continue
         nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or ""), time=node_time))
     return _ForwardNodes(nodes, show_card_title=show_card_title) if nodes else None
+
+
+async def _resolve_forward_file_refs(
+    content: list,
+    resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None,
+    group_id: str,
+) -> list:
+    """把节点内容里的群文件占位换成 File 组件（无解析器或换不到直链时降级为文字占位）。"""
+    resolved = []
+    for comp in content:
+        if not isinstance(comp, _ForwardFileRef):
+            resolved.append(comp)
+            continue
+        url = None
+        error = ""
+        if resolver is not None:
+            try:
+                url = await resolver(comp, group_id)
+            except Exception as e:
+                error = str(e)
+        if url:
+            resolved.append(File(name=comp.name, url=url))
+            continue
+        logger.warning(
+            f"⚠️ [astrbot_plugin_msg_forward_cc] 聊天记录内的群文件拿不到下载直链，"
+            f"降级为文字占位（{comp.name}，file_id={comp.file_id}）"
+            + (f"：{error}" if error else "")
+        )
+        resolved.append(Plain(text=f"[文件:{comp.name}]"))
+    return resolved
 
 
 def _forward_node_time(raw) -> int:
@@ -701,10 +820,11 @@ async def _fetch_forward_nodes(
                 logger.info(
                     f"ℹ️ [astrbot_plugin_msg_forward_cc] 已按昵称反查补回 {fixed} 条聊天记录的发送者 QQ 号（用于显示真实头像）"
                 )
-    nodes = _build_forward_nodes(
+    nodes = await _build_forward_nodes(
         messages,
         keep_time=keep_time,
         show_card_title=show_card_title,
+        file_url_resolver=_forward_file_resolver(bot, event),
     )
     if nodes is None:
         logger.warning(
