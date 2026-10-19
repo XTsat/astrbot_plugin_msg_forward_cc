@@ -196,16 +196,16 @@ class _ForwardNodes(Nodes):
     原生转发卡片一致。`news` 是 NapCat / SnowLuma 等 OneBot 实现支持的扩展参数，
     不支持的实现会忽略它。"""
 
-    # 卡片预览是否显示真实标题（配置 forward_card_preview 关闭时统一显示「[卡片消息]」）
-    show_card_title: bool = True
+    # 卡片预览模式（配置 forward_card_preview：title / source / off，默认 source）
+    card_preview_mode: str = "source"
 
     async def to_dict(self) -> dict:
         payload = {
             "messages": [
-                await _node_to_onebot_dict(node, self.show_card_title) for node in self.nodes
+                await _node_to_onebot_dict(node, self.card_preview_mode) for node in self.nodes
             ],
         }
-        news = _forward_preview_news(self.nodes, self.show_card_title)
+        news = _forward_preview_news(self.nodes, self.card_preview_mode)
         if news:
             payload["news"] = news
         return payload
@@ -237,8 +237,21 @@ async def _component_to_onebot_segment(comp: BaseMessageComponent) -> dict:
     return comp.toDict()
 
 
-# 卡片 prompt 的来源前缀（如「[QQ小程序]」「【分享】」），取标题前需要剥离
+# 卡片 prompt 的来源前缀（如「[QQ小程序]」「【分享】」），取纯标题时需要剥离
 _CARD_PROMPT_BRACKETS = (("[", "]"), ("【", "】"))
+
+# 卡片预览模式：title=仅标题 / source=来源 + 标题（原始 prompt 原样）/ off=不显示
+_CARD_PREVIEW_TITLE = "title"
+_CARD_PREVIEW_SOURCE = "source"
+_CARD_PREVIEW_OFF = "off"
+
+
+def _normalize_card_preview_mode(value) -> str:
+    """归一化卡片预览模式；未知值（含旧版非字符串存储）回退为来源 + 标题（默认）。"""
+    mode = str(value or "").strip().lower()
+    if mode in (_CARD_PREVIEW_TITLE, _CARD_PREVIEW_OFF):
+        return mode
+    return _CARD_PREVIEW_SOURCE
 
 
 def _collapse_preview_text(value) -> str:
@@ -258,19 +271,25 @@ def _strip_card_prefix(text: str) -> str:
     return value
 
 
+def _json_card_data(comp: Json) -> dict:
+    """解析 JSON 卡片的 data 字段（字符串时按 JSON 解析），非法时返回空 dict。"""
+    data = comp.data
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (TypeError, ValueError):
+            return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _json_card_title(comp: Json) -> str:
     """从 JSON 卡片里取卡片标题（取不到返回空字符串）。
 
     只读取标题字段：分享卡的 `meta.news.title`、小程序卡的 `prompt` 正文（去掉
     来源前缀）、其它卡片的 `meta.<类型>.title`。简介、来源、上传者、跳转链接等
     字段一律不读取，避免把卡片里的其它信息带到目标会话。"""
-    data = comp.data
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except (TypeError, ValueError):
-            return ""
-    if not isinstance(data, dict):
+    data = _json_card_data(comp)
+    if not data:
         return ""
     meta = data.get("meta")
     if isinstance(meta, dict):
@@ -293,7 +312,26 @@ def _json_card_title(comp: Json) -> str:
     return ""
 
 
-def _component_preview_text(comp: BaseMessageComponent, show_card_title: bool = True) -> str:
+def _json_card_source_text(comp: Json) -> str:
+    """取卡片原本传递的预览文本（`prompt` 原样，保留「[QQ小程序]」等来源前缀）。
+
+    `prompt` 为空时回退为标题，避免整张卡片退化成「[卡片消息]」。"""
+    prompt = _collapse_preview_text(_json_card_data(comp).get("prompt"))
+    return prompt or _json_card_title(comp)
+
+
+def _json_card_preview_text(comp: Json, mode: str) -> str:
+    """按预览模式取卡片的预览文本（off 模式返回空字符串）。"""
+    if mode == _CARD_PREVIEW_SOURCE:
+        return _json_card_source_text(comp)
+    if mode == _CARD_PREVIEW_TITLE:
+        return _json_card_title(comp)
+    return ""
+
+
+def _component_preview_text(
+    comp: BaseMessageComponent, card_preview_mode: str = _CARD_PREVIEW_SOURCE
+) -> str:
     """返回单个组件在合并转发卡片预览里的文本（对齐 QQ / 协议端的展示习惯）。"""
     if isinstance(comp, Plain):
         return " ".join(str(comp.text or "").split())
@@ -313,30 +351,29 @@ def _component_preview_text(comp: BaseMessageComponent, show_card_title: bool = 
             return "@全体成员"
         return f"@{comp.name or qq}"
     if isinstance(comp, Json):
-        if show_card_title:
-            title = _json_card_title(comp)
-            if title:
-                return title
-        return "[卡片消息]"
+        text = _json_card_preview_text(comp, _normalize_card_preview_mode(card_preview_mode))
+        return text or "[卡片消息]"
     if isinstance(comp, Nodes | Node | Forward):
         return _FORWARD_PLACEHOLDER
     return "[消息]"
 
 
-def _forward_preview_news(nodes: list[Node], show_card_title: bool = True) -> list[dict]:
+def _forward_preview_news(
+    nodes: list[Node], card_preview_mode: str = _CARD_PREVIEW_SOURCE
+) -> list[dict]:
     """生成合并转发卡片的预览行（OneBot send_*_forward_msg 的 news 扩展参数）。
 
     协议端默认按节点内容自动生成预览，但嵌套聊天记录节点没有可预览的消息段
     （显示成「[消息]」）、JSON 卡片显示成「[JSON消息]」。这里按 QQ 的展示习惯
-    重新生成：嵌套记录固定为「[聊天记录]」；卡片显示真实标题（取不到标题或
-    配置关闭时显示「[卡片消息]」）；只保留前 4 行，超长正文截断。返回空列表
+    重新生成：嵌套记录固定为「[聊天记录]」；卡片按 card_preview_mode 显示原始
+    文本或标题（off 模式统一「[卡片消息]」）；只保留前 4 行，超长正文截断。返回空列表
     表示无需携带预览参数。"""
     news = []
     for node in nodes[:_FORWARD_PREVIEW_MAX_LINES]:
         preview = " ".join(
             text
             for text in (
-                _component_preview_text(comp, show_card_title) for comp in node.content or []
+                _component_preview_text(comp, card_preview_mode) for comp in node.content or []
             )
             if text
         )
@@ -351,19 +388,21 @@ def _forward_preview_news(nodes: list[Node], show_card_title: bool = True) -> li
     return news
 
 
-async def _node_to_onebot_dict(node: Node, show_card_title: bool = True) -> dict:
+async def _node_to_onebot_dict(
+    node: Node, card_preview_mode: str = _CARD_PREVIEW_SOURCE
+) -> dict:
     """把单个合并转发节点序列化为 OneBot node 段（含原始发送时间）。"""
     data = {"user_id": str(node.uin or "0"), "nickname": node.name or ""}
     if isinstance(node.time, int) and node.time > 0:
         data["time"] = node.time
     nested = _sole_nested_forward(node.content or [])
     if nested is not None:
-        nested_show_title = getattr(nested, "show_card_title", show_card_title)
+        nested_mode = getattr(nested, "card_preview_mode", card_preview_mode)
         data["content"] = [
-            await _node_to_onebot_dict(n, nested_show_title) for n in nested.nodes
+            await _node_to_onebot_dict(n, nested_mode) for n in nested.nodes
         ]
         # 内层聊天记录卡片的预览同样受 news 控制（协议端只能给出昵称或 [消息]）
-        inner_news = _forward_preview_news(nested.nodes, nested_show_title)
+        inner_news = _forward_preview_news(nested.nodes, nested_mode)
         if inner_news:
             data["news"] = inner_news
     else:
@@ -371,7 +410,7 @@ async def _node_to_onebot_dict(node: Node, show_card_title: bool = True) -> dict
     return {"type": "node", "data": data}
 
 
-def _nodes_without_nested(nodes: Nodes, *, show_card_title: bool = True) -> _ForwardNodes:
+def _nodes_without_nested(nodes: Nodes, *, card_preview_mode: str = _CARD_PREVIEW_SOURCE) -> _ForwardNodes:
     """把节点内未展开的嵌套聊天记录降级为文本占位（透传源 resId 只会生成坏卡片）。"""
     rebuilt = []
     for node in nodes.nodes:
@@ -380,7 +419,7 @@ def _nodes_without_nested(nodes: Nodes, *, show_card_title: bool = True) -> _For
             for c in node.content or []
         ]
         rebuilt.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
-    return _ForwardNodes(rebuilt, show_card_title=show_card_title)
+    return _ForwardNodes(rebuilt, card_preview_mode=card_preview_mode)
 
 
 async def _expand_nested_forwards(
@@ -389,12 +428,12 @@ async def _expand_nested_forwards(
     *,
     keep_time: bool,
     depth: int,
-    show_card_title: bool = True,
+    card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
 ) -> _ForwardNodes:
     """递归展开节点内嵌套的聊天记录；层数超限或拉取失败时降级为文本占位。"""
     if depth <= 0:
-        return _nodes_without_nested(nodes, show_card_title=show_card_title)
+        return _nodes_without_nested(nodes, card_preview_mode=card_preview_mode)
     rebuilt = []
     for node in nodes.nodes:
         content: list[BaseMessageComponent] = []
@@ -409,7 +448,7 @@ async def _expand_nested_forwards(
                     nested_id,
                     keep_time=keep_time,
                     depth=depth - 1,
-                    show_card_title=show_card_title,
+                    card_preview_mode=card_preview_mode,
                     avatar_resolver=avatar_resolver,
                 )
                 if nested_id
@@ -417,7 +456,7 @@ async def _expand_nested_forwards(
             )
             content.append(nested if nested is not None else Plain(text=_FORWARD_PLACEHOLDER))
         rebuilt.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
-    return _ForwardNodes(rebuilt, show_card_title=show_card_title)
+    return _ForwardNodes(rebuilt, card_preview_mode=card_preview_mode)
 
 
 def _onebot_bot_of(event) -> object | None:
@@ -689,7 +728,7 @@ async def _build_forward_nodes(
     messages: list,
     *,
     keep_time: bool = True,
-    show_card_title: bool = True,
+    card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     file_url_resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None = None,
 ) -> _ForwardNodes | None:
     """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。
@@ -729,7 +768,7 @@ async def _build_forward_nodes(
         if not content:
             continue
         nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or ""), time=node_time))
-    return _ForwardNodes(nodes, show_card_title=show_card_title) if nodes else None
+    return _ForwardNodes(nodes, card_preview_mode=card_preview_mode) if nodes else None
 
 
 async def _resolve_forward_file_refs(
@@ -777,7 +816,7 @@ async def _fetch_forward_nodes(
     *,
     keep_time: bool = True,
     depth: int = _FORWARD_MAX_DEPTH,
-    show_card_title: bool = True,
+    card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
 ) -> _ForwardNodes | None:
     """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 _ForwardNodes。
@@ -823,7 +862,7 @@ async def _fetch_forward_nodes(
     nodes = await _build_forward_nodes(
         messages,
         keep_time=keep_time,
-        show_card_title=show_card_title,
+        card_preview_mode=card_preview_mode,
         file_url_resolver=_forward_file_resolver(bot, event),
     )
     if nodes is None:
@@ -837,7 +876,7 @@ async def _fetch_forward_nodes(
         nodes,
         keep_time=keep_time,
         depth=depth,
-        show_card_title=show_card_title,
+        card_preview_mode=card_preview_mode,
         avatar_resolver=avatar_resolver,
     )
 
@@ -847,15 +886,16 @@ async def _expand_forward_components(
     chain,
     *,
     keep_time: bool = True,
-    show_card_title: bool = True,
+    card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
 ) -> list:
     """把链中的合并转发组件统一展开为可跨会话发送的 _ForwardNodes。
 
     Forward 仅携带源会话 resId，需拉取内容重建；Node 包成 Nodes 以便统一发送；
     拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。
-    keep_time 控制是否保留聊天记录里每条消息的原始发送时间；show_card_title
-    控制卡片预览行是否显示真实标题；avatar_resolver 见 `_fetch_forward_nodes`。"""
+    keep_time 控制是否保留聊天记录里每条消息的原始发送时间；card_preview_mode
+    控制卡片预览行的展示方式（仅标题 / 来源 + 标题 / 不显示）；avatar_resolver
+    见 `_fetch_forward_nodes`。"""
     if not chain:
         return chain
     expanded = []
@@ -865,12 +905,12 @@ async def _expand_forward_components(
                 event,
                 getattr(comp, "id", ""),
                 keep_time=keep_time,
-                show_card_title=show_card_title,
+                card_preview_mode=card_preview_mode,
                 avatar_resolver=avatar_resolver,
             )
             expanded.append(nodes if nodes is not None else Plain(text=_FORWARD_PLACEHOLDER))
         elif isinstance(comp, Node):
-            expanded.append(_ForwardNodes([comp], show_card_title=show_card_title))
+            expanded.append(_ForwardNodes([comp], card_preview_mode=card_preview_mode))
         else:
             expanded.append(comp)
     return expanded
@@ -895,7 +935,7 @@ async def _map_chain_components(chain, mapper) -> list:
                 nodes.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
             # 保留子类（_ForwardNodes 的自定义序列化与卡片预览配置不能被降级成内置 Nodes）
             if isinstance(comp, _ForwardNodes):
-                mapped.append(_ForwardNodes(nodes, show_card_title=comp.show_card_title))
+                mapped.append(_ForwardNodes(nodes, card_preview_mode=comp.card_preview_mode))
             else:
                 mapped.append(Nodes(nodes))
         else:
@@ -1357,11 +1397,11 @@ def _serialize_node(node) -> dict:
     }
 
 
-def _deserialize_node(data, *, show_card_title: bool = True) -> Node | None:
+def _deserialize_node(data, *, card_preview_mode: str = _CARD_PREVIEW_SOURCE) -> Node | None:
     """把序列化的合并转发节点还原为 Node；内容为空时返回 None。"""
     if not isinstance(data, dict):
         return None
-    content = _deserialize_chain(data.get("content") or [], show_card_title=show_card_title)
+    content = _deserialize_chain(data.get("content") or [], card_preview_mode=card_preview_mode)
     if not content:
         return None
     return Node(
@@ -1409,10 +1449,10 @@ def _serialize_chain(chain) -> list:
     return out
 
 
-def _deserialize_chain(data: list, *, show_card_title: bool = True) -> list:
+def _deserialize_chain(data: list, *, card_preview_mode: str = _CARD_PREVIEW_SOURCE) -> list:
     """把序列化的 dict 列表还原为消息链组件列表。
 
-    show_card_title 透传给合并转发节点：队列恢复时按当前配置决定卡片预览
+    card_preview_mode 透传给合并转发节点：队列恢复时按当前配置决定卡片预览
     是否显示真实标题。"""
     chain = []
     for item in data or []:
@@ -1438,17 +1478,17 @@ def _deserialize_chain(data: list, *, show_card_title: bool = True) -> list:
                 nodes = [
                     n
                     for n in (
-                        _deserialize_node(x, show_card_title=show_card_title)
+                        _deserialize_node(x, card_preview_mode=card_preview_mode)
                         for x in item.get("nodes") or []
                     )
                     if n
                 ]
                 if nodes:
-                    chain.append(_ForwardNodes(nodes, show_card_title=show_card_title))
+                    chain.append(_ForwardNodes(nodes, card_preview_mode=card_preview_mode))
             elif t == "node":
-                node = _deserialize_node(item.get("node"), show_card_title=show_card_title)
+                node = _deserialize_node(item.get("node"), card_preview_mode=card_preview_mode)
                 if node:
-                    chain.append(_ForwardNodes([node], show_card_title=show_card_title))
+                    chain.append(_ForwardNodes([node], card_preview_mode=card_preview_mode))
         except Exception:
             continue
     return chain
@@ -3365,13 +3405,12 @@ class MsgForward(star.Star):
             # "inherit" 或其他值 → 继承全局
         return bool(self.config.get("download_media_before_send", False))
 
-    def _show_card_title(self) -> bool:
-        """聊天记录卡片预览是否显示卡片真实标题。
+    def _card_preview_mode(self) -> str:
+        """聊天记录卡片预览模式（配置 forward_card_preview）。
 
-        配置 forward_card_preview 为 off（不显示）时统一显示「[卡片消息]」；
-        其余情况（含默认 title 与非法值）均显示标题。"""
-        mode = str(self.config.get("forward_card_preview", "title") or "").strip().lower()
-        return mode != "off"
+        source=显示卡片原本传递的预览文本（保留「[QQ小程序]」等来源前缀，默认）；
+        title=仅显示卡片标题；off=统一显示「[卡片消息]」；非法值回退 source。"""
+        return _normalize_card_preview_mode(self.config.get("forward_card_preview", "source"))
 
     def _forward_avatar_enabled(self) -> bool:
         """转发聊天记录时是否按发送者昵称反查真实 QQ 号（用于显示真实头像）。
@@ -3613,11 +3652,11 @@ class MsgForward(star.Star):
         restored = 0
         dropped = 0
         kept = []
-        show_card_title = self._show_card_title()
+        card_preview_mode = self._card_preview_mode()
         for it in items:
             try:
                 chain = _deserialize_chain(
-                    it.get("chain", []), show_card_title=show_card_title
+                    it.get("chain", []), card_preview_mode=card_preview_mode
                 )
                 if not chain:
                     dropped += 1
@@ -3851,8 +3890,8 @@ class MsgForward(star.Star):
             # 合并转发（聊天记录）展开：源会话的 forward resId 在目标端无效，
             # 需拉取真实内容重建 Nodes，交给目标平台重新上传（否则显示坏卡片）
             keep_forward_time = bool(self.config.get("forward_keep_time", True))
-            # 卡片预览：默认显示卡片标题；配置关闭时统一显示 [卡片消息]
-            show_card_title = self._show_card_title()
+            # 卡片预览：来源 + 标题（默认）/ 仅标题 / 不显示，见 forward_card_preview
+            card_preview_mode = self._card_preview_mode()
             # 聊天记录发送者头像：按昵称反查真实 QQ 号（配置关闭时不反查，沿用协议端返回值）
             avatar_resolver = (
                 self._forward_node_name_map if self._forward_avatar_enabled() else None
@@ -3861,7 +3900,7 @@ class MsgForward(star.Star):
                 event,
                 sanitized_chain,
                 keep_time=keep_forward_time,
-                show_card_title=show_card_title,
+                card_preview_mode=card_preview_mode,
                 avatar_resolver=avatar_resolver,
             )
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）

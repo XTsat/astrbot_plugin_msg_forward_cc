@@ -55,23 +55,25 @@
 
 - `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS` / `_FORWARD_MAX_DEPTH`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`） / 嵌套聊天记录最多再展开的层数（协议端上限 3 层，取 2）
 - `_FORWARD_PREVIEW_MAX_LINES` / `_FORWARD_PREVIEW_MAX_CHARS`：合并转发卡片预览（`news` 扩展参数）最多展示的行数（QQ 卡片模板上限 4 行）/ 单行正文最大长度（超出截断并加省略号）
-- `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`；同时携带 `news` 预览行，避免协议端把嵌套聊天记录显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`（`news` 为 NapCat / SnowLuma 等 OneBot 实现的扩展参数，不支持的实现会忽略）；`show_card_title` 字段由配置 `forward_card_preview` 决定，控制预览行是否显示卡片真实标题
-- `_sole_nested_forward(content)` / `_nodes_without_nested(nodes, show_card_title=True)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
-- `_collapse_preview_text(value)` / `_strip_card_prefix(text)` / `_json_card_title(comp)`：预览文本折叠为单行 / 去掉卡片 `prompt` 的来源前缀（`[QQ小程序]`、`【分享】`）/ 从 JSON 卡片取标题（`meta.news.title` → `prompt` 正文 → 其它 `meta.<类型>.title`，**只读标题**，简介 / 来源 / 上传者 / 跳转链接等字段一律不读）
-- `_forward_preview_news(nodes, show_card_title=True)` / `_component_preview_text(comp, show_card_title=True)`：按 QQ 展示习惯生成合并转发卡片预览行（昵称 + 内容摘要，嵌套记录为 `[聊天记录]`、卡片为真实标题或 `[卡片消息]`，前 4 行）/ 单个组件的预览文本
-- `_component_to_onebot_segment(comp)` / `_node_to_onebot_dict(node, show_card_title=True)`：节点内容组件 → OneBot 消息段（媒体转 base64、混排嵌套降级文本）/ 单个节点 → node 段（带 `time`，嵌套记录输出为嵌套 node 数组，并为其附带内层卡片 `news` 预览）
+- `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`；同时携带 `news` 预览行，避免协议端把嵌套聊天记录显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`（`news` 为 NapCat / SnowLuma 等 OneBot 实现的扩展参数，不支持的实现会忽略）；`card_preview_mode` 字段由配置 `forward_card_preview` 决定，控制预览行的卡片展示方式——`source` 来源 + 标题（默认，保留原始 `prompt` 的来源前缀）/ `title` 仅标题 / `off` 统一「[卡片消息]」
+- `_sole_nested_forward(content)` / `_nodes_without_nested(nodes, card_preview_mode=_CARD_PREVIEW_TITLE)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
+- `_CARD_PREVIEW_TITLE` / `_CARD_PREVIEW_SOURCE` / `_CARD_PREVIEW_OFF` / `_normalize_card_preview_mode(value)`：卡片预览三态常量（仅标题 / 来源 + 标题 / 不显示）与配置归一化（未知值回退仅标题）
+- `_collapse_preview_text(value)` / `_strip_card_prefix(text)` / `_json_card_data(comp)`：预览文本折叠为单行 / 去掉卡片 `prompt` 的来源前缀（`[QQ小程序]`、`【分享】`）/ 解析 JSON 卡片的 `data` 字段
+- `_json_card_title(comp)` / `_json_card_source_text(comp)` / `_json_card_preview_text(comp, mode)`：从 JSON 卡片取标题（`meta.news.title` → `prompt` 正文 → 其它 `meta.<类型>.title`，**只读标题**，简介 / 来源 / 上传者 / 跳转链接等字段一律不读）/ 取卡片原本传递的预览文本（`prompt` 原样保留来源前缀，为空回退标题）/ 按预览模式分派取文本
+- `_forward_preview_news(nodes, card_preview_mode=_CARD_PREVIEW_TITLE)` / `_component_preview_text(comp, card_preview_mode=_CARD_PREVIEW_TITLE)`：按 QQ 展示习惯生成合并转发卡片预览行（昵称 + 内容摘要，嵌套记录为 `[聊天记录]`、卡片为真实标题或 `[卡片消息]`，前 4 行）/ 单个组件的预览文本
+- `_component_to_onebot_segment(comp)` / `_node_to_onebot_dict(node, card_preview_mode=_CARD_PREVIEW_TITLE)`：节点内容组件 → OneBot 消息段（媒体转 base64、混排嵌套降级文本）/ 单个节点 → node 段（带 `time`，嵌套记录输出为嵌套 node 数组，并为其附带内层卡片 `news` 预览）
 - `_forward_node_time(raw)`：归一化节点发送时间（秒级时间戳，越界或非法返回 0）
-- `_expand_nested_forwards(event, nodes, keep_time, depth, show_card_title=True, avatar_resolver=None)`：递归展开节点内嵌套的聊天记录，层数超限或拉取失败降级为文本占位；`avatar_resolver` 透传给嵌套记录的头像反查
+- `_expand_nested_forwards(event, nodes, keep_time, depth, card_preview_mode=_CARD_PREVIEW_TITLE, avatar_resolver=None)`：递归展开节点内嵌套的聊天记录，层数超限或拉取失败降级为文本占位；`avatar_resolver` 透传给嵌套记录的头像反查
 - `_onebot_bot_of(event)` / `_unwrap_onebot_data(ret)` / `_forward_messages_of(payload)`：取事件所属 OneBot 协议端、归一化 action 返回值、提取节点消息列表
 - `_forward_node_sender_name(msg)` / `_forward_node_sender_group(msg)` / `_set_forward_node_sender_uin(msg, uin)`：取节点消息的发送者显示名（名片优先、昵称兜底，兼容 `{type: node, data}` 包裹格式）/ 取节点消息的来源群号 / 回写发送者 QQ 号（同时覆盖顶层与包裹格式字段）
 - `_resolve_forward_sender_uins(messages, name_map_lookup)`：按发送者显示名从群成员名册反查真实 QQ 号并回写**唯一匹配**，返回修正条数；部分协议端（如 SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，QQ 端只能显示默认头像，靠昵称反查补救；无来源群 / 无匹配时保持原值
 - `_media_url_in_segment(data)`：从 OneBot 媒体段取可下载 http(s) URL（url 优先，file 为 URL 时兜底）
 - `_ForwardFileRef` / `_resolve_group_file_url(bot, group_id, file_id, busid=None)` / `_forward_file_resolver(bot, event)` / `_resolve_forward_file_refs(content, resolver, group_id)`：节点内只有 file_id、没有直链的群文件段占位（file_id 只能在异步层换 URL）/ 调 `get_group_file_url` 换下载直链（机器人不在文件所属群时协议端会拒绝，失败返回 None）/ 构造解析器——接收记录的会话群优先（转发聊天记录时 QQ 会把记录里的文件重传到接收群文件，节点自带来源群可能取不到），再按节点来源群与 busid 102/104 兜底 / 把节点内容里的文件占位换成 `File`，换不到降级为 `[文件:文件名]` 文字占位并记一条 warning
 - `_forward_segment_to_components(seg)`：把节点里的一个 OneBot 消息段转换为 AstrBot 组件（At 转文本、带 resId 的嵌套转发保留为 `Forward` 交给递归展开、无 resId 的卡片转文本占位、表情与 JSON 卡片保留；群文件段有直链转 `File`、只有 file_id 转 `_ForwardFileRef` 待解析）
-- `_build_forward_nodes(messages, *, keep_time=True, show_card_title=True, file_url_resolver=None)`（异步）：把 `get_forward_msg` 返回的节点消息重建为 `_ForwardNodes`；兼容 `{"type": "node", "data": {...}}` 包裹格式，空内容节点跳过；`keep_time` 决定是否把原始发送时间写入 `Node.time`；`file_url_resolver` 非空时用它把节点内的群文件占位换成下载直链
-- `_fetch_forward_nodes(event, forward_id, keep_time=True, depth=_FORWARD_MAX_DEPTH, show_card_title=True, avatar_resolver=None)`：拉取合并转发内容并重建 `_ForwardNodes`（先按 `id` 再按 `message_id` 调用，兼容不同协议端），重建前用 `avatar_resolver` 按昵称补回发送者真实 QQ 号（配置 `forward_node_avatar`，为 None 时跳过），节点内的群文件会先换下载直链再重建为 `File`（否则只能降级成文字），随后递归展开嵌套记录；失败返回 None 由调用方降级
-- `_expand_forward_components(event, chain, keep_time=True, show_card_title=True, avatar_resolver=None)`：把链中的 `Forward`（仅带源会话 resId）展开为重建的 `_ForwardNodes`、`Node` 包成 `_ForwardNodes`；拉取失败降级为 `[聊天记录]` 文本，绝不透传无效 forward 段；`avatar_resolver` 见 `_fetch_forward_nodes`
-- `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL），并保留节点时间、`_ForwardNodes` 子类与其 `show_card_title` 配置（自定义序列化不能被降级成内置 `Nodes`）
+- `_build_forward_nodes(messages, *, keep_time=True, card_preview_mode=_CARD_PREVIEW_TITLE, file_url_resolver=None)`（异步）：把 `get_forward_msg` 返回的节点消息重建为 `_ForwardNodes`；兼容 `{"type": "node", "data": {...}}` 包裹格式，空内容节点跳过；`keep_time` 决定是否把原始发送时间写入 `Node.time`；`file_url_resolver` 非空时用它把节点内的群文件占位换成下载直链
+- `_fetch_forward_nodes(event, forward_id, keep_time=True, depth=_FORWARD_MAX_DEPTH, card_preview_mode=_CARD_PREVIEW_TITLE, avatar_resolver=None)`：拉取合并转发内容并重建 `_ForwardNodes`（先按 `id` 再按 `message_id` 调用，兼容不同协议端），重建前用 `avatar_resolver` 按昵称补回发送者真实 QQ 号（配置 `forward_node_avatar`，为 None 时跳过），节点内的群文件会先换下载直链再重建为 `File`（否则只能降级成文字），随后递归展开嵌套记录；失败返回 None 由调用方降级
+- `_expand_forward_components(event, chain, keep_time=True, card_preview_mode=_CARD_PREVIEW_TITLE, avatar_resolver=None)`：把链中的 `Forward`（仅带源会话 resId）展开为重建的 `_ForwardNodes`、`Node` 包成 `_ForwardNodes`；拉取失败降级为 `[聊天记录]` 文本，绝不透传无效 forward 段；`avatar_resolver` 见 `_fetch_forward_nodes`
+- `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL），并保留节点时间、`_ForwardNodes` 子类与其 `card_preview_mode` 配置（自定义序列化不能被降级成内置 `Nodes`）
 - `_chain_has_media(chain)`：链中是否含媒体组件（含节点内媒体），决定发送失败时是否值得本地化重试
 
 ### 2.4 媒体处理工具函数（模块级）
@@ -209,7 +211,7 @@
 | 发送队列总长度上限 | `queue_max_size` | int, 0 | **全部规则合计**的队列积压上限，0=不限制；与规则级独立上限同时生效（先判总上限、再判规则级） |
 | 发送媒体前先下载到本地 | `download_media_before_send` | bool, false | 跨设备转发提示找不到文件时才开启 |
 | 转发聊天记录时保留原始发送时间 | `forward_keep_time` | bool, true | 关闭则聊天记录里每条消息显示为转发时的时间 |
-| 聊天记录卡片预览 | `forward_card_preview` | string, title | title=仅标题（默认，卡片预览行显示卡片标题）；off=不显示（统一 `[卡片消息]`）；只读标题，不显示简介 / 来源 / 上传者等其它信息 |
+| 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
 | 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；只采用唯一匹配，发送者不在机器人所在的群 / 昵称重名 / 已改名时不反查，仍显示默认头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/image/face/record/video/file/at/other，默认全选 |
 | 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
@@ -248,7 +250,7 @@
 ### 5.3 配置读取模式
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
-- 全局开关类字段也走专有方法：`_show_card_title()`（`forward_card_preview`）、`_forward_avatar_enabled()`（`forward_node_avatar`）
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）
 - 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`
 
 ---
@@ -340,7 +342,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 2. `_sanitize_chain_for_forward`：清洗无效 @（空目标丢弃/降级文本；纯数字与 all 保留）
 3. `_sanitize_file_chain_for_forward`：File 组件仅保留 URL
 4. `_resolve_file_urls`：无 URL 的 File 尝试从原始 OneBot 消息获取下载 URL（`get_group_file_url`）
-5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `_ForwardNodes`，按配置 `forward_node_avatar` 用发送者昵称反查真实 QQ 号（头像用）、递归展开节点内嵌套记录、按配置 `forward_keep_time` 保留每条消息的原始发送时间、按配置 `forward_card_preview` 决定卡片预览行显示标题还是 `[卡片消息]`；拉取失败降级为 `[聊天记录]` 文本
+5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `_ForwardNodes`，按配置 `forward_node_avatar` 用发送者昵称反查真实 QQ 号（头像用）、递归展开节点内嵌套记录、按配置 `forward_keep_time` 保留每条消息的原始发送时间、按配置 `forward_card_preview` 决定卡片预览行显示来源 + 标题（默认）/ 仅标题 / `[卡片消息]`；拉取失败降级为 `[聊天记录]` 文本
 
 逐规则流程：
 1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
@@ -591,7 +593,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - 队列持久化恢复（`_restore_persisted_queue`）在 `initialize()` 中执行，恢复后按 `rule_key` 重算规则级积压计数，上限判断保持有效；无法还原的空条目（旧版未序列化合并转发）从 `queue.json` 清除，避免永久残留
 - 合并转发（聊天记录）：`Forward` 组件只携带源会话的 resId，直接透传会在目标端生成打不开的卡片（并露出 `#000000`、`34` 等模板字段），因此必须先拉取内容重建 `Nodes` 再发送；只有 `aiocqhttp` / `satori` 目标能发送 `Nodes`，其他平台降级为文本
 - 合并转发的时间与嵌套：AstrBot 内置 `Nodes.to_dict` 丢弃节点时间、也表达不了嵌套记录，故用 `_ForwardNodes` 子类覆写 `to_dict`（aiocqhttp 适配器对 `Nodes` 正是调 `to_dict()`）；节点时间来自 `get_forward_msg` 每条消息的 `time`，配置 `forward_keep_time=false` 时不写 `time`（目标端统一显示转发时间）；嵌套记录只有被协议端返回为带 resId 的 `forward` 段时才能递归展开（重建为嵌套 node 数组，协议端上限 3 层，本项目取 2），若源记录里的嵌套卡片只是预览 xml（无 resId，例如旧版坏卡片）则只能降级为 `[聊天记录]` 文本
-- 合并转发的卡片预览：协议端自动生成预览时，嵌套聊天记录节点因没有可预览的消息段会显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`，因此 `_ForwardNodes.to_dict()` 显式携带 OneBot 扩展参数 `news`（前 4 行，文本截断），嵌套节点额外携带内层卡片的 `news`；NapCat 与 SnowLuma 均支持该参数，不支持的实现会忽略，不影响发送。卡片预览行默认显示卡片标题（`meta.news.title` → `prompt` 正文 → 其它 `meta.<类型>.title`，只读标题字段，简介 / 来源 / 上传者 / 跳转链接一律不读），配置 `forward_card_preview=off` 时统一显示 `[卡片消息]`；`_ForwardNodes.show_card_title` 保存该决定，`_map_chain_components` 与队列序列化 / 反序列化（`_serialize_chain` / `_deserialize_chain`）都会保留 / 重新按当前配置注入，避免重建链时丢失
+- 合并转发的卡片预览：协议端自动生成预览时，嵌套聊天记录节点因没有可预览的消息段会显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`，因此 `_ForwardNodes.to_dict()` 显式携带 OneBot 扩展参数 `news`（前 4 行，文本截断），嵌套节点额外携带内层卡片的 `news`；NapCat 与 SnowLuma 均支持该参数，不支持的实现会忽略，不影响发送。卡片预览行默认显示卡片原本传递的 `prompt`（`forward_card_preview=source`，保留「[QQ小程序]」「[分享]」等来源前缀，`prompt` 为空时回退标题），配置 `forward_card_preview=title` 时只读标题字段（`meta.news.title` → `prompt` 正文 → 其它 `meta.<类型>.title`，简介 / 来源 / 上传者 / 跳转链接一律不读），`forward_card_preview=off` 时统一显示 `[卡片消息]`；`_ForwardNodes.card_preview_mode` 保存该决定，`_map_chain_components` 与队列序列化 / 反序列化（`_serialize_chain` / `_deserialize_chain`）都会保留 / 重新按当前配置注入，避免重建链时丢失
 - 合并转发头像：QQ 端只按节点里的 QQ 号渲染头像（节点的 `avatar` 字段被忽略），而部分协议端（SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，导致清一色默认头像；配置 `forward_node_avatar=true`（默认）时按发送者显示名反查真实 QQ 号——记录来源群名册优先，其次机器人所在全部群的名册（同名在不同群指向不同 QQ 号时丢弃、同一群里同名多人也丢弃，只采用唯一匹配）；名册复用 `@` 昵称反查的群成员缓存（`at_nickname_lookup_cache_ttl`，名册本身不短于 300s），机器人不在的来源群按昵称查不到就保持原值（仍显示默认头像），改用 NapCat / LLOneBot 等能给出真实 QQ 号的协议端则无需依赖此反查
 - 合并转发节点的内容形态：节点内容只能是「纯嵌套 node 数组」或「普通消息段数组」，同一节点里混排文本与嵌套记录无法表达（`_component_to_onebot_segment` 会把嵌套记录降级为文本占位）；节点内媒体仍由 `_component_to_onebot_segment` 转 base64 内嵌
 - 合并转发节点内媒体：直接发送由 AstrBot `Node.to_dict()` 转 base64 内嵌；队列模式由 `_prepare_chain_for_queue` 递归本地化，发送前 `_prepare_chain_for_media_urls` 递归注册文件服务 URL
