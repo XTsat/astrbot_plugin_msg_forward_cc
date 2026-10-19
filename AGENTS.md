@@ -26,7 +26,7 @@
 |------|------|------|
 | `main.py` | ✅ | 插件主体，全部逻辑（4015 行，单文件风格） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（238 行） |
-| `metadata.yaml` | ✅ | 插件元数据（v0.5.7，支持 19 个平台） |
+| `metadata.yaml` | ✅ | 插件元数据（v0.5.8，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档 |
 | `CHANGELOG.md` | ✅ | 变更日志 |
 | `LICENSE` | ✅ | AGPL-3.0 |
