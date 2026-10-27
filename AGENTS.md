@@ -66,7 +66,8 @@
 - `_expand_nested_forwards(event, nodes, keep_time, depth, card_preview_mode=_CARD_PREVIEW_TITLE, avatar_resolver=None)`：递归展开节点内嵌套的聊天记录，层数超限或拉取失败降级为文本占位；`avatar_resolver` 透传给嵌套记录的头像反查
 - `_onebot_bot_of(event)` / `_unwrap_onebot_data(ret)` / `_forward_messages_of(payload)`：取事件所属 OneBot 协议端、归一化 action 返回值、提取节点消息列表
 - `_forward_node_sender_name(msg)` / `_forward_node_sender_group(msg)` / `_set_forward_node_sender_uin(msg, uin)`：取节点消息的发送者显示名（名片优先、昵称兜底，兼容 `{type: node, data}` 包裹格式）/ 取节点消息的来源群号 / 回写发送者 QQ 号（同时覆盖顶层与包裹格式字段）
-- `_resolve_forward_sender_uins(messages, name_map_lookup)`：按发送者显示名从群成员名册反查真实 QQ 号并回写**唯一匹配**，返回修正条数；部分协议端（如 SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，QQ 端只能显示默认头像，靠昵称反查补救；无来源群 / 无匹配时保持原值
+- `_normalize_member_name(name)` / `_member_uin_index(name_map)`：昵称归一化（NFKC 全半角 + casefold，只保留字母与数字，去掉空格 / Emoji / 标点）与名册归一化索引（归一化后撞名且 QQ 号不同则丢弃）
+- `_resolve_forward_sender_uins(messages, name_map_lookup)`：按发送者显示名从群成员名册反查真实 QQ 号并回写**唯一匹配**，返回修正条数；反查顺序为记录来源群名册（精确 → 归一化）→ 全群名册 → 昵称本身是 QQ 号时直接采用（`_FORWARD_NUMERIC_UIN_RE`）；部分协议端（如 SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，QQ 端只能显示默认头像，靠昵称反查补救；无匹配时保持原值，并在 `logger.info` 里输出本条记录的反查命中数与未命中示例
 - `_media_url_in_segment(data)`：从 OneBot 媒体段取可下载 http(s) URL（url 优先，file 为 URL 时兜底）
 - `_ForwardFileRef` / `_resolve_group_file_url(bot, group_id, file_id, busid=None)` / `_forward_file_resolver(bot, event)` / `_resolve_forward_file_refs(content, resolver, group_id)`：节点内只有 file_id、没有直链的群文件段占位（file_id 只能在异步层换 URL）/ 调 `get_group_file_url` 换下载直链（机器人不在文件所属群时协议端会拒绝，失败返回 None）/ 构造解析器——接收记录的会话群优先（转发聊天记录时 QQ 会把记录里的文件重传到接收群文件，节点自带来源群可能取不到），再按节点来源群与 busid 102/104 兜底 / 把节点内容里的文件占位换成 `File`，换不到降级为 `[文件:文件名]` 文字占位并记一条 warning
 - `_forward_segment_to_components(seg)`：把节点里的一个 OneBot 消息段转换为 AstrBot 组件（At 转文本、带 resId 的嵌套转发保留为 `Forward` 交给递归展开、无 resId 的卡片转文本占位、表情与 JSON 卡片保留；群文件段有直链转 `File`、只有 file_id 转 `_ForwardFileRef` 待解析）
@@ -212,9 +213,9 @@
 | 发送媒体前先下载到本地 | `download_media_before_send` | bool, false | 跨设备转发提示找不到文件时才开启 |
 | 转发聊天记录时保留原始发送时间 | `forward_keep_time` | bool, true | 关闭则聊天记录里每条消息显示为转发时的时间 |
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
-| 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；只采用唯一匹配，发送者不在机器人所在的群 / 昵称重名 / 已改名时不反查，仍显示默认头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
+| [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；发送者不在机器人所在的群 / 昵称重名 / 已改名时不反查，仍显示默认头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/image/face/record/video/file/at/other，默认全选 |
-| 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
+| [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
 | 额外允许 @ 透传的目标平台 | `at_passthrough_extra_platforms` | list | 默认已含 QQ 系（aiocqhttp/qq_official 等），自建 QQ 适配器在此追加 |
 | 平台名称映射 | `platform_names` | list | 每项 `原始平台名=显示名`（如 `aiocqhttp=QQ`），兼容旧版 `platform_name_map` object 格式自动迁移 |
@@ -235,7 +236,7 @@
 | 发送队列长度（条） | `queue_max_size` | int, 0 | 本规则独立积压上限（一条多目标转发会计入多次）；0 或不填=不限制（仅受全局总上限约束） |
 | 发送媒体前先下载到本地 | `download_media_before_send` | string, inherit | inherit / true / false 三态，强制覆盖全局 |
 | 转发的内容类型 | `content_types` | list(checkbox) | 非空覆盖全局默认；全部不勾选=继承全局 |
-| 按昵称反查 @ 对象 | `at_nickname_lookup` | string, inherit | inherit / true / false 三态 |
+| [增强] 按昵称反查 @ 对象 | `at_nickname_lookup` | string, inherit | inherit / true / false 三态 |
 | 媒体下载是否走代理 | `use_proxy` | bool, false | |
 | 媒体下载代理地址 | `proxy_url` | string, "" | 仅 `use_proxy` 开启时生效 |
 
@@ -250,7 +251,6 @@
 ### 5.3 配置读取模式
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
-- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）
 - 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`
 
 ---

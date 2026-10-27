@@ -8,6 +8,7 @@ import ssl
 import string
 import tempfile
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlparse
@@ -182,6 +183,9 @@ _FORWARD_MAX_DEPTH = 2
 # 合并转发卡片最多展示的预览行数（QQ 卡片模板上限）与单行正文最大长度
 _FORWARD_PREVIEW_MAX_LINES = 4
 _FORWARD_PREVIEW_MAX_CHARS = 40
+
+# 聊天记录节点昵称本身就是 QQ 号时可直接采用的形态（5~12 位、不以 0 开头）
+_FORWARD_NUMERIC_UIN_RE = re.compile(r"[1-9]\d{4,11}")
 
 
 class _ForwardNodes(Nodes):
@@ -489,6 +493,27 @@ def _forward_messages_of(payload) -> list:
     return []
 
 
+def _normalize_member_name(name: str) -> str:
+    """把群名片 / 昵称归一化为比对键：全角转半角、大小写统一、去掉空格与 Emoji 标点。
+
+    名字一个来自聊天记录归档、一个来自群成员列表，同一个人的字符串常因全半角、
+    Emoji、零宽字符或首尾空白而不相等，严格比对会大面积漏配，故只保留字母与数字
+    参与比对（汉字属字母类不受影响）。"""
+    text = unicodedata.normalize("NFKC", str(name or "")).casefold()
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] in ("L", "N"))
+
+
+def _member_uin_index(name_map: dict) -> dict[str, str]:
+    """把「显示名 → QQ 号」名册转成归一化索引（归一化后撞名且 QQ 号不同则丢弃）。"""
+    owners: dict[str, set[str]] = {}
+    for name, uin in (name_map or {}).items():
+        key = _normalize_member_name(name)
+        value = str(uin or "").strip()
+        if key and value:
+            owners.setdefault(key, set()).add(value)
+    return {key: next(iter(values)) for key, values in owners.items() if len(values) == 1}
+
+
 def _forward_node_sender_name(msg: dict) -> str:
     """取聊天记录节点的发送者显示名（群名片优先、昵称兜底，兼容 node 包裹格式）。"""
     for holder in (msg.get("data"), msg):
@@ -535,35 +560,55 @@ async def _resolve_forward_sender_uins(
     """把聊天记录节点发送者 QQ 号修正为真实值（尽力而为），返回修正条数。
 
     部分协议端（如 SnowLuma）读取合并转发时会把所有节点的发送者 user_id 写成同一个
-    占位值，QQ 端只能显示默认头像；这里按发送者显示名从「节点来源群」的成员列表反查
-    真实 QQ 号，只采用唯一匹配。机器人不在来源群、昵称重名或取不到成员列表时保持
-    原值，由调用方按协议端返回的信息发送。"""
+    占位值，QQ 端只能显示默认头像；这里按发送者显示名反查真实 QQ 号，只采用唯一匹配。
+    反查顺序：记录来源群名册（精确 → 归一化）→ 全群名册（由 name_map_lookup 在来源群
+    查不到时回退）→ 昵称本身是 QQ 号时直接采用。机器人不在来源群、昵称重名或取不到
+    成员列表时保持原值，由调用方按协议端返回的信息发送。"""
     if not messages or name_map_lookup is None:
         return 0
-    group_maps: dict[str, dict] = {}
+    group_maps: dict[str, tuple[dict, dict]] = {}
 
-    async def _name_map_of(group_id: str) -> dict:
+    async def _maps_of(group_id: str) -> tuple[dict, dict]:
+        """取某来源群的（原始名册, 归一化索引）；空群号表示只查全群名册。"""
         if group_id not in group_maps:
             try:
-                group_maps[group_id] = await name_map_lookup(group_id) or {}
-            except Exception:
-                group_maps[group_id] = {}
+                raw = await name_map_lookup(group_id) or {}
+            except Exception as e:
+                logger.warning(f"⚠️ [astrbot_plugin_msg_forward_cc] 取群 {group_id or '全群'} 成员名册失败，头像反查跳过该群：{e}")
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            group_maps[group_id] = (raw, _member_uin_index(raw))
         return group_maps[group_id]
 
     fixed = 0
+    total = 0
+    missed: list[str] = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         name = _forward_node_sender_name(msg)
         if not name:
             continue
-        group_id = _forward_node_sender_group(msg)
-        if not group_id:
-            continue
-        uin = str((await _name_map_of(group_id)).get(name) or "").strip()
+        total += 1
+        raw_map, index = await _maps_of(_forward_node_sender_group(msg))
+        key = _normalize_member_name(name)
+        uin = str(raw_map.get(name) or "").strip()
+        if not uin and key:
+            uin = index.get(key, "")
+        if not uin and _FORWARD_NUMERIC_UIN_RE.fullmatch(key):
+            # 部分记录的昵称本身就是 QQ 号，没有名册可查时直接采用
+            uin = key
         if uin:
             _set_forward_node_sender_uin(msg, uin)
             fixed += 1
+        elif len(missed) < 3:
+            missed.append(name)
+    if total:
+        sample = f"，未命中示例：{'、'.join(missed)}" if missed else ""
+        logger.info(
+            f"ℹ️ [astrbot_plugin_msg_forward_cc] 聊天记录头像反查：{total} 个发送者，补回 {fixed} 个{sample}"
+        )
     return fixed
 
 
@@ -3185,7 +3230,10 @@ class MsgForward(star.Star):
 
         复用 @ 昵称反查的成员列表缓存（缓存时长同 at_nickname_lookup_cache_ttl）。
         机器人不在该群时返回空 dict 且不记录告警；失败结果同样缓存一个周期，
-        避免每条聊天记录都重复请求机器人已退出的群。"""
+        避免每条聊天记录都重复请求机器人已退出的群。
+        群号为空（协议端没给出节点来源群）时直接返回空 dict，由调用方走全群名册。"""
+        if not group_id:
+            return {}
         cached = self._member_cache_get(group_id)
         if cached is None:
             await self._get_group_member_name_map(group_id, quiet=True)
@@ -3978,7 +4026,8 @@ class MsgForward(star.Star):
                         base_chain = _textify_at_chain(message_chain)
                     # 目标平台不支持合并转发时降级为文本占位（跨平台目标）
                     base_chain = self._degrade_forward_for_target(base_chain, target)
-                    new_chain = base_chain if not header_text else [Plain(text=header_text)] + base_chain
+                    target_header = header_text
+                    new_chain = base_chain if not target_header else [Plain(text=target_header)] + base_chain
 
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
                     if queue_interval > 0:
@@ -4023,7 +4072,7 @@ class MsgForward(star.Star):
                             try:
                                 if fallback_chain is None:
                                     prepared = await _prepare_chain_for_forward(filtered_chain)
-                                    fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
+                                    fallback_chain = prepared if not target_header else [Plain(text=target_header)] + prepared
                                 await self.context.send_message(target, event.chain_result(fallback_chain))
                                 logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
                                 if cooldown_sec > 0:
@@ -4033,7 +4082,7 @@ class MsgForward(star.Star):
                                 if has_media:
                                     try:
                                         localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
-                                        fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
+                                        fb_chain = localized if not target_header else [Plain(text=target_header)] + localized
                                         await self.context.send_message(target, event.chain_result(fb_chain))
                                         logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
                                         if cooldown_sec > 0:
