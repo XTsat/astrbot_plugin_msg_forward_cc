@@ -67,7 +67,8 @@
 - `_onebot_bot_of(event)` / `_unwrap_onebot_data(ret)` / `_forward_messages_of(payload)`：取事件所属 OneBot 协议端、归一化 action 返回值、提取节点消息列表
 - `_forward_node_sender_name(msg)` / `_forward_node_sender_group(msg)` / `_set_forward_node_sender_uin(msg, uin)`：取节点消息的发送者显示名（名片优先、昵称兜底，兼容 `{type: node, data}` 包裹格式）/ 取节点消息的来源群号 / 回写发送者 QQ 号（同时覆盖顶层与包裹格式字段）
 - `_normalize_member_name(name)` / `_member_uin_index(name_map)`：昵称归一化（NFKC 全半角 + casefold，只保留字母与数字，去掉空格 / Emoji / 标点）与名册归一化索引（归一化后撞名且 QQ 号不同则丢弃）
-- `_resolve_forward_sender_uins(messages, name_map_lookup)`：按发送者显示名从群成员名册反查真实 QQ 号并回写**唯一匹配**，返回修正条数；反查顺序为记录来源群名册（精确 → 归一化）→ 全群名册 → 昵称本身是 QQ 号时直接采用（`_FORWARD_NUMERIC_UIN_RE`）；部分协议端（如 SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，QQ 端只能显示默认头像，靠昵称反查补救；无匹配时保持原值，并在 `logger.info` 里输出本条记录的反查命中数与未命中示例
+- `_forward_record_uins(messages)` / `_forward_record_identity_lost(uins)`：取每条节点当前携带的发送者 QQ 号 / 判断整条记录的身份是否已被协议端抹平（无号或所有节点共用一个号）；各节点自带不同真实 QQ 号时不反查，避免把正确值改错
+- `_resolve_forward_sender_uins(messages, name_map_lookup)`：按发送者显示名从群成员名册反查真实 QQ 号并回写**唯一匹配**，返回修正条数；反查顺序为记录来源群名册（精确 → 归一化）→ 全群名册 → 昵称本身是 QQ 号时直接采用（`_FORWARD_NUMERIC_UIN_RE`）；部分协议端（如 SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，QQ 端取不到头像，靠昵称反查补救；记录自带真实 QQ 号时整条跳过；无匹配时保持原值，并在 `logger.info` 里输出本条记录的反查命中数与未命中示例
 - `_media_url_in_segment(data)`：从 OneBot 媒体段取可下载 http(s) URL（url 优先，file 为 URL 时兜底）
 - `_ForwardFileRef` / `_resolve_group_file_url(bot, group_id, file_id, busid=None)` / `_forward_file_resolver(bot, event)` / `_resolve_forward_file_refs(content, resolver, group_id)`：节点内只有 file_id、没有直链的群文件段占位（file_id 只能在异步层换 URL）/ 调 `get_group_file_url` 换下载直链（机器人不在文件所属群时协议端会拒绝，失败返回 None）/ 构造解析器——接收记录的会话群优先（转发聊天记录时 QQ 会把记录里的文件重传到接收群文件，节点自带来源群可能取不到），再按节点来源群与 busid 102/104 兜底 / 把节点内容里的文件占位换成 `File`，换不到降级为 `[文件:文件名]` 文字占位并记一条 warning
 - `_forward_segment_to_components(seg)`：把节点里的一个 OneBot 消息段转换为 AstrBot 组件（At 转文本、带 resId 的嵌套转发保留为 `Forward` 交给递归展开、无 resId 的卡片转文本占位、表情与 JSON 卡片保留；群文件段有直链转 `File`、只有 file_id 转 `_ForwardFileRef` 待解析）
@@ -213,7 +214,7 @@
 | 发送媒体前先下载到本地 | `download_media_before_send` | bool, false | 跨设备转发提示找不到文件时才开启 |
 | 转发聊天记录时保留原始发送时间 | `forward_keep_time` | bool, true | 关闭则聊天记录里每条消息显示为转发时的时间 |
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
-| [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；发送者不在机器人所在的群 / 昵称重名 / 已改名时不反查，仍显示默认头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
+| [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；**仅当整条记录的发送者 QQ 号已被协议端抹平时才改写**（记录自带不同真实 QQ 号则整条跳过，避免把正确值改错）；发送者不在机器人所在的群 / 昵称重名 / 已改名时改不了，这些消息取不到头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/image/face/record/video/file/at/other，默认全选 |
 | [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
@@ -251,6 +252,7 @@
 ### 5.3 配置读取模式
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）
 - 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`
 
 ---
@@ -594,7 +596,8 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - 合并转发（聊天记录）：`Forward` 组件只携带源会话的 resId，直接透传会在目标端生成打不开的卡片（并露出 `#000000`、`34` 等模板字段），因此必须先拉取内容重建 `Nodes` 再发送；只有 `aiocqhttp` / `satori` 目标能发送 `Nodes`，其他平台降级为文本
 - 合并转发的时间与嵌套：AstrBot 内置 `Nodes.to_dict` 丢弃节点时间、也表达不了嵌套记录，故用 `_ForwardNodes` 子类覆写 `to_dict`（aiocqhttp 适配器对 `Nodes` 正是调 `to_dict()`）；节点时间来自 `get_forward_msg` 每条消息的 `time`，配置 `forward_keep_time=false` 时不写 `time`（目标端统一显示转发时间）；嵌套记录只有被协议端返回为带 resId 的 `forward` 段时才能递归展开（重建为嵌套 node 数组，协议端上限 3 层，本项目取 2），若源记录里的嵌套卡片只是预览 xml（无 resId，例如旧版坏卡片）则只能降级为 `[聊天记录]` 文本
 - 合并转发的卡片预览：协议端自动生成预览时，嵌套聊天记录节点因没有可预览的消息段会显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`，因此 `_ForwardNodes.to_dict()` 显式携带 OneBot 扩展参数 `news`（前 4 行，文本截断），嵌套节点额外携带内层卡片的 `news`；NapCat 与 SnowLuma 均支持该参数，不支持的实现会忽略，不影响发送。卡片预览行默认显示卡片原本传递的 `prompt`（`forward_card_preview=source`，保留「[QQ小程序]」「[分享]」等来源前缀，`prompt` 为空时回退标题），配置 `forward_card_preview=title` 时只读标题字段（`meta.news.title` → `prompt` 正文 → 其它 `meta.<类型>.title`，简介 / 来源 / 上传者 / 跳转链接一律不读），`forward_card_preview=off` 时统一显示 `[卡片消息]`；`_ForwardNodes.card_preview_mode` 保存该决定，`_map_chain_components` 与队列序列化 / 反序列化（`_serialize_chain` / `_deserialize_chain`）都会保留 / 重新按当前配置注入，避免重建链时丢失
-- 合并转发头像：QQ 端只按节点里的 QQ 号渲染头像（节点的 `avatar` 字段被忽略），而部分协议端（SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，导致清一色默认头像；配置 `forward_node_avatar=true`（默认）时按发送者显示名反查真实 QQ 号——记录来源群名册优先，其次机器人所在全部群的名册（同名在不同群指向不同 QQ 号时丢弃、同一群里同名多人也丢弃，只采用唯一匹配）；名册复用 `@` 昵称反查的群成员缓存（`at_nickname_lookup_cache_ttl`，名册本身不短于 300s），机器人不在的来源群按昵称查不到就保持原值（仍显示默认头像），改用 NapCat / LLOneBot 等能给出真实 QQ 号的协议端则无需依赖此反查
+- 合并转发头像：QQ 端只按节点里的 QQ 号渲染头像（节点的 `avatar` 字段被忽略），而部分协议端（SnowLuma）读取聊天记录时所有节点都返回同一个占位 QQ 号，导致清一色默认头像；配置 `forward_node_avatar=true`（默认）时按发送者显示名反查真实 QQ 号——记录来源群名册优先，其次机器人所在全部群的名册（同名在不同群指向不同 QQ 号时丢弃、同一群里同名多人也丢弃，只采用唯一匹配）；名册复用 `@` 昵称反查的群成员缓存（`at_nickname_lookup_cache_ttl`，名册本身不短于 300s），机器人不在的来源群按昵称查不到就保持原值（取不到头像）。只在整条记录的身份已被抹平时才反查（`_forward_record_identity_lost`：节点没带号、或所有节点共用一个占位号）；各节点自带不同真实 QQ 号时整条跳过，避免改名 / 昵称恰为他人 QQ 号时把正确的发送者改错，改用 NapCat / LLOneBot 等能给出真实 QQ 号的协议端则无需依赖此反查
+- 合并转发头像的不可解边界：QQ 客户端自己转发聊天记录是服务端对象搬移，记录里的发送者身份原样保留；而 OneBot 侧只能「读出来重建」，部分协议端（SnowLuma）读取时不给真实 QQ 号，身份就在这一层丢掉，昵称反查只能补回名册里能唯一匹配的那部分。协议端虽有 `forward_group_single_msg` / `forward_friend_single_msg`（按源消息 ID 让服务端直接转发，理论可保住身份），但实测 SnowLuma 直转出来的记录仍取不到头像，故本项目未采用该方案；要彻底解决需换用能给出真实 QQ 号的协议端（NapCat / LLOneBot）
 - 合并转发节点的内容形态：节点内容只能是「纯嵌套 node 数组」或「普通消息段数组」，同一节点里混排文本与嵌套记录无法表达（`_component_to_onebot_segment` 会把嵌套记录降级为文本占位）；节点内媒体仍由 `_component_to_onebot_segment` 转 base64 内嵌
 - 合并转发节点内媒体：直接发送由 AstrBot `Node.to_dict()` 转 base64 内嵌；队列模式由 `_prepare_chain_for_queue` 递归本地化，发送前 `_prepare_chain_for_media_urls` 递归注册文件服务 URL
 - `/mf queue pause` 暂停 worker 消费（`_queue_paused`），持久化条目不被删除；`resume` 恢复

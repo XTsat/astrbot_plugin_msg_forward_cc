@@ -553,6 +553,31 @@ def _set_forward_node_sender_uin(msg: dict, uin: str) -> None:
             sender["user_id"] = uin
 
 
+def _forward_record_uins(messages: list) -> list[str]:
+    """取每条节点当前携带的发送者 QQ 号（缺失记空串）。"""
+    uins: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        uin = ""
+        for holder in (msg, msg.get("data")):
+            if isinstance(holder, dict) and holder.get("user_id"):
+                uin = str(holder["user_id"]).strip()
+                break
+        uins.append(uin)
+    return uins
+
+
+def _forward_record_identity_lost(uins: list[str]) -> bool:
+    """整条记录的发送者身份是否已被协议端抹平（只有抹平才需要按昵称反查补救）。
+
+    协议端读不出真实身份时，所有节点会共用同一个占位 QQ 号；各节点自带不同 QQ 号则
+    说明身份还在——这时按昵称改写只会把正确值改错（改过名后旧昵称被他人占用、昵称
+    恰好是别人的 QQ 号等），故整条记录放弃反查。"""
+    known = [uin for uin in uins if uin]
+    return not known or len(set(known)) == 1
+
+
 async def _resolve_forward_sender_uins(
     messages: list,
     name_map_lookup: Callable[[str], Awaitable[dict]] | None,
@@ -560,11 +585,16 @@ async def _resolve_forward_sender_uins(
     """把聊天记录节点发送者 QQ 号修正为真实值（尽力而为），返回修正条数。
 
     部分协议端（如 SnowLuma）读取合并转发时会把所有节点的发送者 user_id 写成同一个
-    占位值，QQ 端只能显示默认头像；这里按发送者显示名反查真实 QQ 号，只采用唯一匹配。
+    占位值，QQ 端取不到头像；这里按发送者显示名反查真实 QQ 号，只采用唯一匹配。
     反查顺序：记录来源群名册（精确 → 归一化）→ 全群名册（由 name_map_lookup 在来源群
     查不到时回退）→ 昵称本身是 QQ 号时直接采用。机器人不在来源群、昵称重名或取不到
-    成员列表时保持原值，由调用方按协议端返回的信息发送。"""
+    成员列表时保持原值，由调用方按协议端返回的信息发送；记录自带真实 QQ 号时整条跳过。"""
     if not messages or name_map_lookup is None:
+        return 0
+    if not _forward_record_identity_lost(_forward_record_uins(messages)):
+        logger.info(
+            "ℹ️ [astrbot_plugin_msg_forward_cc] 聊天记录自带真实发送者 QQ 号，跳过头像反查"
+        )
         return 0
     group_maps: dict[str, tuple[dict, dict]] = {}
 
@@ -3922,6 +3952,7 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
+            source_platform = str(event.get_platform_name() or "")
             # 带上 1-based 规则编号（与 /mf list 显示的编号一致），供队列上限日志提示等使用
             rules = [(rid, r) for rid, r in enumerate(self.config.get("rules", []), start=1)
                      if source_umo in MsgForward._umo_list(r, "source_umo")]
