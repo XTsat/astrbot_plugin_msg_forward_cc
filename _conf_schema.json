@@ -57,8 +57,16 @@
           "filter_patterns": {
             "description": "过滤规则列表",
             "type": "list",
-            "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
+            "hint": "仅对本规则生效。每项格式：regex:正则表达式、cmd:指令名（cmd: 匹配任意指令）或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
             "default": []
+          },
+          "command_filter": {
+            "description": "指令消息不转发",
+            "type": "string",
+            "hint": "仅对本规则生效。继承全局=跟随全局设置；拦截指令=以唤醒词开头的指令消息（如 /help）不转发；不拦截=指令消息按普通消息处理。",
+            "default": "inherit",
+            "options": ["inherit", "true", "false"],
+            "labels": ["继承全局", "拦截指令", "不拦截指令"]
           },
           "cooldown_seconds": {
             "description": "转发冷却时间（秒）",
@@ -136,7 +144,19 @@
   "filter_patterns": {
     "description": "全局过滤规则列表（每行一条）",
     "type": "text",
-    "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
+    "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，cmd:指令名 表示指令类型（cmd: 匹配任意指令，cmd:help 匹配 help），其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
+    "default": ""
+  },
+  "command_filter_enabled": {
+    "description": "指令消息不转发",
+    "type": "bool",
+    "hint": "开启后，以唤醒词开头的指令消息（如 /help、/mf list）不转发，避免把机器人指令当聊天内容转发出去。默认开启；每条规则可在规则内单独切换（command_filter）。",
+    "default": true
+  },
+  "command_prefixes": {
+    "description": "唤醒词（识别指令用的前缀，每行一个）",
+    "type": "text",
+    "hint": "每行一个唤醒词，可填多个（如 / 或 ! 或 #机器人）。留空则自动跟随 AstrBot 全局唤醒词（wake_prefix，默认 /）。中文输入法打出的全角符号（如 ／、！）同样能识别。",
     "default": ""
   },
   "default_cooldown_seconds": {

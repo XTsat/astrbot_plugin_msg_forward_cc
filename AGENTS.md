@@ -24,8 +24,8 @@
 
 | 文件 | 必选 | 职责 |
 |------|------|------|
-| `main.py` | ✅ | 插件主体，全部逻辑（4134 行，单文件风格） |
-| `_conf_schema.json` | ✅ | WebUI 配置 Schema（252 行） |
+| `main.py` | ✅ | 插件主体，全部逻辑（4405 行，单文件风格） |
+| `_conf_schema.json` | ✅ | WebUI 配置 Schema（272 行） |
 | `metadata.yaml` | ✅ | 插件元数据（v0.5.9，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档 |
 | `CHANGELOG.md` | ✅ | 变更日志 |
@@ -42,6 +42,7 @@
 ```
 工具与数据路径（常量、MIME 映射）
 → 内容类型筛选（组件 → 类型键、按类型过滤）
+→ 指令识别（唤醒词解析、消息链开头的指令名识别）
 → 合并转发（聊天记录）展开（拉取内容重建 / 嵌套递归展开 / 时间保留 / 目标平台降级）
 → 媒体工具函数（下载 / 重建 / 本地化 / 序列化）
 → 消息链清洗（@ 清洗、File 清洗、At 转发策略）
@@ -51,7 +52,16 @@
 
 依赖方向：工具函数不依赖类实例（全模块级函数），类方法只调用模块级工具函数与 `self.config`。
 
-### 2.3 合并转发（聊天记录）展开（模块级）
+### 2.3 指令识别（唤醒词 / 指令消息，模块级）
+
+- `_DEFAULT_COMMAND_PREFIX` / `_COMMAND_FILTER_TAGS`：全局与插件配置都取不到唤醒词时的兜底 `/` / 过滤条目里的指令类型前缀（`cmd:`、`指令:`）
+- `_normalize_command_prefixes(raw)`：解析唤醒词配置（text 每行一个 / list 均可）→ 去重后按长度倒序，保证 `_command_prefixes` 传入的长唤醒词优先匹配
+- `_global_wake_prefixes()`：读取 AstrBot 全局 `wake_prefix`（通常 `["/"]`）；读取失败告警并退回 `/`
+- `_leading_plain_text(chain)`：取消息链开头连续的文字，跳过在前的 At / Reply（`@机器人 /help`、引用回复后 `/help` 同样识别）；遇到第一个非文字组件即停止。**必须在原始消息链上判断**——AstrBot 唤醒阶段会把唤醒词从 `message_str` 摘掉（`/help` 到插件时 `message_str` 已是 `help`）
+- `_match_wake_prefix(text, prefixes)`：判断文本是否以唤醒词开头，返回 `(唤醒词, 指令名)`；原文与 NFKC 归一化文本都比对（兼容中文输入法打出的全角 `／`、`！`），唤醒词按长度倒序匹配；只有唤醒词、后面没有指令名（如单独一个 `/`）不算指令
+- `_command_info_of_chain(chain, prefixes)`：`_leading_plain_text` + `_match_wake_prefix` 的组合入口
+
+### 2.4 合并转发（聊天记录）展开（模块级）
 
 - `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS` / `_FORWARD_MAX_DEPTH`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`） / 嵌套聊天记录最多再展开的层数（协议端上限 3 层，取 2）
 - `_FORWARD_PREVIEW_MAX_LINES` / `_FORWARD_PREVIEW_MAX_CHARS`：合并转发卡片预览（`news` 扩展参数）最多展示的行数（QQ 卡片模板上限 4 行）/ 单行正文最大长度（超出截断并加省略号）
@@ -78,7 +88,7 @@
 - `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL），并保留节点时间、`_ForwardNodes` 子类与其 `card_preview_mode` 配置（自定义序列化不能被降级成内置 `Nodes`）
 - `_chain_has_media(chain)`：链中是否含媒体组件（含节点内媒体），决定发送失败时是否值得本地化重试
 
-### 2.4 媒体处理工具函数（模块级）
+### 2.5 媒体处理工具函数（模块级）
 
 - `_comp_type_name(comp)` / `_comp_content_type(comp)`：组件 → 内容类型键 / Content-Type
 - `_content_types_for(rule, config)`：解析规则内容类型筛选（规则级覆盖 → 全局默认 → 全选）
@@ -106,18 +116,18 @@
 - `load_json(path)` / `save_json(path, data)`：健壮文件读写，分类记录错误（FileNotFoundError/JSONDecodeError/OSError/TypeError）；原子写入（先写 `.tmp` 再 replace，`ensure_ascii=False, indent=2`）
 - `gen_code(n=6)`：`secrets` 生成绑定码（小写字母+数字）
 
-### 2.5 存储层 `MsgForwardStore`
+### 2.6 存储层 `MsgForwardStore`
 
 - 维护 `pending.json`，提供 `load_pending / save_pending / add_pending / pop_pending`（pop 不存在的 code 抛 KeyError）
 - 无锁简化（见源码注释），数据量小、单进程访问
 
-### 2.6 插件主体 `MsgForward(star.Star)` 生命周期
+### 2.7 插件主体 `MsgForward(star.Star)` 生命周期
 
 - `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）
 - `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务
 - `terminate()`：取消 worker 与清理任务
 
-### 2.7 核心数据流
+### 2.8 核心数据流
 
 ```
 事件进入 forward_message（@filter.event_message_type(ALL)）
@@ -205,7 +215,9 @@
 | 默认隐藏来源信息头 | `default_hide_header` | bool, false | 新建规则默认隐藏来源头 |
 | 来源信息头模板 | `header_template` | text | 变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式 |
 | 消息过滤模式 | `filter_mode` | string, off | off / blacklist / whitelist |
-| 全局过滤规则列表（每行一条） | `filter_patterns` | text | `regex:` 前缀=正则，其余=关键词（不区分大小写） |
+| 全局过滤规则列表（每行一条） | `filter_patterns` | text | `regex:` 前缀=正则，`cmd:` 前缀=指令（`cmd:`=任意指令、`cmd:help`=指定指令），其余=关键词（不区分大小写） |
+| 指令消息不转发 | `command_filter_enabled` | bool, true | 以唤醒词开头的指令消息（如 `/help`）不转发；规则级 `command_filter` 可覆盖 |
+| 唤醒词（每行一个） | `command_prefixes` | text, "" | 识别指令用的前缀，可填多个；留空跟随 AstrBot 全局 `wake_prefix`（默认 `/`）；NFKC 兼容全角 `／`、`！` |
 | 默认转发冷却时间（秒） | `default_cooldown_seconds` | int, 0 | 规则未显式设置时继承 |
 | 默认发送队列间隔（秒） | `default_queue_interval_seconds` | int, 0 | 规则未显式设置时继承 |
 | 启用发送队列 | `queue_enabled` | bool, false | 总开关，关闭时规则间隔不生效 |
@@ -231,7 +243,8 @@
 | 目标 UMO 列表 | `target_umo` | text（每行一条） | 多目标：转发到每个会话 |
 | 隐藏来源信息头 | `hide_header` | bool, false | |
 | 过滤模式 | `filter_mode` | string, inherit | inherit / off / blacklist / whitelist |
-| 过滤规则列表 | `filter_patterns` | list | 非空则覆盖全局，留空继承全局 |
+| 过滤规则列表 | `filter_patterns` | list | 非空则覆盖全局，留空继承全局；条目支持 `regex:` / `cmd:` / 关键词 |
+| 指令消息不转发 | `command_filter` | string, inherit | inherit / true / false 三态，强制覆盖全局；true=指令消息不转发 |
 | 转发冷却时间（秒） | `cooldown_seconds` | int, 0 | 0=关闭本规则冷却；不填（删除字段）=继承全局默认 |
 | 发送队列间隔（秒） | `queue_interval_seconds` | int, 0 | > 0 且 `queue_enabled` 时进入队列模式；不填=继承全局默认 |
 | 发送队列长度（条） | `queue_max_size` | int, 0 | 本规则独立积压上限（一条多目标转发会计入多次）；0 或不填=不限制（仅受全局总上限约束） |
@@ -252,8 +265,8 @@
 ### 5.3 配置读取模式
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
-- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）
-- 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_command_prefixes()`（插件配置优先，留空回退 AstrBot 全局 `wake_prefix`）
+- 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`、`_should_filter_commands(rule)`
 
 ---
 
@@ -297,7 +310,12 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf cooldown` | 管理员 | 查看冷却配置 |
 | `mf cooldown default <秒>` | 管理员 | 设置全局默认冷却（0=关闭） |
 | `mf cooldown <编号> <秒\|inherit>` | 管理员 | 设置规则级冷却（inherit=重置继承全局） |
-| `mf filter` | 管理员 | 查看全局+规则级过滤配置、冷却配置、队列配置 |
+| `mf filter` | 管理员 | 查看全局+规则级过滤配置、指令过滤与唤醒词、冷却配置、队列配置 |
+| `mf filter cmd` | 管理员 | 查看指令过滤状态与当前唤醒词 |
+| `mf filter cmd on` / `off` | 管理员 | 全局开启/关闭指令过滤（默认开启） |
+| `mf filter cmd <编号> on\|off\|inherit` | 管理员 | 规则级指令过滤开关（inherit=重置继承全局） |
+| `mf filter prefix <唤醒词...>` | 管理员 | 设置唤醒词（空格分隔多个；多词参数从 `event.message_str` 解析，不能只读 handler 参数） |
+| `mf filter prefix reset` | 管理员 | 恢复为跟随 AstrBot 全局唤醒词 |
 | `mf content` | 管理员 | 查看内容类型筛选配置 |
 | `mf content list` | 管理员 | 查看可选内容类型与别名 |
 | `mf content default <类型...>` | 管理员 | 设置全局默认（all=全选） |
@@ -347,7 +365,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `_ForwardNodes`，按配置 `forward_node_avatar` 用发送者昵称反查真实 QQ 号（头像用）、递归展开节点内嵌套记录、按配置 `forward_keep_time` 保留每条消息的原始发送时间、按配置 `forward_card_preview` 决定卡片预览行显示来源 + 标题（默认）/ 仅标题 / `[卡片消息]`；拉取失败降级为 `[聊天记录]` 文本
 
 逐规则流程：
-1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
+1. 跳过 `enabled=false` 规则；`_should_forward(event, rule, command_name, command_resolved=True)` 过滤检查（规则级优先，inherit 继承全局）——先判指令过滤（`_should_filter_commands(rule)` 且消息是指令则直接不转发），再走 `filter_mode` + `filter_patterns`（关键词 / 正则 / `cmd:` 指令类型）；`command_name` 由事件级 `_command_name(event)` 识别一次后复用（`command_resolved=True` 表示已识别，避免逐规则重复识别）
 2. 内容类型筛选 `_content_types_for` + `_filter_chain_by_types`；过滤后为空则跳过（不转发、不占冷却）
 3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
 4. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
@@ -365,7 +383,9 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 模式：`off`（不过滤）/ `blacklist`（命中不转发）/ `whitelist`（命中才转发）
 - 模式优先级：规则级 `filter_mode`（inherit → 全局 `filter_mode`）> 全局
 - 规则列表：规则级 `filter_patterns` 非空用它，否则继承全局 `filter_patterns`
-- 条目解析 `_parse_filter_item`：`regex:` 前缀 → 正则（`re.search`），否则关键词（小写包含匹配，不区分大小写）
+- 条目解析 `_parse_filter_item`：`regex:` 前缀 → 正则（`re.search`）；`cmd:` / `指令:` 前缀 → 指令类型（value 为空=任意指令，否则与识别出的指令名不区分大小写比对）；其余 → 关键词（小写包含匹配，不区分大小写）
+- 指令过滤先于模式判定：`_should_filter_commands(rule)` 开启（全局 `command_filter_enabled` 默认 true，规则级 `command_filter` inherit/true/false 覆盖）且消息被 `_command_name(event)` 识别为指令时，`_should_forward` 直接返回 False——`filter_mode=whitelist` 也不会转发指令，这是「所有指令默认不转发」的实现方式
+- 指令识别在原始消息链上做（见 2.3）：`event.message_str` 已被 AstrBot 摘掉唤醒词，不能用来判断；识别结果同时供 `cmd:` 条目使用（指令过滤关闭时 `cmd:` 仍可用）
 - `_unwrap_patterns`：兼容 text（按行拆分）和 template_list（取 dict 的 `rule` 字段）两种配置格式
 
 ### 6.7 内容类型筛选与 @ 转发

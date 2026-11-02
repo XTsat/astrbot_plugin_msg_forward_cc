@@ -21,7 +21,8 @@
 - **单命令配置**：`/mf add/bind` 绑定码流程，或 `/mf bindraw` 单命令直接建规则。
 - **来源信息控制**：每条规则可独立设置显示/隐藏来源信息（`/mf hide`）。
 - **规则启停**：每条规则可独立启用/停用，停用后规则保留但不再转发（WebUI 开关或 `/mf toggle`）。
-- **消息过滤**：全局与规则级两层过滤（off/blacklist/whitelist），支持关键词与正则。
+- **消息过滤**：全局与规则级两层过滤（off/blacklist/whitelist），支持关键词、正则与指令（`cmd:`）三种匹配方式。
+- **指令不转发**：以唤醒词开头的指令消息（如 `/help`、`/mf list`）默认不转发；唤醒词默认跟随 AstrBot 全局唤醒词（`/`），也可改成 `!`、`#` 等自定义唤醒词，全角符号同样能识别。
 - **转发冷却**：全局默认与规则级冷却时间，避免刷屏（与队列间隔互斥：队列模式下冷却不生效，列表以 `❄失效(队列中)` 标记）。
 - **发送队列**：全局默认与规则级队列间隔，匹配消息进入队列后每隔设定时间转发一条；不同规则的队列按各自间隔**独立调度**，一条规则的间隔长短不会拖慢其它规则的发送节拍；支持规则级队列长度上限，达上限后新消息丢弃。
 - **媒体转发（失败自动降级）**：发送失败时自动下载远程媒体到本地重试；协议端调用超时（如 NapCat sendMsg）会短延迟后重发原链，纯文本消息同样适用。
@@ -105,10 +106,10 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 
 #### 4. 消息过滤（Filter）
 
-支持**关键词**和**正则表达式**两种匹配方式，统一在 `filter_patterns` 中管理。分**全局**和**逐规则**两层：
+支持**关键词**、**正则表达式**和**指令**三种匹配方式，统一在 `filter_patterns` 中管理。分**全局**和**逐规则**两层：
 
-- **全局**：顶层 `filter_mode` + `filter_patterns`（template_list 类型，逐条添加规则，`regex:xxx`=正则，否则=关键词），支持 JSON 批量导入导出
-- **逐规则**：每条转发规则可覆写 `filter_mode`（`inherit`=继承全局）和 `filter_patterns`（空=继承全局），每项格式：`regex:正则表达式` 或 关键词
+- **全局**：顶层 `filter_mode` + `filter_patterns`（template_list 类型，逐条添加规则，`regex:xxx`=正则，`cmd:xxx`=指令，否则=关键词），支持 JSON 批量导入导出
+- **逐规则**：每条转发规则可覆写 `filter_mode`（`inherit`=继承全局）和 `filter_patterns`（空=继承全局），每项格式：`regex:正则表达式`、`cmd:指令名` 或 关键词
 
 三种模式：
 
@@ -117,6 +118,13 @@ UMO 能让插件知道"某条消息来自哪个平台的哪个会话"，确保�
 - **whitelist**：命中才转发，未命中则跳过
 
 > 全局用 WebUI 的 template_list 增删改，规则级在 WebUI 中填 JSON 数组字符串。通过 `/mf filter` 可查看当前配置。
+
+**指令过滤（默认开启）**：以唤醒词开头的指令消息（如 `/help`、`/mf list`）默认**不转发**，避免机器人的指令被当成聊天内容同步到别的会话。它独立于上面的过滤模式，任何模式下都生效：
+
+- 开关：全局默认开启，可在配置「指令消息不转发」（`command_filter_enabled`）或 `/mf filter cmd on|off` 切换；每条规则也可单独设置（`command_filter`，或 `/mf filter cmd <编号> on|off|inherit`）
+- 唤醒词：默认跟随 AstrBot 全局唤醒词（`wake_prefix`，通常是 `/`）；想用别的唤醒词就在配置「唤醒词（识别指令用的前缀，每行一个）」（`command_prefixes`）里填写，每行一个、可填多个（如 `!`、`#`、`#机器人`），或用 `/mf filter prefix <唤醒词>` 修改、`/mf filter prefix reset` 恢复跟随全局；中文输入法打出的全角符号（如 `／`、`！`）同样能识别
+- 指令类型也可以写进过滤列表：`cmd:` 匹配任意指令，`cmd:help` 只匹配 help 指令（不区分大小写）；即使关闭了指令过滤，也能用它在黑名单 / 白名单里精确控制某条指令是否转发
+- 关闭指令过滤后，指令消息就按普通消息处理（照常参与关键词 / 正则 / 指令类型的过滤）
 
 #### 5. 内容类型筛选（多选，默认全选）
 
@@ -193,7 +201,12 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `mf cooldown default <秒>` | 设置全局默认冷却时间（0=关闭） |
 | `mf cooldown <编号> <秒>` | 设置某条规则冷却时间（0=关闭该规则冷却） |
 | `mf cooldown <编号> inherit` | 重置某条规则冷却为继承全局默认 |
-| `mf filter` | 查看当前过滤配置（模式+正则） |
+| `mf filter` | 查看当前过滤配置（模式 + 关键词/正则/指令条目 + 指令过滤与唤醒词） |
+| `mf filter cmd on` / `mf filter cmd off` | 全局开启/关闭指令过滤（开启时指令消息不转发，默认开启） |
+| `mf filter cmd <编号> on\|off` | 设置某条规则的指令过滤 |
+| `mf filter cmd <编号> inherit` | 重置某条规则的指令过滤为继承全局 |
+| `mf filter prefix <唤醒词...>` | 设置唤醒词（可填多个，空格分隔，例：/mf filter prefix ! ＃） |
+| `mf filter prefix reset` | 恢复为跟随 AstrBot 全局唤醒词 |
 | `mf content` | 查看内容类型筛选配置（全局默认 + 规则级覆盖） |
 | `mf content list` | 查看可选内容类型与别名 |
 | `mf content default <类型...>` | 设置全局默认内容类型（`all`=全选，例：/mf content default plain image） |
@@ -256,7 +269,9 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `platform_names` | list | `["aiocqhttp=QQ"]` | 平台显示名映射，每项格式：`原始平台名=显示名`，未命中的平台自动使用内置名称 |
 | `header_template` | text | 见下方 | 来源信息头模板，支持变量替换 |
 | `filter_mode` | string | `off` | 消息过滤模式：off/blacklist/whitelist |
-| `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，否则=关键词） |
+| `filter_patterns` | template_list | `[]` | 全局过滤规则列表，每条一条规则（regex:xxx=正则，cmd:xxx=指令，否则=关键词） |
+| `command_filter_enabled` | bool | `true` | 指令消息不转发：以唤醒词开头的指令消息（如 `/help`、`/mf list`）不转发，每条规则可单独覆盖 |
+| `command_prefixes` | text | 空 | 唤醒词（识别指令用的前缀，每行一个，可填多个），留空则跟随 AstrBot 全局唤醒词（默认 `/`）；全角符号同样能识别 |
 | `default_cooldown_seconds` | int | `0` | 默认转发冷却时间（秒），每条规则可单独覆盖 |
 | `default_queue_interval_seconds` | int | `0` | 默认发送队列间隔（秒），开启后消息进入队列每隔该秒数转发一条，每条规则可单独覆盖 |
 | `queue_max_size` | int | `0` | 发送队列**总长度上限**（全部规则合计积压条数），0=不限制；达到上限后新消息被丢弃（记录 error 日志），队列中已有的消息不受影响；各规则可用规则级 `queue_max_size` 单独限制本规则积压 |
@@ -279,7 +294,8 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `target_umo` | text | 消息目标会话标识，每行一条，可填多个（消息会转发到其中的每一个） |
 | `hide_header` | bool | 是否隐藏来源信息头 |
 | `filter_mode` | string | 过滤模式（inherit=继承全局），支持 inherit/off/blacklist/whitelist |
-| `filter_patterns` | list | 过滤规则列表（留空=继承全局），每项格式：`regex:表达式` 或 关键词 |
+| `filter_patterns` | list | 过滤规则列表（留空=继承全局），每项格式：`regex:表达式`、`cmd:指令名` 或 关键词 |
+| `command_filter` | string | 指令消息不转发（inherit=继承全局），支持 inherit/true/false：`true`=以唤醒词开头的指令消息不转发，`false`=指令消息按普通消息处理 |
 | `cooldown_seconds` | int | 转发冷却时间（秒），0=关闭本规则冷却；不填则继承全局默认值；规则处于队列模式时冷却不生效（显示 `❄失效(队列中)`） |
 | `queue_interval_seconds` | int | 发送队列间隔（秒），0=关闭本规则队列（立即转发）；不填则继承全局默认值；开启后消息进入队列每隔该秒数转发一条 |
 | `queue_max_size` | int | 发送队列长度上限（条），本规则在队列中允许积压的最大消息数；0 或不填=不限制（仅受全局总上限约束）；达到后新消息被丢弃（记录 error 日志） |

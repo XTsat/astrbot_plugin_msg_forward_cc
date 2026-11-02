@@ -168,6 +168,100 @@ def _should_attach_header(rule: dict, allowed: set) -> bool:
 
 
 # ------------------------
+# 指令识别（唤醒词 / 指令消息）
+# ------------------------
+
+# 默认唤醒词：插件未配置、AstrBot 全局也未配置时兜底
+_DEFAULT_COMMAND_PREFIX = "/"
+
+# 过滤规则条目里的「指令」类型前缀：cmd:help 匹配指定指令，cmd: 匹配任意指令
+_COMMAND_FILTER_TAGS = ("cmd:", "指令:")
+
+
+def _normalize_command_prefixes(raw) -> list[str]:
+    """解析唤醒词配置，返回去重后按长度倒序排列的列表。
+
+    兼容 text（每行一个）与 list 两种格式，空项忽略；长唤醒词排在前面，
+    保证「/mf」这类长唤醒词优先于「/」匹配，指令名不会被拆错。"""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        items = raw.splitlines()
+    elif isinstance(raw, (list, tuple)):
+        items = [str(x) for x in raw]
+    else:
+        items = [str(raw)]
+    out: list[str] = []
+    for item in items:
+        for piece in str(item).splitlines():
+            prefix = piece.strip()
+            if prefix and prefix not in out:
+                out.append(prefix)
+    return sorted(out, key=len, reverse=True)
+
+
+def _global_wake_prefixes() -> list[str]:
+    """读取 AstrBot 全局唤醒词（wake_prefix，通常为 ["/"]）。
+
+    插件唤醒词留空时跟随框架的唤醒词，避免框架改了前缀后插件识别不到指令。"""
+    try:
+        from astrbot.core import astrbot_config
+        prefixes = _normalize_command_prefixes(astrbot_config.get("wake_prefix"))
+    except Exception as exc:  # 全局配置不可用时退回默认唤醒词，不影响转发
+        logger.warning(f"⚠️ [astrbot_plugin_msg_forward_cc] 读取 AstrBot 唤醒词失败，改用默认唤醒词：{exc}")
+        prefixes = []
+    return prefixes or [_DEFAULT_COMMAND_PREFIX]
+
+
+def _leading_plain_text(chain) -> str:
+    """取消息链开头连续的文字内容（跳过在前的 @ / 引用回复等非文字组件）。
+
+    识别指令必须在原始消息链上做：AstrBot 唤醒阶段会把唤醒词从 message_str 里摘掉，
+    消息「/help」到达插件时 message_str 已变成「help」，只有链上还留着完整文本。"""
+    parts: list[str] = []
+    for comp in chain or []:
+        if isinstance(comp, Plain):
+            parts.append(comp.text or "")
+            continue
+        if parts:
+            break
+        # 群里「@机器人 /help」、私聊「引用某条消息后 /help」同样是指令
+        if isinstance(comp, At) or _comp_type_name(comp) == "Reply":
+            continue
+        break
+    return "".join(parts).strip()
+
+
+def _match_wake_prefix(text: str, prefixes: list[str]) -> tuple[str, str] | None:
+    """判断文本是否以唤醒词开头，返回 (唤醒词, 指令名)；不是指令返回 None。
+
+    原文与 NFKC 归一化文本都比对一次，兼容中文输入法打出的全角「／」「！」；
+    只有唤醒词、唤醒词后没有指令名的消息（如单独一个「/」）不算指令。"""
+    if not text or not prefixes:
+        return None
+    candidates = [text]
+    normalized = unicodedata.normalize("NFKC", text)
+    if normalized != text:
+        candidates.append(normalized)
+    for cand in candidates:
+        cand = cand.lstrip()
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            for wake in {prefix, unicodedata.normalize("NFKC", prefix)}:
+                if not wake or not cand.startswith(wake):
+                    continue
+                rest = cand[len(wake):].strip()
+                if not rest:
+                    continue
+                return wake, rest.split()[0]
+    return None
+
+
+def _command_info_of_chain(chain, prefixes: list[str]) -> tuple[str, str] | None:
+    """识别消息链是否为指令消息，返回 (唤醒词, 指令名)；不是指令返回 None。"""
+    return _match_wake_prefix(_leading_plain_text(chain), prefixes)
+
+
+# ------------------------
 # 合并转发（聊天记录）展开
 # ------------------------
 
@@ -2043,7 +2137,10 @@ class MsgForward(star.Star):
             "│   ├── cooldown <编号> <秒>: 设置某条规则冷却（0=关闭该规则冷却）\n"
             "│   └── cooldown <编号> inherit: 重置为继承全局默认\n"
             "├── 🎯 过滤\n"
-            "│   └── filter: 查看当前过滤配置\n"
+            "│   ├── filter: 查看当前过滤配置（含指令过滤与唤醒词）\n"
+            "│   ├── filter cmd on / filter cmd off: 全局开关指令过滤（默认开启=指令不转发）\n"
+            "│   ├── filter cmd <编号> on|off|inherit: 设置某条规则的指令过滤\n"
+            "│   └── filter prefix <唤醒词...|reset>: 改唤醒词（默认跟随 AstrBot 全局，/ 可改）\n"
             "├── 📦 内容类型\n"
             "│   ├── content: 查看内容类型筛选配置\n"
             "│   ├── content list: 查看可选内容类型与别名\n"
@@ -2077,7 +2174,9 @@ class MsgForward(star.Star):
             "冷却与队列同时开启时冷却失效（队列间隔已在限流），\n"
             "list 中以 ❄失效(队列中) 标记，日志会告警一次。\n"
             "@ 转发：默认 At 一律转为文本 @昵称（不发送真实 At，稳妥）；开启昵称反查\n"
-            "（高级 @）后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭）。"
+            "（高级 @）后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭）。\n"
+            "指令过滤：默认以唤醒词开头的指令消息（如 /help）不转发；唤醒词默认跟随\n"
+            "AstrBot 全局唤醒词（/），可用 /mf filter prefix 改成 ! 等其它唤醒词。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2635,10 +2734,98 @@ class MsgForward(star.Star):
         lines.extend(self._format_rules(list(enumerate(rules, start=1))))
         yield event.plain_result("\n".join(lines))
 
+    @staticmethod
+    def _filter_item_tag(item_type: str) -> str:
+        """过滤条目的类型标记：正则 / 指令 / 关键词。"""
+        return {"regex": "[正]", "command": "[指]"}.get(item_type, "[关]")
+
+    @staticmethod
+    def _filter_args(event: AstrMessageEvent, args: str) -> list[str]:
+        """取 /mf filter 之后的全部参数。
+
+        AstrBot 只把首个 token 传进 handler 参数，多词参数（唤醒词）必须从原始文本取。"""
+        tokens = (event.message_str or "").split()
+        for i, tok in enumerate(tokens):
+            if tok.lower() == "filter":
+                return tokens[i + 1:]
+        return (args or "").split()
+
+    def _apply_filter_option(self, tokens: list[str]) -> str:
+        """处理 /mf filter 的子参数（cmd / prefix），返回回复文本。"""
+        head = tokens[0].strip().lower()
+        rest = [t.strip() for t in tokens[1:] if t.strip()]
+
+        if head in ("cmd", "指令"):
+            if not rest:
+                state = "开启" if bool(self.config.get("command_filter_enabled", True)) else "关闭"
+                return (
+                    f"📋 指令过滤：{state}｜唤醒词：{' / '.join(self._command_prefixes())}\n"
+                    "用法：/mf filter cmd on|off 设全局；/mf filter cmd <编号> on|off|inherit 设规则级"
+                )
+            # 规则级：cmd <编号> on|off|inherit
+            if len(rest) == 2 and rest[1].lower() in ("on", "off", "inherit"):
+                rid, arg = rest[0], rest[1].lower()
+                rules, idx, rule = self._get_rule(rid)
+                if rule is None:
+                    return f"❌ 规则 #{rid} 不存在"
+                if arg == "inherit":
+                    rule.pop("command_filter", None)
+                    self.config["rules"] = rules
+                    self.config.save_config()
+                    return f"✅ 规则 #{rid}（{self._rule_name(rule)}）指令过滤已重置为继承全局"
+                rule["command_filter"] = (arg == "on")
+                self.config["rules"] = rules
+                self.config.save_config()
+                state = "拦截指令消息（以唤醒词开头的消息不转发）" if arg == "on" else "不拦截指令消息"
+                return f"✅ 规则 #{rid}（{self._rule_name(rule)}）{state}"
+            # 全局：cmd on|off
+            if len(rest) == 1 and rest[0].lower() in ("on", "off"):
+                val = rest[0].lower() == "on"
+                self.config["command_filter_enabled"] = val
+                self.config.save_config()
+                return ("✅ 已开启指令过滤：以唤醒词开头的指令消息不再转发"
+                        if val else "✅ 已关闭指令过滤：指令消息按普通消息处理")
+            return "❌ 用法：/mf filter cmd on|off；或 /mf filter cmd <编号> on|off|inherit"
+
+        if head in ("prefix", "wake", "唤醒词"):
+            if not rest:
+                return (
+                    f"📋 当前唤醒词：{' / '.join(self._command_prefixes())}\n"
+                    f"      AstrBot 全局唤醒词：{' / '.join(_global_wake_prefixes())}\n"
+                    "用法：/mf filter prefix / 设置唤醒词（可填多个，空格分隔）；"
+                    "/mf filter prefix reset 恢复跟随全局"
+                )
+            if len(rest) == 1 and rest[0].lower() in ("reset", "default", "inherit", "clear"):
+                self.config["command_prefixes"] = ""
+                self.config.save_config()
+                return f"✅ 已恢复跟随 AstrBot 全局唤醒词：{' / '.join(_global_wake_prefixes())}"
+            prefixes = _normalize_command_prefixes(rest)
+            if not prefixes:
+                return "❌ 唤醒词不能为空；恢复默认请用 /mf filter prefix reset"
+            self.config["command_prefixes"] = "\n".join(prefixes)
+            self.config.save_config()
+            return (
+                f"✅ 唤醒词已设为：{' / '.join(prefixes)}"
+                "（指令过滤开启时，以此开头的指令消息不再转发）"
+            )
+
+        return (
+            "❌ 未知参数，用法：\n"
+            "/mf filter：查看过滤配置\n"
+            "/mf filter cmd on|off：全局开关指令过滤\n"
+            "/mf filter cmd <编号> on|off|inherit：设置某条规则的指令过滤\n"
+            "/mf filter prefix <唤醒词...>：设置唤醒词（reset 恢复跟随全局）"
+        )
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("filter")
-    async def cmd_filter_list(self, event: AstrMessageEvent):
-        """查看当前的过滤配置"""
+    async def cmd_filter_list(self, event: AstrMessageEvent, args: str = ""):
+        """查看当前的过滤配置（含指令过滤与唤醒词），或按子参数修改"""
+        tokens = MsgForward._filter_args(event, args)
+        if tokens:
+            yield event.plain_result(self._apply_filter_option(tokens))
+            return
+
         filter_mode = self.config.get("filter_mode", "off")
         patterns_data = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
 
@@ -2652,8 +2839,20 @@ class MsgForward(star.Star):
         else:
             for i, item in enumerate(patterns_data, start=1):
                 tp, val = MsgForward._parse_filter_item(item)
-                tag = "[正]" if tp == "regex" else "[关]"
-                lines.append(f"      {tag} {i}. {val}")
+                lines.append(f"      {MsgForward._filter_item_tag(tp)} {i}. {val or '（任意指令）'}")
+
+        # 指令过滤：以唤醒词开头的指令消息默认不转发
+        cmd_on = bool(self.config.get("command_filter_enabled", True))
+        custom_prefixes = _normalize_command_prefixes(self.config.get("command_prefixes"))
+        prefix_src = "本插件配置" if custom_prefixes else "跟随 AstrBot 全局唤醒词"
+        lines.append(
+            f"\n🎯 指令过滤：{'开启' if cmd_on else '关闭'}"
+            f"｜唤醒词：{' / '.join(self._command_prefixes())}（{prefix_src}）"
+        )
+        lines.append(
+            "      开启时，以唤醒词开头的指令消息（如 /help）不转发"
+            if cmd_on else "      关闭时，指令消息按普通消息处理（过滤列表里的 cmd: 仍然可用）"
+        )
 
         # 显示各规则的单独过滤配置
         rules = self.config.get("rules", [])
@@ -2670,11 +2869,22 @@ class MsgForward(star.Star):
                 if rfp:
                     for j, item in enumerate(rfp, start=1):
                         tp, val = MsgForward._parse_filter_item(str(item))
-                        tag = "[正]" if tp == "regex" else "[关]"
-                        lines.append(f"      {tag} {j}. {val}")
+                        lines.append(f"      {MsgForward._filter_item_tag(tp)} {j}. {val or '（任意指令）'}")
 
         if not has_per_rule:
             lines.append("（所有规则使用全局过滤配置）")
+
+        # 指令过滤的规则级覆盖
+        rule_cmd_lines = []
+        for idx, r in enumerate(rules, start=1):
+            val = r.get("command_filter")
+            if val is None or (isinstance(val, str) and val.strip().lower() == "inherit"):
+                continue
+            state = "拦截指令" if self._should_filter_commands(r) else "不拦截指令"
+            rule_cmd_lines.append(f"  #{idx} | {self._rule_name(r)} | {state}")
+        if rule_cmd_lines:
+            lines.append("\n🎯 规则级指令过滤：")
+            lines.extend(rule_cmd_lines)
 
         # 显示冷却配置
         default_cd = self.config.get("default_cooldown_seconds", 0)
@@ -2692,6 +2902,11 @@ class MsgForward(star.Star):
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄{cd_val}s{tail}")
             else:
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
+
+        lines.append(
+            "\n用法：/mf filter cmd on|off 开关指令过滤；/mf filter cmd <编号> on|off|inherit 设规则级；"
+            "/mf filter prefix <唤醒词...> 改唤醒词（reset 恢复跟随全局）"
+        )
 
         yield event.plain_result("\n".join(lines))
 
@@ -3409,7 +3624,50 @@ class MsgForward(star.Star):
                 cleaned.append(comp)
         return cleaned
 
-    def _should_forward(self, event: AstrMessageEvent, rule: dict = None) -> bool:
+    def _should_filter_commands(self, rule: dict | None) -> bool:
+        """判断是否拦截指令消息（以唤醒词开头的消息，如 /help）。
+
+        全局默认开启（command_filter_enabled）；规则显式设置 command_filter 时按规则值，
+        inherit 或未设置时继承全局。兼容 bool 与 on/off、true/false 字符串。"""
+        val = (rule or {}).get("command_filter")
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in ("true", "on", "1", "yes"):
+                return True
+            if v in ("false", "off", "0", "no"):
+                return False
+        return bool(self.config.get("command_filter_enabled", True))
+
+    def _command_prefixes(self) -> list[str]:
+        """生效的唤醒词列表：配置了就用配置，留空则跟随 AstrBot 全局唤醒词（默认 /）。"""
+        custom = _normalize_command_prefixes(self.config.get("command_prefixes"))
+        return custom or _global_wake_prefixes()
+
+    def _command_name(self, event: AstrMessageEvent) -> str | None:
+        """识别当前消息是否为指令消息，返回指令名（不含唤醒词）；不是指令返回 None。"""
+        info = _command_info_of_chain(event.get_messages(), self._command_prefixes())
+        return info[1] if info else None
+
+    def _should_forward(
+        self,
+        event: AstrMessageEvent,
+        rule: dict = None,
+        command_name: str | None = None,
+        *,
+        command_resolved: bool = False,
+    ) -> bool:
+        """判断当前消息是否应转发给该规则。
+
+        command_name / command_resolved 由事件级调用方预先识别后传入（避免逐规则重复识别）；
+        未传入时就地识别。指令过滤开启时，指令消息一律不转发。"""
+        # 指令过滤：以唤醒词开头的指令消息（如 /help）默认不转发
+        if self._should_filter_commands(rule):
+            name = command_name if command_resolved else self._command_name(event)
+            if name is not None:
+                return False
+
         # 确定生效的过滤模式和规则列表
         if rule:
             fm = rule.get("filter_mode", "inherit")
@@ -3433,9 +3691,18 @@ class MsgForward(star.Star):
 
         msg_text = event.message_str
         msg_lower = msg_text.lower()
+        # 指令类型条目（cmd:）需要指令名，指令过滤关闭时也可单独使用
+        cmd_name = command_name if command_resolved else self._command_name(event)
 
         for item in fp:
             item_type, item_val = self._parse_filter_item(item)
+            if item_type == "command":
+                # cmd: 匹配任意指令；cmd:help 匹配指定指令（不区分大小写）
+                if cmd_name is None:
+                    continue
+                if not item_val or item_val.lower() == cmd_name.lower():
+                    return fm == "whitelist"
+                continue
             if not item_val:
                 continue
             if item_type == "keyword":
@@ -3449,10 +3716,17 @@ class MsgForward(star.Star):
 
     @staticmethod
     def _parse_filter_item(item: str):
-        """解析一条过滤规则，返回 (type, value)"""
+        """解析一条过滤规则，返回 (type, value)。
+
+        regex:正则表达式 → 正则匹配；cmd:指令名 或 cmd: → 指令类型（value 为空匹配
+        任意指令）；其余 → 关键词（不区分大小写的包含匹配）。"""
         s = item.strip()
         if s.startswith("regex:"):
             return "regex", s[6:].strip()
+        lowered = s.lower()
+        for tag in _COMMAND_FILTER_TAGS:
+            if lowered.startswith(tag):
+                return "command", s[len(tag):].strip()
         return "keyword", s
 
     @staticmethod
@@ -3960,6 +4234,14 @@ class MsgForward(star.Star):
                 return
 
             raw_chain = event.get_messages()
+            # 指令识别（唤醒词可配置）：事件级识别一次，供每条规则的指令过滤复用；
+            # 命中的规则全都拦截指令时就到此为止，不必再做合并转发展开、媒体本地化等重活
+            command_name = self._command_name(event)
+            if command_name is not None and all(self._should_filter_commands(r) for _, r in rules):
+                logger.debug(
+                    f"[astrbot_plugin_msg_forward_cc] 指令消息 /{command_name} 命中指令过滤，不转发"
+                )
+                return
             # 清洗无效的 @ 提及（空目标），保留 qq 原样透传，昵称仅作兜底
             sanitized_chain = _sanitize_chain_for_forward(raw_chain)
             # 清洗 File 组件的本地路径：NapCat 读不到源端本地路径，仅保留 URL 走下载
@@ -3995,8 +4277,8 @@ class MsgForward(star.Star):
                     continue
                 # 队列归集用的稳定规则标识（不依赖编号，规则增删/排序后仍有效）
                 rule_key = self._rule_key(rule)
-                # 逐规则过滤检查
-                if not self._should_forward(event, rule):
+                # 逐规则过滤检查（含指令过滤：指令消息默认不转发）
+                if not self._should_forward(event, rule, command_name, command_resolved=True):
                     continue
 
                 # 内容类型筛选（v0.5.0）：仅保留规则选中的类型，默认全选
