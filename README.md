@@ -15,6 +15,7 @@
 - **规则管理**：每条规则可设备注、单独启停、单独隐藏来源信息；`/mf add` + `/mf bind` 绑定码两步建规则，或 `/mf bindraw` 一条命令建规则。
 - **来源信息标注**：转发时自动加来源信息头（平台 / 发送者 / 会话 ID），模板可自定义，也可按规则隐藏。
 - **消息过滤**：全局与规则两级（不过滤 / 黑名单 / 白名单），支持关键词与正则。
+- **用户黑白名单**：按发送者 UID 精确过滤，只转发指定用户的消息或只屏蔽指定用户；UID 用 AstrBot `/sid` 指令获取，全局与规则两级各自可设。
 - **指令默认不转发**：以 AstrBot 唤醒词开头的消息（如 `/help`）归入内容类型「指令」，该类型默认不勾选，勾上才转发。
 - **转发冷却**：全局默认与规则级冷却时间，避免刷屏。
 - **发送队列**：按规则设置间隔逐条转发，各规则独立调度；可设队列长度上限、暂停 / 恢复、一键清空。
@@ -76,6 +77,20 @@
 | -------------- | ------------------ |
 | `mf filter` | 查看过滤配置（模式、关键词 / 正则条目、指令处理方式） |
 
+### 用户黑白名单
+
+| 指令 | 说明 |
+| -------------- | ------------------ |
+| `mf sender` | 查看用户黑白名单配置（全局 + 规则级） |
+| `mf sender default <off\|blacklist\|whitelist>` | 设置全局模式：不过滤 / 黑名单（名单里的 UID 不转发）/ 白名单（只转名单里的 UID） |
+| `mf sender default add <UID...>` | 往全局名单里加 UID（多个用空格分隔；UID 用 `/sid` 获取） |
+| `mf sender default del <UID...>` | 从全局名单里删 UID |
+| `mf sender default clear` | 清空全局名单 |
+| `mf sender <编号> <模式\|inherit>` | 设置某条规则的模式（`inherit`=继承全局） |
+| `mf sender <编号> add\|del <UID...>` / `clear` | 增删 / 清空某条规则的名单 |
+
+> **UID 怎么拿**：在来源会话给机器人发送 AstrBot 自带的 `/sid` 指令，把输出里的 `UID: 「…」` 那一行原样填进名单。它就是这个人在该平台上的唯一 ID（QQ 号、openid、guild id 等由各平台适配器决定），换昵称、改群名片都不影响判定。名单只做 UID 精确匹配，不做昵称或数字形态的模糊匹配；同一平台开了多个适配器、需要区分实例时写 `BotID:UID` 或 `平台名:UID`（Bot ID 同样在 `/sid` 输出里）。
+
 ### 内容类型
 
 | 指令 | 说明 |
@@ -129,7 +144,7 @@
 
 ## 三、配置
 
-全部配置项在 AstrBot WebUI 的插件配置页修改（含内容类型勾选、@ 昵称反查等）；运行时状态可用 `/mf filter`、`/mf content`、`/mf queue status` 查看。唤醒词用 AstrBot 全局配置，插件不单独设置。
+全部配置项在 AstrBot WebUI 的插件配置页修改（含内容类型勾选、@ 昵称反查等）；运行时状态可用 `/mf filter`、`/mf sender`、`/mf content`、`/mf queue status` 查看。唤醒词用 AstrBot 全局配置，插件不单独设置。
 
 ### 基础设置
 
@@ -146,8 +161,12 @@
 | ------- | ------ | -------- | ------ |
 | 消息过滤模式（`filter_mode`） | string | `off` | `off` 不过滤 / `blacklist` 命中不转发 / `whitelist` 命中才转发 |
 | 全局过滤规则列表（`filter_patterns`） | template_list | `[]` | 每条一条规则：`regex:表达式`=正则，其余=关键词（不区分大小写） |
+| 用户黑白名单模式（`sender_filter_mode`） | string | `off` | `off` 不过滤 / `blacklist` 名单里的 UID 不转发 / `whitelist` 只转发名单里的 UID；名单为空时不生效 |
+| 全局用户名单（`sender_filter_list`） | text | 空 | 每行一个 UID（精确匹配，`/sid` 输出里的 UID 行）；需区分适配器实例时写 `BotID:UID`（详见下方说明） |
 
 > 过滤分**全局**与**逐规则**两层：规则级 `filter_mode` / `filter_patterns` 留空即继承全局。唤醒词用 AstrBot 全局配置（`wake_prefix`，默认 `/`），插件不单独设置；以唤醒词开头的消息归入内容类型「指令」，是否转发由「指令」勾选决定（默认不勾），与过滤模式无关。
+
+> 用户黑白名单按**消息发送者 UID** 过滤（UID 用 AstrBot 自带的 `/sid` 指令获取），与上面按消息内容的过滤相互独立、同时生效：UID 放行的消息才继续判断关键词 / 正则。规则级 `sender_filter_mode` 为「继承全局」时跟随全局模式，规则级名单留空时跟随全局名单。名单为空时不生效（避免误开白名单后一条都转发不出去）；条目也可以直接用 `/mf sender` 增删。
 
 ### 冷却与队列
 
@@ -182,7 +201,7 @@
 ### 规则字段（`rules`）
 
 <details>
-<summary>规则字段（16 项）</summary>
+<summary>规则字段（18 项）</summary>
 
 | 字段 | 类型 | 说明 |
 | ----- | ------ | ------ |
@@ -193,6 +212,8 @@
 | `hide_header` | bool | 是否隐藏来源信息头 |
 | `filter_mode` | string | 过滤模式：`inherit` 继承全局 / `off` / `blacklist` / `whitelist` |
 | `filter_patterns` | list | 过滤条目：`regex:表达式` 或关键词；留空继承全局 |
+| `sender_filter_mode` | string | 用户黑白名单模式：`inherit` 继承全局 / `off` / `blacklist` / `whitelist` |
+| `sender_filter_list` | text | 本规则的用户名单，每行一个 UID（`/sid` 获取）或 `BotID:UID`；留空继承全局名单 |
 | `cooldown_seconds` | int | 冷却秒数，0=关闭本规则冷却；不填=继承全局 |
 | `queue_interval_seconds` | int | 队列间隔秒数，0=立即转发；不填=继承全局 |
 | `queue_max_size` | int | 本规则队列积压上限，0 或不填=不限制（仅受全局总上限约束） |

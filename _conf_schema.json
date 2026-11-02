@@ -70,6 +70,30 @@
             "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
             "default": []
           },
+          "sender_filter_mode": {
+            "description": "用户黑白名单模式",
+            "type": "string",
+            "hint": "仅对本规则生效。继承全局=跟随全局的用户黑白名单设置；黑名单=名单里的 UID 发来的消息不转发；白名单=只转发名单里的 UID 发来的消息。名单为空时不生效。",
+            "default": "inherit",
+            "options": [
+              "inherit",
+              "off",
+              "blacklist",
+              "whitelist"
+            ],
+            "labels": [
+              "继承全局",
+              "不过滤",
+              "黑名单",
+              "白名单"
+            ]
+          },
+          "sender_filter_list": {
+            "description": "用户名单",
+            "type": "text",
+            "hint": "仅对本规则生效。每行一个 UID（精确匹配，即 AstrBot /sid 指令输出里的 UID 行），需要区分适配器实例时写 BotID:UID。留空=继承全局名单。",
+            "default": ""
+          },
           "cooldown_seconds": {
             "description": "转发冷却时间（秒）",
             "type": "int",
@@ -191,6 +215,28 @@
     "description": "全局过滤规则列表（每行一条）",
     "type": "text",
     "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
+    "default": ""
+  },
+  "sender_filter_mode": {
+    "description": "用户黑白名单模式",
+    "type": "string",
+    "hint": "按消息发送者 UID 过滤（UID 就是 AstrBot /sid 指令输出里的 UID 行，精确匹配、换昵称也认得出）：黑名单=名单里的 UID 发来的消息不转发；白名单=只转发名单里的 UID 发来的消息。名单在下方「全局用户名单」中填写，名单为空时本项不生效。每条规则可单独覆盖。",
+    "default": "off",
+    "options": [
+      "off",
+      "blacklist",
+      "whitelist"
+    ],
+    "labels": [
+      "不过滤",
+      "黑名单",
+      "白名单"
+    ]
+  },
+  "sender_filter_list": {
+    "description": "全局用户名单（每行一条）",
+    "type": "text",
+    "hint": "每行填一个 UID（精确匹配，即 AstrBot /sid 指令输出里的 UID 行）。同一平台开了多个适配器、需要区分实例时写 BotID:UID 或 平台名:UID（Bot ID 同样见 /sid）。不做昵称 / QQ 号形态的模糊匹配。留空=不按用户过滤。",
     "default": ""
   },
   "default_cooldown_seconds": {

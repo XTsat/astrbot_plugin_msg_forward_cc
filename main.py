@@ -180,6 +180,126 @@ def _should_attach_header(rule: dict, allowed: set) -> bool:
 
 
 # ------------------------
+# 用户黑白名单（按发送者过滤）
+# ------------------------
+
+# 生效的名单模式（规则级另支持 inherit = 继承全局）
+_SENDER_FILTER_MODES = ("off", "blacklist", "whitelist")
+_SENDER_FILTER_MODE_TEXT = {"off": "不过滤", "blacklist": "黑名单", "whitelist": "白名单"}
+
+# 命令里可直接输入的模式别名（中文与英文都认）
+_SENDER_FILTER_MODE_ALIASES = {
+    "off": "off", "none": "off", "关闭": "off", "不过滤": "off",
+    "blacklist": "blacklist", "black": "blacklist", "黑名单": "blacklist", "黑": "blacklist",
+    "whitelist": "whitelist", "white": "whitelist", "白名单": "whitelist", "白": "whitelist",
+    "inherit": "inherit", "继承": "inherit", "继承全局": "inherit",
+}
+
+
+def _sender_filter_mode(value, default: str = "off") -> str:
+    """把配置值归一化为名单模式键（off / blacklist / whitelist），未知值回退默认。"""
+    mode = str(value or "").strip().lower()
+    return mode if mode in _SENDER_FILTER_MODES else default
+
+
+def _unwrap_sender_entries(value) -> list[str]:
+    """把用户名单配置统一为去重后的条目列表（兼容 text 每行一条与 list 两种格式）。"""
+    if not value:
+        return []
+    if isinstance(value, str):
+        raw = value.splitlines()
+    elif isinstance(value, (list, tuple)):
+        raw = []
+        for item in value:
+            if isinstance(item, dict):
+                item = item.get("rule") or item.get("value") or ""
+            raw.append(str(item))
+    else:
+        return []
+    entries: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        entry = str(item).strip()
+        if not entry:
+            continue
+        key = entry.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+    return entries
+
+
+def _sender_entry_hits(
+    entry: str,
+    sender_id: str,
+    platform_name: str = "",
+    platform_id: str = "",
+) -> bool:
+    """判断单个名单条目是否命中该发送者（只认 UID，不做昵称 / 数字猜测）。
+
+    条目就是 AstrBot `/sid` 输出里的 UID（即 `event.get_sender_id()`），精确比较：
+    不同平台、不同适配器的 UID 各自唯一，同一个人换昵称 / 名片也照样命中。
+    需要区分同一平台开了多个适配器实例时，写成 `BotID:UID` 或 `平台名:UID`
+    （Bot ID 同样在 `/sid` 输出里，是适配器实例的唯一标识）。"""
+    text = str(entry or "").strip()
+    sender = str(sender_id or "").strip()
+    if not text or not sender:
+        return False
+    if ":" in text:
+        scope, _, uid = text.partition(":")
+        uid = uid.strip()
+        if uid != sender:
+            return False
+        scope = scope.strip().casefold()
+        return bool(scope) and scope in (
+            str(platform_id or "").strip().casefold(),
+            str(platform_name or "").strip().casefold(),
+        )
+    return text == sender
+
+
+def _sender_filter_allows(
+    mode: str,
+    entries: list[str],
+    sender_id: str,
+    platform_name: str = "",
+    platform_id: str = "",
+) -> bool:
+    """按模式判定该发送者的消息是否放行。
+
+    名单为空视为不过滤（与关键词过滤一致），避免误开白名单后一条都转发不出去。"""
+    if mode not in ("blacklist", "whitelist") or not entries:
+        return True
+    hit = any(
+        _sender_entry_hits(entry, sender_id, platform_name, platform_id) for entry in entries
+    )
+    return hit if mode == "whitelist" else not hit
+
+
+def _sender_filter_for(rule, config) -> tuple[str, list[str]]:
+    """解析某条规则生效的用户名单过滤 (模式, 条目)。
+
+    规则级 sender_filter_mode 为 inherit（或缺失）时继承全局模式；规则级名单非空时
+    覆盖全局名单，留空继承全局名单。"""
+    if isinstance(rule, dict):
+        rule_mode = str(rule.get("sender_filter_mode") or "inherit").strip().lower()
+        mode = (
+            rule_mode
+            if rule_mode in _SENDER_FILTER_MODES
+            else _sender_filter_mode(config.get("sender_filter_mode", "off"))
+        )
+        entries = _unwrap_sender_entries(rule.get("sender_filter_list")) or _unwrap_sender_entries(
+            config.get("sender_filter_list")
+        )
+        return mode, entries
+    return (
+        _sender_filter_mode(config.get("sender_filter_mode", "off")),
+        _unwrap_sender_entries(config.get("sender_filter_list")),
+    )
+
+
+# ------------------------
 # 指令识别（唤醒词 / 指令消息）
 # ------------------------
 
@@ -2143,8 +2263,13 @@ class MsgForward(star.Star):
             "│   ├── cooldown default <秒>: 设置全局默认冷却（0=关闭）\n"
             "│   ├── cooldown <编号> <秒>: 设置某条规则冷却（0=关闭该规则冷却）\n"
             "│   └── cooldown <编号> inherit: 重置为继承全局默认\n"
-            "├── 🎯 过滤\n"
-            "│   └── filter: 查看当前过滤配置（含指令处理方式）\n"
+            "├── 🎯 过滤 / 用户名单\n"
+            "│   ├── filter: 查看关键词过滤配置（含指令处理方式）\n"
+            "│   ├── sender: 查看用户黑白名单配置（按发送者 UID 精确过滤）\n"
+            "│   ├── sender default <off|blacklist|whitelist>: 设置全局用户黑白名单模式\n"
+            "│   ├── sender default add|del <UID...> / clear: 增删 / 清空全局名单（UID 见 /sid）\n"
+            "│   ├── sender <编号> <模式|inherit>: 设置某条规则的用户黑白名单模式\n"
+            "│   └── sender <编号> add|del <UID...>|clear: 增删 / 清空某条规则的名单\n"
             "├── 📦 内容类型\n"
             "│   ├── content: 查看内容类型筛选配置\n"
             "│   ├── content list: 查看可选内容类型与别名\n"
@@ -2176,7 +2301,9 @@ class MsgForward(star.Star):
             "@ 对象」后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭，WebUI 配置）。\n"
             "指令消息：以唤醒词开头的消息（如 /help）整条归入内容类型「指令」，默认不勾选=不转发；\n"
             "要转发就 /mf content default 指令 或 /mf content <编号> 指令 勾上（/mf content list 看类型）。\n"
-            "唤醒词只跟随 AstrBot 全局唤醒词（wake_prefix，默认 /），插件不单独设置前缀。"
+            "唤醒词只跟随 AstrBot 全局唤醒词（wake_prefix，默认 /），插件不单独设置前缀。\n"
+            "用户黑白名单：按发送者 UID 精确过滤（UID 见 AstrBot /sid 输出），黑名单=名单里的 UID 不转发，\n"
+            "白名单=只转发名单里的 UID；规则级可覆盖全局，名单为空时不生效。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2308,7 +2435,7 @@ class MsgForward(star.Star):
         return f"✅ 规则 #{rid}（{self._rule_name(rule)}）{status}"
 
     def _format_rules(self, items) -> list:
-        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列间隔/队列长度/@反查/内容类型状态）。
+        """把 (规则编号, 规则) 对列表格式化为展示行（启用/隐藏/冷却/队列间隔/队列长度/@反查/内容类型/用户名单状态）。
 
         供 /mf list 与 /mf listall 复用，避免两处重复；编号由调用方决定
         （list 传原始编号，listall 传 1..n 递增编号）。"""
@@ -2335,7 +2462,16 @@ class MsgForward(star.Star):
                 ct_str = f"📦仅{CONTENT_TYPES[first]}" if len(ct_keys) == 1 else f"📦{len(ct_keys)}类"
             else:
                 ct_str = ""
-            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, qmax_str, at_str, ct_str]
+            # 用户黑白名单标记：规则显式设了模式时显示模式，只配了名单（模式继承）时显示「名单」
+            sender_mode = str(r.get("sender_filter_mode") or "inherit").strip().lower()
+            sender_entries = _unwrap_sender_entries(r.get("sender_filter_list"))
+            if sender_mode in _SENDER_FILTER_MODES:
+                sf_str = f"👤{_SENDER_FILTER_MODE_TEXT[sender_mode]}" + (f"({len(sender_entries)}人)" if sender_entries else "")
+            elif sender_entries:
+                sf_str = f"👤名单{len(sender_entries)}人"
+            else:
+                sf_str = ""
+            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, qmax_str, at_str, ct_str, sf_str]
             lines.append(" ".join(p for p in parts if p))
         return lines
 
@@ -2686,12 +2822,169 @@ class MsgForward(star.Star):
             else:
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
 
+        # 用户黑白名单摘要（按发送者过滤，详细配置用 /mf sender）
+        g_sender_mode = _sender_filter_mode(self.config.get("sender_filter_mode", "off"))
+        g_sender_entries = _unwrap_sender_entries(self.config.get("sender_filter_list"))
+        lines.append(
+            f"\n👤 用户黑白名单：{_SENDER_FILTER_MODE_TEXT[g_sender_mode]}"
+            + (f"（{len(g_sender_entries)} 人）" if g_sender_entries else "")
+        )
+        lines.append("      用 /mf sender 查看 / 设置（按发送者过滤，全局与规则级两级）")
+
         lines.append(
             "\n用法：指令是否转发用 /mf content 勾选「指令」（默认不勾）；"
             "唤醒词跟随 AstrBot 全局配置，插件不单独设置"
         )
 
         yield event.plain_result("\n".join(lines))
+
+    # ----- 用户黑白名单命令 -----
+
+    @staticmethod
+    def _sender_usage_text() -> str:
+        """生成 /mf sender 的用法说明文本。"""
+        return (
+            "用法：\n"
+            "/mf sender                                   查看用户黑白名单配置\n"
+            "/mf sender default <off|blacklist|whitelist>   设置全局模式（不过滤 / 黑名单 / 白名单）\n"
+            "/mf sender default add|del <UID...>          增删全局名单（UID 见 /sid 输出的 UID 行，多个用空格分隔）\n"
+            "/mf sender default clear                     清空全局名单\n"
+            "/mf sender <编号> <模式|inherit>              设置某条规则的模式（inherit=继承全局）\n"
+            "/mf sender <编号> add|del <用户...>|clear     增删 / 清空某条规则的名单"
+        )
+
+    def _sender_view_text(self) -> str:
+        """生成用户黑白名单配置的展示文本（全局 + 规则级覆盖）。"""
+        g_mode = _sender_filter_mode(self.config.get("sender_filter_mode", "off"))
+        g_entries = _unwrap_sender_entries(self.config.get("sender_filter_list"))
+        head = f"👤 用户黑白名单（按消息发送者过滤）：全局 {_SENDER_FILTER_MODE_TEXT[g_mode]}"
+        lines = [head + (f"｜{len(g_entries)} 人" if g_entries else "")]
+        if g_entries:
+            lines.append("      " + "、".join(g_entries))
+        elif g_mode != "off":
+            lines.append("      （名单为空，暂不生效）")
+
+        per_rule = False
+        for idx, rule in enumerate(self.config.get("rules", []), start=1):
+            rule_mode = str(rule.get("sender_filter_mode") or "inherit").strip().lower()
+            rule_entries = _unwrap_sender_entries(rule.get("sender_filter_list"))
+            if rule_mode not in _SENDER_FILTER_MODES and not rule_entries:
+                continue
+            if not per_rule:
+                lines.append("\n规则级覆盖：")
+                per_rule = True
+            mode_text = (
+                _SENDER_FILTER_MODE_TEXT[rule_mode] if rule_mode in _SENDER_FILTER_MODES else "继承全局"
+            )
+            list_text = "、".join(rule_entries) if rule_entries else "继承全局名单"
+            lines.append(f"  #{idx} | {self._rule_name(rule)} | {mode_text} | {list_text}")
+        if not per_rule:
+            lines.append("（所有规则使用全局设置）")
+
+        lines.append(
+            "\n名单写法：UID（AstrBot /sid 输出里的 UID，精确匹配、跨适配器唯一），"
+            "多适配器同号需区分时写 BotID:UID 或 平台名:UID（Bot ID 同样见 /sid）\n"
+            "不做昵称 / QQ 号形态的模糊匹配：昵称同名、换名片都不影响，填错就是填错\n"
+            "黑名单=名单里的人不转发；白名单=只转发名单里的人；名单为空时不生效"
+        )
+        lines.append("\n" + self._sender_usage_text())
+        return "\n".join(lines)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mf.command("sender")
+    async def cmd_sender(self, event: AstrMessageEvent, args: str = ""):
+        """查看 / 设置用户黑白名单（按消息发送者过滤，全局与规则级两级）"""
+        args = (args or "").strip()
+        if not args:
+            yield event.plain_result(self._sender_view_text())
+            return
+
+        parts = args.split()
+        to_global = parts[0].strip().lower() in ("default", "全局")
+        rules: list = []
+        rule: dict | None = None
+        rid = ""
+        if to_global:
+            holder: dict = self.config
+            target_label = "全局"
+        else:
+            rid = parts[0]
+            rules, _, rule = self._get_rule(rid)
+            if rule is None:
+                yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+                return
+            holder = rule
+            target_label = f"规则 #{rid}（{self._rule_name(rule)}）"
+
+        rest = parts[1:]
+        if not rest:
+            yield event.plain_result("❌ " + self._sender_usage_text())
+            return
+
+        op = rest[0].strip().lower()
+        # 名单增删：add / del <用户...>、clear
+        if op in ("add", "del", "delete", "remove", "rm", "clear"):
+            current = _unwrap_sender_entries(holder.get("sender_filter_list"))
+            if op == "clear":
+                entries: list[str] = []
+            else:
+                if len(rest) < 2:
+                    yield event.plain_result("❌ add / del 后面要跟 UID（见 /sid 输出的 UID，多个用空格分隔）")
+                    return
+                if op == "add":
+                    entries = list(current)
+                    seen = {entry.casefold() for entry in entries}
+                    for item in rest[1:]:
+                        entry = item.strip()
+                        if entry and entry.casefold() not in seen:
+                            seen.add(entry.casefold())
+                            entries.append(entry)
+                else:
+                    removals = {item.strip().casefold() for item in rest[1:] if item.strip()}
+                    entries = [entry for entry in current if entry.casefold() not in removals]
+                    if len(entries) == len(current):
+                        yield event.plain_result(f"❌ {target_label}的名单里没有：{' '.join(rest[1:])}")
+                        return
+            if entries:
+                holder["sender_filter_list"] = "\n".join(entries)
+            else:
+                # 清空后删除字段：规则级回到继承全局名单，全局回到「不按用户过滤」
+                holder.pop("sender_filter_list", None)
+            if rule is not None:
+                self.config["rules"] = rules
+            self.config.save_config()
+            mode_now, _ = _sender_filter_for(rule, self.config)
+            tail = (
+                f"，当前模式：{_SENDER_FILTER_MODE_TEXT[mode_now]}"
+                if mode_now != "off"
+                else "，当前模式：不过滤（名单暂不生效）"
+            )
+            yield event.plain_result(f"✅ {target_label}的用户名单已更新（{len(entries)} 人）{tail}")
+            return
+
+        # 模式设置：off / blacklist / whitelist（规则级另有 inherit）
+        mode = _SENDER_FILTER_MODE_ALIASES.get(op)
+        if mode is None:
+            yield event.plain_result("❌ " + self._sender_usage_text())
+            return
+        if mode == "inherit":
+            if rule is None:
+                yield event.plain_result("❌ 全局只能设为 off / blacklist / whitelist，规则级才能 inherit（继承全局）")
+                return
+            rule.pop("sender_filter_mode", None)
+            self.config["rules"] = rules
+            self.config.save_config()
+            yield event.plain_result(f"✅ {target_label}用户名单模式已重置为继承全局")
+            return
+        holder["sender_filter_mode"] = mode
+        if rule is not None:
+            self.config["rules"] = rules
+        self.config.save_config()
+        _, entries_now = _sender_filter_for(rule, self.config)
+        warn = "（名单为空，暂不生效，用 add 添加用户）" if mode != "off" and not entries_now else ""
+        yield event.plain_result(
+            f"✅ {target_label}用户名单模式已设为 {_SENDER_FILTER_MODE_TEXT[mode]}{warn}"
+        )
 
     @mf.group("queue")
     def queue(self):
@@ -3453,6 +3746,25 @@ class MsgForward(star.Star):
 
         return fm == "blacklist"
 
+    def _should_forward_by_sender(self, event: AstrMessageEvent, rule: dict) -> bool:
+        """按用户黑白名单判断该消息的发送者是否允许转发（全局与规则级两级）。
+
+        身份只认 UID（`/sid` 输出的 UID 即 `event.get_sender_id()`），精确匹配；
+        昵称、QQ 号形态等猜测一律不参与判定，避免认错人。"""
+        mode, entries = _sender_filter_for(rule, self.config)
+        if mode not in ("blacklist", "whitelist") or not entries:
+            return True
+        sender_id = str(event.get_sender_id() or "")
+        platform_name = str(event.get_platform_name() or "")
+        platform_id = str(event.get_platform_id() or "")
+        if _sender_filter_allows(mode, entries, sender_id, platform_name, platform_id):
+            return True
+        logger.debug(
+            f"[astrbot_plugin_msg_forward_cc] 发送者 UID {sender_id or '空'}（{platform_id or platform_name}）"
+            f" 未通过用户{_SENDER_FILTER_MODE_TEXT[mode]}名单，不转发"
+        )
+        return False
+
     @staticmethod
     def _parse_filter_item(item: str):
         """解析一条过滤规则，返回 (type, value)。
@@ -3978,6 +4290,9 @@ class MsgForward(star.Star):
                     f"[astrbot_plugin_msg_forward_cc] 指令消息 /{command_name} 未勾选内容类型「指令」，不转发"
                 )
                 return
+            # 用户黑白名单：命中规则的名单全都不放行时到此为止，不必再做合并转发展开等重活
+            if all(not self._should_forward_by_sender(event, r) for _, r in rules):
+                return
             # 清洗无效的 @ 提及（空目标），保留 qq 原样透传，昵称仅作兜底
             sanitized_chain = _sanitize_chain_for_forward(raw_chain)
             # 清洗 File 组件的本地路径：NapCat 读不到源端本地路径，仅保留 URL 走下载
@@ -4015,6 +4330,9 @@ class MsgForward(star.Star):
                 rule_key = self._rule_key(rule)
                 # 逐规则过滤检查（关键词 / 正则）
                 if not self._should_forward(event, rule):
+                    continue
+                # 用户黑白名单检查（按发送者过滤，全局与规则级两级）
+                if not self._should_forward_by_sender(event, rule):
                     continue
 
                 # 内容类型筛选：仅保留规则选中的类型（默认全选，但「指令」默认不勾）

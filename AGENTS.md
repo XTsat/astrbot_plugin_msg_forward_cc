@@ -249,6 +249,8 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 来源信息头模板 | `header_template` | text | 变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式 |
 | 消息过滤模式 | `filter_mode` | string, off | off / blacklist / whitelist |
 | 全局过滤规则列表（每行一条） | `filter_patterns` | text | `regex:` 前缀=正则，其余=关键词（不区分大小写） |
+| 用户黑白名单模式 | `sender_filter_mode` | string, off | off / blacklist / whitelist；按消息发送者 UID 过滤，名单为空时不生效 |
+| 全局用户名单（每行一条） | `sender_filter_list` | text | UID（`/sid` 输出，`event.get_sender_id()` 精确匹配）或 `BotID:UID` / `平台名:UID`；留空=不按用户过滤 |
 | 默认转发冷却时间（秒） | `default_cooldown_seconds` | int, 0 | 规则未显式设置时继承 |
 | 默认发送队列间隔（秒） | `default_queue_interval_seconds` | int, 0 | 规则未显式设置时继承 |
 | 启用发送队列 | `queue_enabled` | bool, false | 总开关，关闭时规则间隔不生效 |
@@ -275,6 +277,8 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 隐藏来源信息头 | `hide_header` | bool, false | |
 | 过滤模式 | `filter_mode` | string, inherit | inherit / off / blacklist / whitelist |
 | 过滤规则列表 | `filter_patterns` | list | 非空则覆盖全局，留空继承全局；条目支持 `regex:` / 关键词 |
+| 用户黑白名单模式 | `sender_filter_mode` | string, inherit | inherit / off / blacklist / whitelist |
+| 用户名单 | `sender_filter_list` | text（每行一条） | 非空则覆盖全局名单，留空继承全局；条目同全局用户名单（UID 精确匹配） |
 | 转发冷却时间（秒） | `cooldown_seconds` | int, 0 | 0=关闭本规则冷却；不填（删除字段）=继承全局默认 |
 | 发送队列间隔（秒） | `queue_interval_seconds` | int, 0 | > 0 且 `queue_enabled` 时进入队列模式；不填=继承全局默认 |
 | 发送队列长度（条） | `queue_max_size` | int, 0 | 本规则独立积压上限（一条多目标转发会计入多次）；0 或不填=不限制（仅受全局总上限约束） |
@@ -343,7 +347,12 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf cooldown` | 管理员 | 查看冷却配置 |
 | `mf cooldown default <秒>` | 管理员 | 设置全局默认冷却（0=关闭） |
 | `mf cooldown <编号> <秒\|inherit>` | 管理员 | 设置规则级冷却（inherit=重置继承全局） |
-| `mf filter` | 管理员 | 只读查看全局+规则级过滤配置、指令处理方式、冷却配置、队列配置 |
+| `mf filter` | 管理员 | 只读查看全局+规则级过滤配置、指令处理方式、用户名单摘要、冷却配置、队列配置 |
+| `mf sender` | 管理员 | 查看用户黑白名单配置（全局 + 规则级） |
+| `mf sender default <off\|blacklist\|whitelist>` | 管理员 | 设置全局用户名单模式 |
+| `mf sender default add\|del <用户...>` / `clear` | 管理员 | 增删 / 清空全局用户名单 |
+| `mf sender <编号> <模式\|inherit>` | 管理员 | 设置规则级用户名单模式（inherit=继承全局） |
+| `mf sender <编号> add\|del <用户...>` / `clear` | 管理员 | 增删 / 清空规则级用户名单 |
 | `mf content` | 管理员 | 查看内容类型筛选配置 |
 | `mf content list` | 管理员 | 查看可选内容类型与别名 |
 | `mf content default <类型...>` | 管理员 | 设置全局默认（all=全选） |
@@ -392,7 +401,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `_ForwardNodes`，按配置 `forward_node_avatar` 用发送者昵称反查真实 QQ 号（头像用）、递归展开节点内嵌套记录、按配置 `forward_keep_time` 保留每条消息的原始发送时间、按配置 `forward_card_preview` 决定卡片预览行显示来源 + 标题（默认）/ 仅标题 / `[卡片消息]`；拉取失败降级为 `[聊天记录]` 文本
 
 逐规则流程：
-1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（关键词 / 正则，规则级优先，inherit 继承全局）；指令消息不走这里，由下一步的内容类型判定
+1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（关键词 / 正则，规则级优先，inherit 继承全局）；`_should_forward_by_sender(event, rule)` 用户黑白名单检查（按发送者，见 6.6）；指令消息不走这里，由下一步的内容类型判定
 2. 内容类型筛选 `_content_types_for` + `_filter_chain_by_types(..., is_command)`（事件级 `_command_name(event)` 识别一次，指令消息整体按 `command` 类型判定）；过滤后为空则跳过（不转发、不占冷却）——指令消息默认就死在这一步
 3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
 4. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
@@ -414,6 +423,16 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 指令消息不在这里判：以唤醒词开头的整条消息由 `_command_name(event)` 识别后交给内容类型「指令」（见 6.7），`filter_mode=whitelist` 也拦不住/放不过它
 - 指令识别在原始消息链上做（见 2.3）：`event.message_str` 已被 AstrBot 摘掉唤醒词，不能用它判断；唤醒词只取 AstrBot 全局 `wake_prefix`（NFKC 兼容全角 `／`、`！`）
 - `_unwrap_patterns`：兼容 text（按行拆分）和 template_list（取 dict 的 `rule` 字段）两种配置格式
+
+**用户黑白名单（按发送者过滤，与上面的消息内容过滤相互独立、同时生效）**：
+
+- 模块级 `_sender_filter_mode(value)` / `_unwrap_sender_entries(value)`：模式归一化（off / blacklist / whitelist，未知值回退 off）/ 名单归一化（兼容 text 每行一条与 list，去空行、去重、保序）
+- **身份只认 UID**：条目即 AstrBot `/sid` 输出的 UID（`event.get_sender_id()`），精确字符串比较；不做昵称、QQ 号形态、正则等模糊匹配，避免认错人（昵称重名 / 改名片都不影响判定）
+- `_sender_entry_hits(entry, sender_id, platform_name, platform_id)`：单条命中——`UID` 与 `sender_id` 精确相等；`BotID:UID` / `平台名:UID` 额外要求前缀匹配 `event.get_platform_id()` / `get_platform_name()`（多适配器同号时区分实例）；无 UID 一律不命中
+- `_sender_filter_allows(mode, entries, sender_id, platform_name, platform_id)`：`blacklist` 命中不放行、`whitelist` 命中才放行；**名单为空一律放行**（避免误开白名单后一条都转发不出去，与关键词过滤的空列表语义一致）
+- `_sender_filter_for(rule, config)`：解析规则生效的 (模式, 名单)——规则级 `sender_filter_mode` 非 inherit 时覆盖模式，规则级名单非空时覆盖全局名单，否则继承全局
+- `MsgForward._should_forward_by_sender(event, rule)`：取 `event.get_sender_id()`（以及 `get_platform_name()` / `get_platform_id()`）判定，不放行则 `logger.debug` 记录（带插件名前缀）后跳过该规则；`forward_message` 里除逐规则检查外，事件级还有一次 `all(...)` 提前返回，避免命中规则全都不放行时白做合并转发展开
+- `/mf sender` 命令增删名单：条目存为多行 text（`_sender_view_text` / `_sender_usage_text` 负责展示与用法）；清空时删除字段（规则级回到继承全局名单、全局回到不按用户过滤）
 
 ### 6.7 内容类型筛选与 @ 转发
 
