@@ -2,24 +2,20 @@
 
 ## [Unreleased]
 
-> 指令消息改由内容类型控制并默认不转发，命令层的过滤/前缀配置收敛到 WebUI
+> 新增用户黑白名单，指令消息改由内容类型控制并默认不转发
 
 ### 新增
 
 - **用户黑白名单（按发送者 UID 精确过滤）**：只转发指定用户的消息，或只屏蔽指定用户，全局与每条规则各自可设。名单填 AstrBot `/sid` 指令输出里的 UID，只做 UID 精确匹配，不做昵称 / 数字形态的模糊判断（换昵称、改群名片都不影响）；同一平台开了多个适配器需要区分实例时写 `BotID:UID`；名单为空时不生效。WebUI 用「用户黑白名单模式」（`sender_filter_mode`）+「用户名单」（`sender_filter_list`）配置，聊天里用 `/mf sender` 增删查，`/mf list`、`/mf listall` 会显示 `👤黑名单` / `👤白名单` / `👤名单N人` 标记
-- **内容类型新增「指令」并默认不勾选**：以 AstrBot 唤醒词开头的消息（如 `/help`、`/mf list`）整条归入该类型，默认不勾选即默认不转发；需要转发时勾上「指令」（配置「默认转发的内容类型」或规则级「转发的内容类型」，也可用 `/mf content default 指令`、`/mf content <编号> 指令`），`/mf content list` 可查看类型与别名
+- **内容类型筛选新增「指令」并默认不勾选**：以 AstrBot 唤醒词开头的消息（如 `/help`、`/mf list`）整条归入「指令」，默认不勾选即默认不转发；要转发时在 WebUI 的「默认转发的内容类型」或规则级「转发的内容类型」里勾上，也可以用 `/mf content`。`/mf content list` 可查看类型与别名
 
 ### 变更
 
-- 精简 README：按「功能 / 指令 / 配置 / 其它」重排，只保留能做什么、怎么配、怎么用的信息，去掉实现原理与目录结构说明；平台兼容性测试单独成文（`docs/platform-compatibility.md`），README 只保留入口指向；上游来源与许可证说明移到最后
-- 配置表补全遗漏的两项：「启用发送队列」（`queue_enabled`）与「队列媒体缓存保留时间」（`queue_media_retention_hours`），配置项按基础 / 过滤 / 队列 / 内容 / 高级 @ 分组，每项按「中文名（`key`）」书写
-- README 指令表按类型分节：绑定与规则 / 冷却 / 过滤 / 内容类型 / 发送队列 / 其它
+- README 收敛到用户视角：按「功能 / 指令 / 配置 / 其它」重排并精简，去掉实现原理与目录结构说明；配置项按类别分组并补全遗漏的「启用发送队列」（`queue_enabled`）与「队列媒体缓存保留时间」（`queue_media_retention_hours`）；指令表按类型分节；平台兼容性测试独立成文（`docs/platform-compatibility.md`），上游来源与许可证说明移到最后
 
 ### 移除
 
-- 移除 `/mf at` 指令组与 `/mf filter cmd …` 子命令：@ 昵称反查（`at_nickname_lookup` 等）改为在 AstrBot WebUI 配置页设置
-- 移除唤醒词配置与 `/mf filter prefix …` 命令：指令识别只跟随 AstrBot 全局唤醒词（`wake_prefix`，默认 `/`），插件不再提供额外前缀设置
-- 移除独立的指令过滤开关（`command_filter_enabled` / 规则级 `command_filter`）与 `cmd:` 过滤条目：指令消息改由内容类型「指令」控制
+- 移除 `/mf at` 指令组（`at` / `at on|off` / `at <编号>` / `at cache` / `at test`）：@ 昵称反查（`at_nickname_lookup` 等）改为在 AstrBot WebUI 配置页设置
 
 ## v0.5.9 (2026-10-28)
 
