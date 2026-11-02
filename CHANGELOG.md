@@ -2,24 +2,23 @@
 
 ## [Unreleased]
 
-> 新增指令过滤：机器人指令不再被当成聊天内容转发，唤醒词可自行修改
+> 指令消息改由内容类型控制并默认不转发，命令层的过滤/前缀配置收敛到 WebUI
 
 ### 新增
 
-- **指令消息默认不转发**：以唤醒词开头的指令消息（如 `/help`、`/mf list`）不再转发到目标会话，避免把机器人指令当成聊天内容同步出去；全局默认开启，可用 `/mf filter cmd on|off` 或配置「指令消息不转发」（`command_filter_enabled`）切换，每条规则也能单独设置（`command_filter`，或 `/mf filter cmd <编号> on|off|inherit`）
-- **唤醒词可自定义**：默认跟随 AstrBot 全局唤醒词（通常是 `/`），可在配置「唤醒词」（`command_prefixes`，每行一个、可填多个）或 `/mf filter prefix <唤醒词>` 改成 `!`、`#机器人` 等；中文输入法打出的全角 `／`、`！` 同样能识别；`/mf filter prefix reset` 恢复跟随全局唤醒词
-- 过滤列表新增「指令」类型：`cmd:` 匹配任意指令、`cmd:help` 只匹配 help 指令（不区分大小写），可写进全局 / 规则级过滤列表，黑名单与白名单都可用；关闭指令过滤后也可用它精确控制某条指令是否转发
-- `/mf filter` 新增指令过滤与唤醒词的查看结果，并支持 `/mf filter cmd ...`、`/mf filter prefix ...` 直接修改
+- **内容类型新增「指令」并默认不勾选**：以 AstrBot 唤醒词开头的消息（如 `/help`、`/mf list`）整条归入该类型，默认不勾选即默认不转发；需要转发时勾上「指令」（配置「默认转发的内容类型」或规则级「转发的内容类型」，也可用 `/mf content default 指令`、`/mf content <编号> 指令`），`/mf content list` 可查看类型与别名
 
 ### 变更
 
 - 精简 README：按「功能 / 指令 / 配置 / 其它」重排，只保留能做什么、怎么配、怎么用的信息，去掉实现原理与目录结构说明；平台兼容性测试单独成文（`docs/platform-compatibility.md`），README 只保留入口指向；上游来源与许可证说明移到最后
 - 配置表补全遗漏的两项：「启用发送队列」（`queue_enabled`）与「队列媒体缓存保留时间」（`queue_media_retention_hours`），配置项按基础 / 过滤 / 队列 / 内容 / 高级 @ 分组，每项按「中文名（`key`）」书写
-- README 指令表按类型分节：绑定与规则 / 冷却 / 过滤与唤醒词 / 内容类型 / 发送队列 / 其它
+- README 指令表按类型分节：绑定与规则 / 冷却 / 过滤 / 内容类型 / 发送队列 / 其它
 
 ### 移除
 
-- 移除 `/mf at` 指令组与 `/mf filter cmd …` 子命令：@ 昵称反查（`at_nickname_lookup` 等）与指令过滤开关（`command_filter_enabled`、规则级 `command_filter`）不再提供命令入口，改为在 AstrBot WebUI 配置页设置；`/mf filter` 仍可只读查看当前配置，`/mf filter prefix` 改唤醒词保留
+- 移除 `/mf at` 指令组与 `/mf filter cmd …` 子命令：@ 昵称反查（`at_nickname_lookup` 等）改为在 AstrBot WebUI 配置页设置
+- 移除唤醒词配置与 `/mf filter prefix …` 命令：指令识别只跟随 AstrBot 全局唤醒词（`wake_prefix`，默认 `/`），插件不再提供额外前缀设置
+- 移除独立的指令过滤开关（`command_filter_enabled` / 规则级 `command_filter`）与 `cmd:` 过滤条目：指令消息改由内容类型「指令」控制
 
 ## v0.5.9 (2026-10-28)
 

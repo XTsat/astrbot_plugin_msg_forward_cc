@@ -28,7 +28,7 @@
 | 文件 | 必选 | 职责 |
 |------|------|------|
 | `main.py` | ✅ | 插件主体，全部逻辑（单文件风格） |
-| `_conf_schema.json` | ✅ | WebUI 配置 Schema（272 行） |
+| `_conf_schema.json` | ✅ | WebUI 配置 Schema（343 行） |
 | `metadata.yaml` | ✅ | 插件元数据（v0.5.9，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档（功能 / 指令 / 配置 / 其它四大板块，只写用户视角） |
 | `docs/platform-compatibility.md` | ✅ | 平台兼容性测试记录（各平台 × 各消息类型的实测结果），README 只保留一句指向 |
@@ -65,12 +65,14 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 ### 2.3 指令识别（唤醒词 / 指令消息，模块级）
 
-- `_DEFAULT_COMMAND_PREFIX` / `_COMMAND_FILTER_TAGS`：全局与插件配置都取不到唤醒词时的兜底 `/` / 过滤条目里的指令类型前缀（`cmd:`、`指令:`）
-- `_normalize_command_prefixes(raw)`：解析唤醒词配置（text 每行一个 / list 均可）→ 去重后按长度倒序，保证 `_command_prefixes` 传入的长唤醒词优先匹配
-- `_global_wake_prefixes()`：读取 AstrBot 全局 `wake_prefix`（通常 `["/"]`）；读取失败告警并退回 `/`
+- 唤醒词**只取 AstrBot 全局配置**（`wake_prefix`，默认 `/`）：插件不提供额外前缀设置、也没有对应配置项或命令
+- `_DEFAULT_COMMAND_PREFIX`：读取全局配置失败时的兜底 `/`
+- `_parse_wake_prefixes(raw)`：解析全局唤醒词（text / list 均可）→ 去重后按长度倒序，保证「/mf」这类长唤醒词优先于「/」匹配
+- `_global_wake_prefixes()`：每次判定现读 AstrBot 全局 `wake_prefix`；读取失败告警并退回 `/`
 - `_leading_plain_text(chain)`：取消息链开头连续的文字，跳过在前的 At / Reply（`@机器人 /help`、引用回复后 `/help` 同样识别）；遇到第一个非文字组件即停止。**必须在原始消息链上判断**——AstrBot 唤醒阶段会把唤醒词从 `message_str` 摘掉（`/help` 到插件时 `message_str` 已是 `help`）
 - `_match_wake_prefix(text, prefixes)`：判断文本是否以唤醒词开头，返回 `(唤醒词, 指令名)`；原文与 NFKC 归一化文本都比对（兼容中文输入法打出的全角 `／`、`！`），唤醒词按长度倒序匹配；只有唤醒词、后面没有指令名（如单独一个 `/`）不算指令
 - `_command_info_of_chain(chain, prefixes)`：`_leading_plain_text` + `_match_wake_prefix` 的组合入口
+- 识别结果只用于把指令消息归入内容类型 `command`（见 6.7），不再有独立的指令过滤开关
 
 ### 2.4 合并转发（聊天记录）展开（模块级）
 
@@ -103,7 +105,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 - `_comp_type_name(comp)` / `_comp_content_type(comp)`：组件 → 内容类型键 / Content-Type
 - `_content_types_for(rule, config)`：解析规则内容类型筛选（规则级覆盖 → 全局默认 → 全选）
-- `_filter_chain_by_types(chain, allowed)`：按选中类型过滤组件
+- `_filter_chain_by_types(chain, allowed, is_command=False)`：按选中类型过滤组件；`is_command=True` 时整条按 `command` 类型判定（勾了 `command` 全保留，否则返回空）
 - `_should_attach_header(rule, allowed)`：判断是否前置来源头（`hide_header` 或未选中「文字」类型时不前置）
 - `_extract_remote_url(comp)`：返回组件引用的远程 http(s) URL；本地文件/base64/data URI 返回 None。**注意 File 组件的 `.file` 是 property（异步上下文访问会触发同步下载），对 File 只检查 `.url` 与 `.file_`**
 - `_guess_media_ext(comp, url, content_type)`：按 Content-Type → URL 后缀 → 组件类型确定临时文件后缀
@@ -145,7 +147,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 → 匹配 source_umo 命中的所有规则（多源：每行一条 UMO）
 → 清洗链（@ 清洗 → File 清洗 → 无 URL File 调 API 取下载 URL）
 → 合并转发展开（Forward → 拉取内容重建 Nodes，递归展开嵌套记录并保留原始时间；失败/跨平台降级为 [聊天记录]）
-→ 逐规则：启停检查 → 过滤 → 内容类型筛选 → 冷却/队列分支
+→ 逐规则：启停检查 → 关键词/正则过滤 → 内容类型筛选（指令消息按 `command` 类型判定，默认不勾=不转发）→ 冷却/队列分支
 → 逐目标：At 策略（默认文本化 / 反查精确 @）→ 合并转发目标平台降级 → 前置来源头 → 发送（或入队）
 → 失败三级兜底重试（超时重试 → 媒体本地化 → 远程 URL）→ 冷却写入 / 队列 worker 按间隔发送
 ```
@@ -246,9 +248,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 默认隐藏来源信息头 | `default_hide_header` | bool, false | 新建规则默认隐藏来源头 |
 | 来源信息头模板 | `header_template` | text | 变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式 |
 | 消息过滤模式 | `filter_mode` | string, off | off / blacklist / whitelist |
-| 全局过滤规则列表（每行一条） | `filter_patterns` | text | `regex:` 前缀=正则，`cmd:` 前缀=指令（`cmd:`=任意指令、`cmd:help`=指定指令），其余=关键词（不区分大小写） |
-| 指令消息不转发 | `command_filter_enabled` | bool, true | 以唤醒词开头的指令消息（如 `/help`）不转发；规则级 `command_filter` 可覆盖 |
-| 唤醒词（每行一个） | `command_prefixes` | text, "" | 识别指令用的前缀，可填多个；留空跟随 AstrBot 全局 `wake_prefix`（默认 `/`）；NFKC 兼容全角 `／`、`！` |
+| 全局过滤规则列表（每行一条） | `filter_patterns` | text | `regex:` 前缀=正则，其余=关键词（不区分大小写） |
 | 默认转发冷却时间（秒） | `default_cooldown_seconds` | int, 0 | 规则未显式设置时继承 |
 | 默认发送队列间隔（秒） | `default_queue_interval_seconds` | int, 0 | 规则未显式设置时继承 |
 | 启用发送队列 | `queue_enabled` | bool, false | 总开关，关闭时规则间隔不生效 |
@@ -258,7 +258,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 转发聊天记录时保留原始发送时间 | `forward_keep_time` | bool, true | 关闭则聊天记录里每条消息显示为转发时的时间 |
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
 | [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；**仅当整条记录的发送者 QQ 号已被协议端抹平时才改写**（记录自带不同真实 QQ 号则整条跳过，避免把正确值改错）；发送者不在机器人所在的群 / 昵称重名 / 已改名时改不了，这些消息取不到头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
-| 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/image/face/record/video/file/at/other，默认全选 |
+| 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/command/image/face/record/video/file/at/other，默认除 `command`（指令）外全选 |
 | [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
 | 额外允许 @ 透传的目标平台 | `at_passthrough_extra_platforms` | list | 默认已含 QQ 系（aiocqhttp/qq_official 等），自建 QQ 适配器在此追加 |
@@ -274,13 +274,12 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 目标 UMO 列表 | `target_umo` | text（每行一条） | 多目标：转发到每个会话 |
 | 隐藏来源信息头 | `hide_header` | bool, false | |
 | 过滤模式 | `filter_mode` | string, inherit | inherit / off / blacklist / whitelist |
-| 过滤规则列表 | `filter_patterns` | list | 非空则覆盖全局，留空继承全局；条目支持 `regex:` / `cmd:` / 关键词 |
-| 指令消息不转发 | `command_filter` | string, inherit | inherit / true / false 三态，强制覆盖全局；true=指令消息不转发 |
+| 过滤规则列表 | `filter_patterns` | list | 非空则覆盖全局，留空继承全局；条目支持 `regex:` / 关键词 |
 | 转发冷却时间（秒） | `cooldown_seconds` | int, 0 | 0=关闭本规则冷却；不填（删除字段）=继承全局默认 |
 | 发送队列间隔（秒） | `queue_interval_seconds` | int, 0 | > 0 且 `queue_enabled` 时进入队列模式；不填=继承全局默认 |
 | 发送队列长度（条） | `queue_max_size` | int, 0 | 本规则独立积压上限（一条多目标转发会计入多次）；0 或不填=不限制（仅受全局总上限约束） |
 | 发送媒体前先下载到本地 | `download_media_before_send` | string, inherit | inherit / true / false 三态，强制覆盖全局 |
-| 转发的内容类型 | `content_types` | list(checkbox) | 非空覆盖全局默认；全部不勾选=继承全局 |
+| 转发的内容类型 | `content_types` | list(checkbox) | 非空覆盖全局默认（含 `command`=指令）；全部不勾选=继承全局；勾上 `command` 才转指令消息 |
 | [增强] 按昵称反查 @ 对象 | `at_nickname_lookup` | string, inherit | inherit / true / false 三态 |
 | 媒体下载是否走代理 | `use_proxy` | bool, false | |
 | 媒体下载代理地址 | `proxy_url` | string, "" | 仅 `use_proxy` 开启时生效 |
@@ -299,8 +298,8 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
 - 只读已知字段、丢弃未知字段：`settings = {k: self.config.get(k, v) for k, v in DEFAULT_SETTINGS.items()}`（本项目的配置读取分散在多个专有方法里，规则级字段逐个走下方列出的解析方法，不做整体重写）
-- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_command_prefixes()`（插件配置优先，留空回退 AstrBot 全局 `wake_prefix`）
-- 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`、`_should_filter_commands(rule)`
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
+- 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`；内容类型走模块级 `_content_types_for(rule, config)`
 
 ---
 
@@ -344,9 +343,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf cooldown` | 管理员 | 查看冷却配置 |
 | `mf cooldown default <秒>` | 管理员 | 设置全局默认冷却（0=关闭） |
 | `mf cooldown <编号> <秒\|inherit>` | 管理员 | 设置规则级冷却（inherit=重置继承全局） |
-| `mf filter` | 管理员 | 只读查看全局+规则级过滤配置、指令过滤与唤醒词、冷却配置、队列配置 |
-| `mf filter prefix <唤醒词...>` | 管理员 | 设置唤醒词（空格分隔多个；多词参数从 `event.message_str` 解析，不能只读 handler 参数） |
-| `mf filter prefix reset` | 管理员 | 恢复为跟随 AstrBot 全局唤醒词 |
+| `mf filter` | 管理员 | 只读查看全局+规则级过滤配置、指令处理方式、冷却配置、队列配置 |
 | `mf content` | 管理员 | 查看内容类型筛选配置 |
 | `mf content list` | 管理员 | 查看可选内容类型与别名 |
 | `mf content default <类型...>` | 管理员 | 设置全局默认（all=全选） |
@@ -368,7 +365,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 **README 命令表格式**：README 的命令表至少包含「指令 / 说明」两列；同一组命令存在权限差异时加「权限」列（取值：全部 / 管理员）。新增或修改命令时，本表、`/mf help` 树与 README 命令表三处同步。
 
-**已移除的命令（不要再实现或引用）**：`mf at` 指令组（`at` / `at on|off` / `at <编号>` / `at cache` / `at test`）与 `/mf filter cmd …` 子命令已于 2026-11-03 移除——@ 昵称反查（`at_nickname_lookup` 等）与指令过滤开关（`command_filter_enabled` / 规则级 `command_filter`）只在 WebUI 配置页设置；`/mf filter prefix …` 改唤醒词保留。
+**已移除的命令（不要再实现或引用）**：`mf at` 指令组（`at` / `at on|off` / `at <编号>` / `at cache` / `at test`）、`/mf filter cmd …` 与 `/mf filter prefix …` 子命令已于 2026-11-03 移除——@ 昵称反查（`at_nickname_lookup` 等）只在 WebUI 配置页设置；指令是否转发改由内容类型「指令」控制（见 6.7）；唤醒词只跟随 AstrBot 全局 `wake_prefix`，插件不提供前缀设置。
 
 **`hide` 与 `hidelist` 说明**：`hidelist` / `hidelistall` 命令已在 v0.4.6 移除（来源信息状态由 `/mf list` / `/mf listall` 的 🔒/🔓 标记覆盖），**不要再实现或引用它们**。
 
@@ -395,8 +392,8 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 5. `_expand_forward_components`：合并转发（`Forward` 只带源会话 resId，直接透传会让目标端显示打不开的卡片）→ 用 `get_forward_msg` 拉取内容重建 `_ForwardNodes`，按配置 `forward_node_avatar` 用发送者昵称反查真实 QQ 号（头像用）、递归展开节点内嵌套记录、按配置 `forward_keep_time` 保留每条消息的原始发送时间、按配置 `forward_card_preview` 决定卡片预览行显示来源 + 标题（默认）/ 仅标题 / `[卡片消息]`；拉取失败降级为 `[聊天记录]` 文本
 
 逐规则流程：
-1. 跳过 `enabled=false` 规则；`_should_forward(event, rule, command_name, command_resolved=True)` 过滤检查（规则级优先，inherit 继承全局）——先判指令过滤（`_should_filter_commands(rule)` 且消息是指令则直接不转发），再走 `filter_mode` + `filter_patterns`（关键词 / 正则 / `cmd:` 指令类型）；`command_name` 由事件级 `_command_name(event)` 识别一次后复用（`command_resolved=True` 表示已识别，避免逐规则重复识别）
-2. 内容类型筛选 `_content_types_for` + `_filter_chain_by_types`；过滤后为空则跳过（不转发、不占冷却）
+1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（关键词 / 正则，规则级优先，inherit 继承全局）；指令消息不走这里，由下一步的内容类型判定
+2. 内容类型筛选 `_content_types_for` + `_filter_chain_by_types(..., is_command)`（事件级 `_command_name(event)` 识别一次，指令消息整体按 `command` 类型判定）；过滤后为空则跳过（不转发、不占冷却）——指令消息默认就死在这一步
 3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
 4. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
 5. 主链：默认透传 `sanitized_chain`（媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
@@ -413,14 +410,15 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 模式：`off`（不过滤）/ `blacklist`（命中不转发）/ `whitelist`（命中才转发）
 - 模式优先级：规则级 `filter_mode`（inherit → 全局 `filter_mode`）> 全局
 - 规则列表：规则级 `filter_patterns` 非空用它，否则继承全局 `filter_patterns`
-- 条目解析 `_parse_filter_item`：`regex:` 前缀 → 正则（`re.search`）；`cmd:` / `指令:` 前缀 → 指令类型（value 为空=任意指令，否则与识别出的指令名不区分大小写比对）；其余 → 关键词（小写包含匹配，不区分大小写）
-- 指令过滤先于模式判定：`_should_filter_commands(rule)` 开启（全局 `command_filter_enabled` 默认 true，规则级 `command_filter` inherit/true/false 覆盖，均在 WebUI 配置）且消息被 `_command_name(event)` 识别为指令时，`_should_forward` 直接返回 False——`filter_mode=whitelist` 也不会转发指令，这是「所有指令默认不转发」的实现方式
-- 指令识别在原始消息链上做（见 2.3）：`event.message_str` 已被 AstrBot 摘掉唤醒词，不能用来判断；识别结果同时供 `cmd:` 条目使用（指令过滤关闭时 `cmd:` 仍可用）
+- 条目解析 `_parse_filter_item`：`regex:` 前缀 → 正则（`re.search`），其余 → 关键词（小写包含匹配，不区分大小写）
+- 指令消息不在这里判：以唤醒词开头的整条消息由 `_command_name(event)` 识别后交给内容类型「指令」（见 6.7），`filter_mode=whitelist` 也拦不住/放不过它
+- 指令识别在原始消息链上做（见 2.3）：`event.message_str` 已被 AstrBot 摘掉唤醒词，不能用它判断；唤醒词只取 AstrBot 全局 `wake_prefix`（NFKC 兼容全角 `／`、`！`）
 - `_unwrap_patterns`：兼容 text（按行拆分）和 template_list（取 dict 的 `rule` 字段）两种配置格式
 
 ### 6.7 内容类型筛选与 @ 转发
 
-- 内容类型键：`plain` 文字 / `image` 图片 / `face` 表情（仅 QQ 内置表情 Face 组件）/ `record` 语音 / `video` 视频 / `file` 文件 / `at` @提及 / `other` 其他；QQ 收藏的表情/表情包以图片形式到达，归入「图片」
+- 内容类型键：`plain` 文字 / `command` 指令 / `image` 图片 / `face` 表情（仅 QQ 内置表情 Face 组件）/ `record` 语音 / `video` 视频 / `file` 文件 / `at` @提及 / `other` 其他；QQ 收藏的表情/表情包以图片形式到达，归入「图片」
+- **「指令」是消息级类型**：以唤醒词开头的整条消息（`_command_name(event)` 命中）归入 `command`，`_filter_chain_by_types(chain, allowed, is_command=True)` 直接按「是否勾选 `command`」整体保留或整体丢弃；`default_content_types` 与规则级 `content_types` 默认都不含它，因此**指令消息默认不转发**，勾上才转
 - 合并转发（聊天记录，`Nodes`）归入「其他」类型：勾选「其他」才会转发聊天记录；目标平台不支持合并转发（非 `aiocqhttp` / `satori`）时降级为 `[聊天记录]` 文本
 - 纯媒体转发（未选中「文字」）时不附带来源信息头（`_should_attach_header`）
 - @ 转发默认策略：At 一律转为文本 `@昵称`（不发送真实 At 组件，彻底规避协议端解析/群成员查询超时）
@@ -606,7 +604,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - **关键配置不进折叠**：首次使用必须填的（必填地址、功能总开关）留在外面；折叠只装「不读也能用」的参考内容。
 - **折叠在 WebUI 会降级**：AstrBot 插件详情页内嵌的 README 会过滤 `details` / `summary` 标签，折叠块在那里变成普通文字、表格照常显示——因此折叠内容必须自洽可读，不能靠折叠藏必要信息。
 - 表格列固定「配置项 / 类型 / 默认值 / 说明」；配置项写「中文名（`key`）」（见 5.1），类型全篇统一（写 schema 的 `type`，或写 WebUI 里的中文类型），不要一张表里混用两种写法。
-- 现状：README 配置表已按「基础设置 / 过滤与指令 / 冷却与队列 / 内容与媒体 / 高级 @」五类分组（覆盖 `_conf_schema.json` 全部 21 项），`rules` 字段表用 `<details>` 折叠；新增配置项时归入对应分组，不要重新堆回一张长表。
+- 现状：README 配置表已按「基础设置 / 过滤与指令 / 冷却与队列 / 内容与媒体 / 高级 @」五类分组（覆盖 `_conf_schema.json` 全部 19 项），`rules` 字段表（15 项）用 `<details>` 折叠；新增配置项时归入对应分组，不要重新堆回一张长表。
 
 #### 7.2.4 何时必须更新 README
 

@@ -51,22 +51,24 @@
             "type": "string",
             "hint": "仅对本规则生效。继承全局=使用全局过滤设置；黑名单=命中则不转发；白名单=命中才转发。",
             "default": "inherit",
-            "options": ["inherit", "off", "blacklist", "whitelist"],
-            "labels": ["继承全局", "不过滤", "黑名单", "白名单"]
+            "options": [
+              "inherit",
+              "off",
+              "blacklist",
+              "whitelist"
+            ],
+            "labels": [
+              "继承全局",
+              "不过滤",
+              "黑名单",
+              "白名单"
+            ]
           },
           "filter_patterns": {
             "description": "过滤规则列表",
             "type": "list",
-            "hint": "仅对本规则生效。每项格式：regex:正则表达式、cmd:指令名（cmd: 匹配任意指令）或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
+            "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
             "default": []
-          },
-          "command_filter": {
-            "description": "指令消息不转发",
-            "type": "string",
-            "hint": "仅对本规则生效。继承全局=跟随全局设置；拦截指令=以唤醒词开头的指令消息（如 /help）不转发；不拦截=指令消息按普通消息处理。",
-            "default": "inherit",
-            "options": ["inherit", "true", "false"],
-            "labels": ["继承全局", "拦截指令", "不拦截指令"]
           },
           "cooldown_seconds": {
             "description": "转发冷却时间（秒）",
@@ -91,25 +93,61 @@
             "type": "string",
             "hint": "仅对本规则生效。继承全局=跟随全局设置，开启/关闭=强制本规则行为。",
             "default": "inherit",
-            "options": ["inherit", "true", "false"],
-            "labels": ["继承全局", "开启", "关闭"]
+            "options": [
+              "inherit",
+              "true",
+              "false"
+            ],
+            "labels": [
+              "继承全局",
+              "开启",
+              "关闭"
+            ]
           },
           "content_types": {
             "description": "转发的内容类型",
             "type": "list",
-            "hint": "仅对本规则生效。勾选需要转发的内容类型（多选），未勾选的类型会被过滤掉。全部不勾选=继承全局默认（全局默认全选）。例：只勾选「表情」则仅转发表情，只勾选「图片」则仅转发图片。",
+            "hint": "仅对本规则生效。勾选需要转发的内容类型（多选），未勾选的类型会被过滤掉。全部不勾选=继承全局默认；「指令」默认不勾选（指令消息不转发），勾上才转发。",
             "default": [],
             "render_type": "checkbox",
-            "options": ["plain", "image", "face", "record", "video", "file", "at", "other"],
-            "labels": ["文字", "图片", "表情", "语音", "视频", "文件", "@提及", "其他"]
+            "options": [
+              "plain",
+              "command",
+              "image",
+              "face",
+              "record",
+              "video",
+              "file",
+              "at",
+              "other"
+            ],
+            "labels": [
+              "文字",
+              "指令",
+              "图片",
+              "表情",
+              "语音",
+              "视频",
+              "文件",
+              "@提及",
+              "其他"
+            ]
           },
           "at_nickname_lookup": {
             "description": "[增强] 高级 @：按昵称反查 @ 对象",
             "type": "string",
             "hint": "仅对本规则生效。inherit=跟随全局；关闭时 @ 转成文本 @昵称（最稳妥）；开启后按目标群成员列表把 @昵称 换成真实成员再精确 @，群大时会多一次接口调用（有缓存），仅 QQ 系有效。",
             "default": "inherit",
-            "options": ["inherit", "true", "false"],
-            "labels": ["继承全局", "开启", "关闭"]
+            "options": [
+              "inherit",
+              "true",
+              "false"
+            ],
+            "labels": [
+              "继承全局",
+              "开启",
+              "关闭"
+            ]
           },
           "use_proxy": {
             "description": "媒体下载是否走代理",
@@ -138,25 +176,21 @@
     "type": "string",
     "hint": "黑名单=命中则不转发，白名单=命中才转发。",
     "default": "off",
-    "options": ["off", "blacklist", "whitelist"],
-    "labels": ["不过滤", "黑名单", "白名单"]
+    "options": [
+      "off",
+      "blacklist",
+      "whitelist"
+    ],
+    "labels": [
+      "不过滤",
+      "黑名单",
+      "白名单"
+    ]
   },
   "filter_patterns": {
     "description": "全局过滤规则列表（每行一条）",
     "type": "text",
-    "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，cmd:指令名 表示指令类型（cmd: 匹配任意指令，cmd:help 匹配 help），其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
-    "default": ""
-  },
-  "command_filter_enabled": {
-    "description": "指令消息不转发",
-    "type": "bool",
-    "hint": "开启后，以唤醒词开头的指令消息（如 /help、/mf list）不转发，避免把机器人指令当聊天内容转发出去。默认开启；每条规则可在规则内单独切换（command_filter）。",
-    "default": true
-  },
-  "command_prefixes": {
-    "description": "唤醒词（识别指令用的前缀，每行一个）",
-    "type": "text",
-    "hint": "每行一个唤醒词，可填多个（如 / 或 ! 或 #机器人）。留空则自动跟随 AstrBot 全局唤醒词（wake_prefix，默认 /）。中文输入法打出的全角符号（如 ／、！）同样能识别。",
+    "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
     "default": ""
   },
   "default_cooldown_seconds": {
@@ -206,8 +240,16 @@
     "type": "string",
     "hint": "转发聊天记录时，记录里的卡片（小程序 / 分享卡）在预览行里显示什么：来源 + 标题=显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀（默认，与 QQ 原生卡片一致）；仅标题=只显示卡片标题，不显示简介、来源、上传者等其它信息；不显示=统一显示「[卡片消息]」。",
     "default": "source",
-    "options": ["source", "title", "off"],
-    "labels": ["来源 + 标题（原样）", "仅标题", "不显示（[卡片消息]）"]
+    "options": [
+      "source",
+      "title",
+      "off"
+    ],
+    "labels": [
+      "来源 + 标题（原样）",
+      "仅标题",
+      "不显示（[卡片消息]）"
+    ]
   },
   "forward_node_avatar": {
     "description": "[增强] 转发聊天记录时获取发送者头像",
@@ -218,11 +260,40 @@
   "default_content_types": {
     "description": "默认转发的内容类型",
     "type": "list",
-    "hint": "新建转发规则时默认勾选的内容类型（多选）。默认全选=转发所有内容。",
-    "default": ["plain", "image", "face", "record", "video", "file", "at", "other"],
+    "hint": "新建转发规则时默认勾选的内容类型（多选）。除「指令」外默认全选；「指令」默认不勾选，即以唤醒词开头的指令消息默认不转发，需要转发时勾上「指令」。",
+    "default": [
+      "plain",
+      "image",
+      "face",
+      "record",
+      "video",
+      "file",
+      "at",
+      "other"
+    ],
     "render_type": "checkbox",
-    "options": ["plain", "image", "face", "record", "video", "file", "at", "other"],
-    "labels": ["文字", "图片", "表情", "语音", "视频", "文件", "@提及", "其他"]
+    "options": [
+      "plain",
+      "command",
+      "image",
+      "face",
+      "record",
+      "video",
+      "file",
+      "at",
+      "other"
+    ],
+    "labels": [
+      "文字",
+      "指令",
+      "图片",
+      "表情",
+      "语音",
+      "视频",
+      "文件",
+      "@提及",
+      "其他"
+    ]
   },
   "at_nickname_lookup": {
     "description": "[增强] 高级 @：按昵称反查 @ 对象（默认关闭=At 转文本）",
