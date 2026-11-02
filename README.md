@@ -201,7 +201,7 @@
 ### 规则字段（`rules`）
 
 <details>
-<summary>规则字段（18 项）</summary>
+<summary>规则字段（17 项）</summary>
 
 | 字段 | 类型 | 说明 |
 | ----- | ------ | ------ |
