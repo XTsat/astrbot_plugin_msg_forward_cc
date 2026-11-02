@@ -2138,8 +2138,6 @@ class MsgForward(star.Star):
             "│   └── cooldown <编号> inherit: 重置为继承全局默认\n"
             "├── 🎯 过滤\n"
             "│   ├── filter: 查看当前过滤配置（含指令过滤与唤醒词）\n"
-            "│   ├── filter cmd on / filter cmd off: 全局开关指令过滤（默认开启=指令不转发）\n"
-            "│   ├── filter cmd <编号> on|off|inherit: 设置某条规则的指令过滤\n"
             "│   └── filter prefix <唤醒词...|reset>: 改唤醒词（默认跟随 AstrBot 全局，/ 可改）\n"
             "├── 📦 内容类型\n"
             "│   ├── content: 查看内容类型筛选配置\n"
@@ -2147,12 +2145,7 @@ class MsgForward(star.Star):
             "│   ├── content default <类型...>: 设置全局默认（all=全选）\n"
             "│   ├── content <编号> <类型...>: 设置某条规则转发的内容类型（多选）\n"
             "│   └── content <编号> inherit: 重置为继承全局默认\n"
-            "├── 🔔 @ 转发\n"
-            "│   ├── at: 查看 @ 转发与昵称反查配置\n"
-            "│   ├── at on / at off: 全局开启/关闭 @昵称反查\n"
-            "│   ├── at cache <秒>: 群成员列表缓存有效期（0=每次重新拉取）\n"
-            "│   ├── at <编号> on|off: 设置某条规则昵称反查（inherit=继承全局）\n"
-            "│   └── at test <群号或UMO>: 测试目标群 @昵称反查命中情况\n"
+
             "├── ⏳ 发送队列\n"
             "│   ├── queue status: 查看发送队列状态与配置\n"
             "│   ├── queue on / queue off: 启用/停用发送队列总开关\n"
@@ -2173,10 +2166,10 @@ class MsgForward(star.Star):
             "达上限后新消息丢弃（总上限同理）。\n"
             "冷却与队列同时开启时冷却失效（队列间隔已在限流），\n"
             "list 中以 ❄失效(队列中) 标记，日志会告警一次。\n"
-            "@ 转发：默认 At 一律转为文本 @昵称（不发送真实 At，稳妥）；开启昵称反查\n"
-            "（高级 @）后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭）。\n"
-            "指令过滤：默认以唤醒词开头的指令消息（如 /help）不转发；唤醒词默认跟随\n"
-            "AstrBot 全局唤醒词（/），可用 /mf filter prefix 改成 ! 等其它唤醒词。"
+            "@ 转发：默认 At 一律转为文本 @昵称（不发送真实 At，稳妥）；开启「按昵称反查\n"
+            "@ 对象」后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭，WebUI 配置）。\n"
+            "指令过滤：默认以唤醒词开头的指令消息（如 /help）不转发（开关在 WebUI 配置）；\n"
+            "唤醒词默认跟随 AstrBot 全局唤醒词（/），可用 /mf filter prefix 改成 ! 等其它唤醒词。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2604,123 +2597,6 @@ class MsgForward(star.Star):
         self.config.save_config()
         yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）内容类型已设为：{self._content_types_text(types)}")
 
-    @mf.group("at")
-    def at(self):
-        """at 命令组：@ 转发与昵称反查配置"""
-        pass
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @at.command("status")
-    async def cmd_at_status(self, event: AstrMessageEvent):
-        """查看 @ 转发与昵称反查配置（/mf at 等价）"""
-        enabled = bool(self.config.get("at_nickname_lookup", False))
-        ttl = self._at_lookup_ttl()
-        cache_size = len(self._group_member_cache)
-        lines = [
-            f"🔔 @ 转发：默认 At 转为文本 @昵称；开启高级 @（昵称反查）后按 qq 透传真实 At",
-            f"🔍 昵称反查：{'✅ 全局开启' if enabled else '⛔ 全局关闭（默认）'}"
-            + (f" | 缓存 {ttl}s" if ttl > 0 else " | 缓存关闭（每次重新拉取）"),
-            f"💾 已缓存群成员列表：{cache_size} 个群",
-        ]
-        rules = self.config.get("rules", [])
-        per_rule = [(idx, r) for idx, r in enumerate(rules, start=1) if r.get("at_nickname_lookup") is not None]
-        if per_rule:
-            lines.append("\n规则级昵称反查：")
-            for idx, r in per_rule:
-                lines.append(f"  #{idx} | {self._rule_name(r)} | {'🔔开启' if self._should_at_lookup(r) else '关闭'}")
-        else:
-            lines.append("（所有规则继承全局昵称反查设置）")
-        lines.append("\n用法：/mf at on|off 全局开关；/mf at <编号> on|off|inherit 规则级；"
-            "/mf at cache <秒> 缓存时长；/mf at test <群号> 测试反查"
-        )
-        lines.append("说明：默认 At 转为文本 @昵称（不发送真实 At）；开启反查（高级 @）后在目标为 QQ 系群聊时按 qq 透传并反查真实成员，每条消息多一次群成员查询（有缓存）。")
-        yield event.plain_result("\n".join(lines))
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @at.command("on")
-    async def cmd_at_on(self, event: AstrMessageEvent):
-        """全局开启 @昵称反查"""
-        self.config["at_nickname_lookup"] = True
-        self.config.save_config()
-        yield event.plain_result("✅ 已全局开启高级 @（昵称反查，规则未单独设置时生效）")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @at.command("off")
-    async def cmd_at_off(self, event: AstrMessageEvent):
-        """全局关闭 @昵称反查"""
-        self.config["at_nickname_lookup"] = False
-        self.config.save_config()
-        yield event.plain_result("✅ 已全局关闭 @昵称反查（At 将一律转为文本 @昵称）")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @at.command("cache")
-    async def cmd_at_cache(self, event: AstrMessageEvent, seconds: str = ""):
-        """设置群成员列表缓存有效期（秒，0=每次重新拉取）"""
-        arg = (seconds or "").strip()
-        try:
-            val = int(arg)
-            if val < 0:
-                raise ValueError
-        except ValueError:
-            yield event.plain_result("❌ 用法：/mf at cache <秒>（非负整数，0=每次重新拉取）")
-            return
-        self.config["at_nickname_lookup_cache_ttl"] = val
-        self.config.save_config()
-        desc = f"{val}s" if val > 0 else "关闭（每次重新拉取）"
-        yield event.plain_result(f"✅ 群成员列表缓存已设为 {desc}")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @at.command("set")
-    async def cmd_at_set(self, event: AstrMessageEvent, rid: str = "", mode: str = ""):
-        """设置规则级昵称反查（/mf at <编号> on|off|inherit）"""
-        arg = (mode or "").strip().lower()
-        if not rid or arg not in ("on", "off", "inherit", "true", "false"):
-            yield event.plain_result(
-                "❌ 用法：/mf at <编号> on|off|inherit\n"
-                "  on=该规则开启反查；off=关闭；inherit=继承全局设置"
-            )
-            return
-        rules, idx, rule = self._get_rule(rid)
-        if rule is None:
-            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
-            return
-        if arg in ("inherit",):
-            rule.pop("at_nickname_lookup", None)
-            result = "已重置为继承全局"
-        else:
-            rule["at_nickname_lookup"] = "true" if arg in ("on", "true") else "false"
-            result = f"已设为{'🔔开启' if rule['at_nickname_lookup'] == 'true' else '关闭'}"
-        self.config["rules"] = rules
-        self.config.save_config()
-        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）昵称反查{result}")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @at.command("test")
-    async def cmd_at_test(self, event: AstrMessageEvent, args: str = ""):
-        """测试目标群 @ 反查：拉取成员列表并显示命中情况"""
-        target = (args or "").strip()
-        if not target:
-            yield event.plain_result("❌ 用法：/mf at test <群号 或 UMO>\n例：/mf at test 123456 或 /mf at test aiocqhttp:GroupMessage:123456")
-            return
-        parts = target.split(":")
-        if len(parts) == 3:
-            platform, msg_type, group_id = parts[0].strip().lower(), parts[1], parts[2]
-        else:
-            platform, msg_type, group_id = "aiocqhttp", "GroupMessage", target
-        if platform not in _QQ_TARGET_PLATFORMS or msg_type != "GroupMessage":
-            yield event.plain_result(f"❌ 昵称反查仅支持 QQ 系群聊（当前：{platform}:{msg_type}）")
-            return
-        name_map, id_map = await self._get_group_member_name_map(group_id)
-        if not name_map:
-            yield event.plain_result(f"❌ 未能拉取群 {group_id} 的成员列表（无 QQ 协议端 / 群号错误 / 无权限），反查将降级为文本 @昵称")
-            return
-        lines = [f"✅ 群 {group_id} 成员 {len(id_map)} 人已缓存", "样例（昵称 → qq）："]
-        for nick, uid in list(name_map.items())[:10]:
-            uniq = id_map.get(uid, uid)
-            lines.append(f"  {nick} → {uid}" + ("" if uniq == nick else f"（{uniq}）"))
-        lines.append("提示：转发时会把 @昵称 中能在上表命中的昵称替换为对应 qq。")
-        yield event.plain_result("\n".join(lines))
-
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("listall")
     async def cmd_list_all(self, event: AstrMessageEvent):
@@ -2751,41 +2627,9 @@ class MsgForward(star.Star):
         return (args or "").split()
 
     def _apply_filter_option(self, tokens: list[str]) -> str:
-        """处理 /mf filter 的子参数（cmd / prefix），返回回复文本。"""
+        """处理 /mf filter 的子参数（prefix / 唤醒词），返回回复文本。"""
         head = tokens[0].strip().lower()
         rest = [t.strip() for t in tokens[1:] if t.strip()]
-
-        if head in ("cmd", "指令"):
-            if not rest:
-                state = "开启" if bool(self.config.get("command_filter_enabled", True)) else "关闭"
-                return (
-                    f"📋 指令过滤：{state}｜唤醒词：{' / '.join(self._command_prefixes())}\n"
-                    "用法：/mf filter cmd on|off 设全局；/mf filter cmd <编号> on|off|inherit 设规则级"
-                )
-            # 规则级：cmd <编号> on|off|inherit
-            if len(rest) == 2 and rest[1].lower() in ("on", "off", "inherit"):
-                rid, arg = rest[0], rest[1].lower()
-                rules, idx, rule = self._get_rule(rid)
-                if rule is None:
-                    return f"❌ 规则 #{rid} 不存在"
-                if arg == "inherit":
-                    rule.pop("command_filter", None)
-                    self.config["rules"] = rules
-                    self.config.save_config()
-                    return f"✅ 规则 #{rid}（{self._rule_name(rule)}）指令过滤已重置为继承全局"
-                rule["command_filter"] = (arg == "on")
-                self.config["rules"] = rules
-                self.config.save_config()
-                state = "拦截指令消息（以唤醒词开头的消息不转发）" if arg == "on" else "不拦截指令消息"
-                return f"✅ 规则 #{rid}（{self._rule_name(rule)}）{state}"
-            # 全局：cmd on|off
-            if len(rest) == 1 and rest[0].lower() in ("on", "off"):
-                val = rest[0].lower() == "on"
-                self.config["command_filter_enabled"] = val
-                self.config.save_config()
-                return ("✅ 已开启指令过滤：以唤醒词开头的指令消息不再转发"
-                        if val else "✅ 已关闭指令过滤：指令消息按普通消息处理")
-            return "❌ 用法：/mf filter cmd on|off；或 /mf filter cmd <编号> on|off|inherit"
 
         if head in ("prefix", "wake", "唤醒词"):
             if not rest:
@@ -2812,9 +2656,8 @@ class MsgForward(star.Star):
         return (
             "❌ 未知参数，用法：\n"
             "/mf filter：查看过滤配置\n"
-            "/mf filter cmd on|off：全局开关指令过滤\n"
-            "/mf filter cmd <编号> on|off|inherit：设置某条规则的指令过滤\n"
-            "/mf filter prefix <唤醒词...>：设置唤醒词（reset 恢复跟随全局）"
+            "/mf filter prefix <唤醒词...>：设置唤醒词（reset 恢复跟随全局）\n"
+            "（指令过滤开关与规则级设置在 WebUI 配置）"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2850,8 +2693,8 @@ class MsgForward(star.Star):
             f"｜唤醒词：{' / '.join(self._command_prefixes())}（{prefix_src}）"
         )
         lines.append(
-            "      开启时，以唤醒词开头的指令消息（如 /help）不转发"
-            if cmd_on else "      关闭时，指令消息按普通消息处理（过滤列表里的 cmd: 仍然可用）"
+            "      开启时，以唤醒词开头的指令消息（如 /help）不转发（开关与规则级设置在 WebUI 配置）"
+            if cmd_on else "      关闭时，指令消息按普通消息处理（过滤列表里的 cmd: 仍然可用；开关在 WebUI 配置）"
         )
 
         # 显示各规则的单独过滤配置
@@ -2904,8 +2747,8 @@ class MsgForward(star.Star):
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
 
         lines.append(
-            "\n用法：/mf filter cmd on|off 开关指令过滤；/mf filter cmd <编号> on|off|inherit 设规则级；"
-            "/mf filter prefix <唤醒词...> 改唤醒词（reset 恢复跟随全局）"
+            "\n用法：/mf filter prefix <唤醒词...> 改唤醒词（reset 恢复跟随全局）；"
+            "指令过滤开关与规则级设置在 WebUI 配置"
         )
 
         yield event.plain_result("\n".join(lines))

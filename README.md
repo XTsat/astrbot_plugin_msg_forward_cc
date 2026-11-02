@@ -48,6 +48,8 @@
 
 全部命令以 `mf` 开头，除 `/mf help` 外均为管理员权限。
 
+### 绑定与规则
+
 | 指令 | 说明 |
 | -------------- | ------------------ |
 | `mf add` | 创建一则消息转发绑定的请求（生成 6 位绑定码） |
@@ -59,24 +61,37 @@
 | `mf hide <编号>` | 切换规则的来源信息显示 / 隐藏 |
 | `mf toggle <编号>` | 启用 / 停用一条规则 |
 | `mf remark <编号> [备注]` | 设置规则备注名称，留空清除 |
+
+### 冷却
+
+| 指令 | 说明 |
+| -------------- | ------------------ |
 | `mf cooldown` | 查看冷却配置（全局默认 + 规则级） |
 | `mf cooldown default <秒>` | 设置全局默认冷却（0=关闭） |
 | `mf cooldown <编号> <秒\|inherit>` | 设置某条规则冷却（0=关闭该规则冷却） |
+
+### 过滤与唤醒词
+
+| 指令 | 说明 |
+| -------------- | ------------------ |
 | `mf filter` | 查看过滤配置（模式、关键词 / 正则 / 指令条目、指令过滤与唤醒词） |
-| `mf filter cmd on` / `mf filter cmd off` | 全局开启 / 关闭指令过滤（默认开启） |
-| `mf filter cmd <编号> on\|off\|inherit` | 设置某条规则的指令过滤 |
 | `mf filter prefix <唤醒词...>` | 设置唤醒词（可填多个，空格分隔，例：`/mf filter prefix ! ＃`） |
 | `mf filter prefix reset` | 恢复为跟随 AstrBot 全局唤醒词 |
+
+### 内容类型
+
+| 指令 | 说明 |
+| -------------- | ------------------ |
 | `mf content` | 查看内容类型筛选配置（全局默认 + 规则级覆盖） |
 | `mf content list` | 查看可选内容类型与别名 |
 | `mf content default <类型...>` | 设置全局默认内容类型（`all`=全选） |
 | `mf content <编号> <类型...>` | 设置某条规则转发的内容类型（多选） |
 | `mf content <编号> inherit` | 重置为继承全局默认 |
-| `mf at` | 查看 @ 转发与昵称反查配置 |
-| `mf at on` / `mf at off` | 全局开启 / 关闭 @ 昵称反查（默认关闭） |
-| `mf at <编号> on\|off\|inherit` | 设置某条规则的 @ 昵称反查 |
-| `mf at cache <秒>` | 群成员列表缓存时长（0=每次重新拉取，默认 300） |
-| `mf at test <群号\|UMO>` | 实测目标群 @ 昵称反查命中情况 |
+
+### 发送队列
+
+| 指令 | 说明 |
+| -------------- | ------------------ |
 | `mf queue status` | 查看发送队列状态与配置（含各规则间隔 / 长度上限 / 当前积压） |
 | `mf queue on` / `mf queue off` | 启用 / 停用发送队列总开关 |
 | `mf queue interval <秒>` | 设置全局默认队列间隔（0=关闭） |
@@ -90,6 +105,11 @@
 | `mf queue set <编号> inherit` | 重置为继承全局默认 |
 | `mf queue clear` | 清空当前积压的发送队列并清理媒体缓存 |
 | `mf queue pause` / `mf queue resume` | 暂停 / 恢复发送队列消费 |
+
+### 其它
+
+| 指令 | 说明 |
+| -------------- | ------------------ |
 | `mf help` | 显示帮助信息 |
 
 > **UMO**：会话的唯一标识，格式 `平台名:消息类型:会话ID`，消息类型为 `GroupMessage`（群聊）或 `FriendMessage`（私聊），例如 `aiocqhttp:GroupMessage:654321`。
@@ -111,7 +131,7 @@
 
 ## 三、配置
 
-全部配置项在 AstrBot WebUI 的插件配置页可视化修改；运行时状态可用 `/mf filter`、`/mf content`、`/mf at`、`/mf queue status` 查看。
+全部配置项在 AstrBot WebUI 的插件配置页修改（含指令过滤开关、唤醒词、@ 昵称反查等）；运行时状态可用 `/mf filter`、`/mf content`、`/mf queue status` 查看。
 
 ### 基础设置
 

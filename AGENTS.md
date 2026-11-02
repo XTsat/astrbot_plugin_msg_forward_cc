@@ -27,7 +27,7 @@
 
 | 文件 | 必选 | 职责 |
 |------|------|------|
-| `main.py` | ✅ | 插件主体，全部逻辑（4405 行，单文件风格） |
+| `main.py` | ✅ | 插件主体，全部逻辑（单文件风格） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（272 行） |
 | `metadata.yaml` | ✅ | 插件元数据（v0.5.9，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档（功能 / 指令 / 配置 / 其它四大板块，只写用户视角） |
@@ -331,7 +331,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 | 命令 | 权限 | 功能 |
 |------|------|------|
-| `mf help` | 全部 | 按分组树状显示帮助（绑定/规则/冷却/过滤/内容类型/@ 转发/发送队列） |
+| `mf help` | 全部 | 按分组树状显示帮助（绑定/规则/冷却/过滤/内容类型/发送队列） |
 | `mf add` | 管理员 | 生成 6 位绑定码存入 pending.json，目标会话用 `bind` 接受 |
 | `mf bind <code>` | 管理员 | 弹出绑定码创建规则（当前会话为目标），默认 `hide_header` 取自 `default_hide_header` |
 | `mf bindraw [源平台] 源ID [目标平台] 目标ID` | 管理员 | 直接建规则（见 6.3） |
@@ -344,10 +344,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf cooldown` | 管理员 | 查看冷却配置 |
 | `mf cooldown default <秒>` | 管理员 | 设置全局默认冷却（0=关闭） |
 | `mf cooldown <编号> <秒\|inherit>` | 管理员 | 设置规则级冷却（inherit=重置继承全局） |
-| `mf filter` | 管理员 | 查看全局+规则级过滤配置、指令过滤与唤醒词、冷却配置、队列配置 |
-| `mf filter cmd` | 管理员 | 查看指令过滤状态与当前唤醒词 |
-| `mf filter cmd on` / `off` | 管理员 | 全局开启/关闭指令过滤（默认开启） |
-| `mf filter cmd <编号> on\|off\|inherit` | 管理员 | 规则级指令过滤开关（inherit=重置继承全局） |
+| `mf filter` | 管理员 | 只读查看全局+规则级过滤配置、指令过滤与唤醒词、冷却配置、队列配置 |
 | `mf filter prefix <唤醒词...>` | 管理员 | 设置唤醒词（空格分隔多个；多词参数从 `event.message_str` 解析，不能只读 handler 参数） |
 | `mf filter prefix reset` | 管理员 | 恢复为跟随 AstrBot 全局唤醒词 |
 | `mf content` | 管理员 | 查看内容类型筛选配置 |
@@ -355,11 +352,6 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf content default <类型...>` | 管理员 | 设置全局默认（all=全选） |
 | `mf content <编号> <类型...>` | 管理员 | 设置某规则内容类型（多选） |
 | `mf content <编号> inherit` | 管理员 | 重置为继承全局默认 |
-| `mf at` | 管理员 | 查看 @ 转发与昵称反查配置 |
-| `mf at on` / `mf at off` | 管理员 | 全局开启/关闭 @昵称反查 |
-| `mf at cache <秒>` | 管理员 | 设置群成员列表缓存时长（0=每次重新拉取） |
-| `mf at <编号> on\|off\|inherit` | 管理员 | 规则级昵称反查开关 |
-| `mf at test <群号\|UMO>` | 管理员 | 实测目标群 @昵称反查命中情况 |
 | `mf queue status` | 管理员 | 查看发送队列状态：总开关/消费状态(暂停/运行)/默认间隔/总上限/媒体保留/当前积压 + 各规则队列（间隔/长度上限/当前积压）表格 |
 | `mf queue on` / `off` | 管理员 | 发送队列总开关 |
 | `mf queue interval <秒>` | 管理员 | 设置全局默认队列间隔（0=关闭） |
@@ -375,6 +367,8 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf queue pause` / `resume` | 管理员 | 暂停/恢复队列消费 |
 
 **README 命令表格式**：README 的命令表至少包含「指令 / 说明」两列；同一组命令存在权限差异时加「权限」列（取值：全部 / 管理员）。新增或修改命令时，本表、`/mf help` 树与 README 命令表三处同步。
+
+**已移除的命令（不要再实现或引用）**：`mf at` 指令组（`at` / `at on|off` / `at <编号>` / `at cache` / `at test`）与 `/mf filter cmd …` 子命令已于 2026-11-03 移除——@ 昵称反查（`at_nickname_lookup` 等）与指令过滤开关（`command_filter_enabled` / 规则级 `command_filter`）只在 WebUI 配置页设置；`/mf filter prefix …` 改唤醒词保留。
 
 **`hide` 与 `hidelist` 说明**：`hidelist` / `hidelistall` 命令已在 v0.4.6 移除（来源信息状态由 `/mf list` / `/mf listall` 的 🔒/🔓 标记覆盖），**不要再实现或引用它们**。
 
@@ -420,7 +414,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 模式优先级：规则级 `filter_mode`（inherit → 全局 `filter_mode`）> 全局
 - 规则列表：规则级 `filter_patterns` 非空用它，否则继承全局 `filter_patterns`
 - 条目解析 `_parse_filter_item`：`regex:` 前缀 → 正则（`re.search`）；`cmd:` / `指令:` 前缀 → 指令类型（value 为空=任意指令，否则与识别出的指令名不区分大小写比对）；其余 → 关键词（小写包含匹配，不区分大小写）
-- 指令过滤先于模式判定：`_should_filter_commands(rule)` 开启（全局 `command_filter_enabled` 默认 true，规则级 `command_filter` inherit/true/false 覆盖）且消息被 `_command_name(event)` 识别为指令时，`_should_forward` 直接返回 False——`filter_mode=whitelist` 也不会转发指令，这是「所有指令默认不转发」的实现方式
+- 指令过滤先于模式判定：`_should_filter_commands(rule)` 开启（全局 `command_filter_enabled` 默认 true，规则级 `command_filter` inherit/true/false 覆盖，均在 WebUI 配置）且消息被 `_command_name(event)` 识别为指令时，`_should_forward` 直接返回 False——`filter_mode=whitelist` 也不会转发指令，这是「所有指令默认不转发」的实现方式
 - 指令识别在原始消息链上做（见 2.3）：`event.message_str` 已被 AstrBot 摘掉唤醒词，不能用来判断；识别结果同时供 `cmd:` 条目使用（指令过滤关闭时 `cmd:` 仍可用）
 - `_unwrap_patterns`：兼容 text（按行拆分）和 template_list（取 dict 的 `rule` 字段）两种配置格式
 
@@ -430,7 +424,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 合并转发（聊天记录，`Nodes`）归入「其他」类型：勾选「其他」才会转发聊天记录；目标平台不支持合并转发（非 `aiocqhttp` / `satori`）时降级为 `[聊天记录]` 文本
 - 纯媒体转发（未选中「文字」）时不附带来源信息头（`_should_attach_header`）
 - @ 转发默认策略：At 一律转为文本 `@昵称`（不发送真实 At 组件，彻底规避协议端解析/群成员查询超时）
-- @昵称反查（可选增强，默认关闭）：开启后按目标群成员列表把 `@昵称` 反查为目标群真实 `qq` 再精确 @；反查顺序「qq 精确匹配优先，昵称兜底」；群成员列表按群缓存（`at_nickname_lookup_cache_ttl` 默认 300s），昵称重名跳过反查，拉取失败/无 QQ 协议端/目标非 QQ 群时静默降级，不影响转发
+- @昵称反查（可选增强，默认关闭，**只在 WebUI 配置**：`at_nickname_lookup` / `at_nickname_lookup_cache_ttl` / 规则级 `at_nickname_lookup`）：开启后按目标群成员列表把 `@昵称` 反查为目标群真实 `qq` 再精确 @；反查顺序「qq 精确匹配优先，昵称兜底」；群成员列表按群缓存（默认 300s），昵称重名跳过反查，拉取失败/无 QQ 协议端/目标非 QQ 群时静默降级，不影响转发
 
 ---
 

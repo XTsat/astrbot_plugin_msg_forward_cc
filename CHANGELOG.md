@@ -15,6 +15,11 @@
 
 - 精简 README：按「功能 / 指令 / 配置 / 其它」重排，只保留能做什么、怎么配、怎么用的信息，去掉实现原理与目录结构说明；平台兼容性测试单独成文（`docs/platform-compatibility.md`），README 只保留入口指向；上游来源与许可证说明移到最后
 - 配置表补全遗漏的两项：「启用发送队列」（`queue_enabled`）与「队列媒体缓存保留时间」（`queue_media_retention_hours`），配置项按基础 / 过滤 / 队列 / 内容 / 高级 @ 分组，每项按「中文名（`key`）」书写
+- README 指令表按类型分节：绑定与规则 / 冷却 / 过滤与唤醒词 / 内容类型 / 发送队列 / 其它
+
+### 移除
+
+- 移除 `/mf at` 指令组与 `/mf filter cmd …` 子命令：@ 昵称反查（`at_nickname_lookup` 等）与指令过滤开关（`command_filter_enabled`、规则级 `command_filter`）不再提供命令入口，改为在 AstrBot WebUI 配置页设置；`/mf filter` 仍可只读查看当前配置，`/mf filter prefix` 改唤醒词保留
 
 ## v0.5.9 (2026-10-28)
 
