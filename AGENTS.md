@@ -5,7 +5,7 @@
 >
 > 适用项目：`astrbot_plugin_msg_forward_cc`（AstrBot 跨平台消息转发插件，Python 单文件）。
 >
-> **模板版本**：v0.1.5（2026-11-03） —— 本行标记本文件对应的 `astrbot-plugin` 模板版本。回填项目内容时**不要改动本行**；只有从上游合并到新版本时才把它更新为合并到的版本。
+> **模板版本**：v0.1.9（2026-11-04） —— 本行标记本文件对应的 `astrbot-plugin` 模板版本。回填项目内容时**不要改动本行**；只有从上游合并到新版本时才把它更新为合并到的版本。
 > **来源**：本文件是 [agent-templates](https://github.com/XTsat/agent-templates) 的 `templates/astrbot-plugin/AGENTS.md` 副本，最新版见该仓库 `main` 分支；已回填本项目的插件名、命令前缀、目录结构、命令表与项目特有约定。
 > 用户说「更新 AGENTS」时按此流程：① 打开来源仓库该模板的 `AGENTS.md`，比对头部「模板版本」与本地是否一致——一致说明已是最新，直接结束，不必逐节比对 → ② 不一致才拉取来源模板最新版（**用 GitHub contents API 或带 cache-buster 的 raw URL**，`raw.githubusercontent.com` 直链有 CDN 缓存，可能拿到旧版）→ ③ 与本地逐节比对 → ④ 合并（保留本项目已回填的插件名、命令前缀、目录结构与项目特有约定）→ ⑤ 展示 diff 与改动清单，等用户确认后再落盘，并把头部「模板版本」同步改为合并到的版本。**禁止整文件覆盖**。
 
@@ -39,7 +39,7 @@
 
 > 无 `requirements.txt`：全部依赖已由 AstrBot 运行时自带或按需惰性 import。
 > 插件目录位于 AstrBot 4.x 的 `data/plugins/`（`addons/` 是 3.x 旧路径，已废弃）。
-> `metadata.yaml` 必填 `name` / `desc` / `version` / `author`，推荐 `display_name` / `repo`，可选 `support_platforms` / `tags` / `short_desc`；`astrbot_version` 只在能明确最低支持版本时才填，说不准就保持注释状态，不写估算范围。
+> `metadata.yaml` 必填 `name` / `desc` / `version` / `author`，推荐 `display_name` / `repo`，可选 `support_platforms` / `tags`（**全量、单概念**关键词，README 头部只挑重点） / `short_desc`；`astrbot_version` 只在能明确最低支持版本时才填，说不准就保持注释状态，不写估算范围。
 > `_conf_schema.json` 是扁平 `{key: {type, description, default, ...}}` 字典（详见 5.1），没有 `fields` 数组之类的自造外壳。
 > 本项目不使用 `views/`（WebUI 可视化视图）、`pages/`（旧兼容目录）与 `.astrbot-plugin/`（i18n）目录——全部交互走聊天指令 + 配置表单。
 > ⚠️ **有意偏差（许可证）**：上游模板要求「许可证按需创建、README 不放许可证章节」。本项目派生自 AstrBot（AGPL）与 `astrbot_plugin_msg_transfer`，**必须**保留 AGPL-3.0：`LICENSE` 文件与 README 的许可证说明都是必需的，不按上游删除。
@@ -556,8 +556,10 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 
 ```html
 <div align="center">
+<img src="logo.png" alt="跨平台消息转发" width="160" />
 <h1>跨平台消息转发</h1>
 <p><strong>在不同聊天平台及群聊之间自动转发与同步消息</strong></p>
+<!-- sub 行只挑插件真正的重点功能（数量不限，可为 metadata tags 的变体），全量标签留在 metadata.yaml 的 tags -->
 <p><sub>消息转发 &nbsp;&nbsp; 跨平台 &nbsp;&nbsp; 群聊桥接 &nbsp;&nbsp; 聊天 &nbsp;&nbsp; 消息 &nbsp;&nbsp; 同步 &nbsp;&nbsp; 转发 &nbsp;&nbsp; 过滤 &nbsp;&nbsp; 工具</sub></p>
 <p><strong>中文</strong> &nbsp;/&nbsp; <a href="README_en.md">English</a></p>
 </div>
@@ -567,20 +569,23 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 
 ```html
 <div align="center">
+<img src="logo.png" alt="Msg Forward Cc" width="160" />
 <h1>Msg Forward Cc</h1>
 <p><strong>Plugin description</strong></p>
+<!-- list only the plugin's headline features here (no fixed count; wording may be a variant of the metadata tags); the full tag list lives in metadata.yaml -->
 <p><sub>tag1 &nbsp;&nbsp; tag2 &nbsp;&nbsp; tag3</sub></p>
 <p><a href="README.md">中文</a> &nbsp;/&nbsp; <strong>English</strong></p>
 </div>
 ```
 
 命名规则：
+- **Logo**：头部第一行固定放插件图标 `<img src="logo.png" alt="插件名" width="160" />`——`logo.png` 与本 README 同目录、用相对路径引用（不写 GitHub raw 绝对链接、不复用 `metadata.yaml` 的远程图标地址）；`alt` 必填（中文版写 `display_name`，英文版写英文插件名），宽度固定 `160`，不加圆角 / 阴影等额外样式；中英两版都要有（本项目当前只有中文版，建立 `README_en.md` 时同步补）
 - **中文版 h1**：取 `metadata.yaml` 的 `display_name`（当前为「跨平台消息转发」）
 - **英文版 h1**：取插件名 `astrbot_plugin_xxx` 中 `xxx` 部分，拆分单词后每个首字母大写（`astrbot_plugin_msg_forward_cc` → `Msg Forward Cc`；若觉得不自然，建立英文版时可改用 `Message Forward`，并在 `README_en.md` 内保持一致）
 - **desc**：中文版用 `metadata.yaml` 的 `desc`；英文版做地道翻译
-- **tags**：取自 `metadata.yaml` 的 `tags`（若有），用 `&nbsp;&nbsp;` 分隔；中文版用中文标签、英文版用英文标签
+- **tags**：`metadata.yaml` 的 `tags` 是**全量关键词清单**（供市场分类与搜索），**不因为 README 头部放不下就删减**；并且**每个标签只放一个概念**——复合词要拆开（「消息转发」→「消息」「转发」，「状态检测」→「状态」「检测」），不写「A+B」式复合词、不写整句，这样一个词条能被独立检索命中。README 头部的 `<sub>` 行只挑**插件真正的重点功能**当标签，**数量不硬性限定**（重点少就两三个，重点多可多列），按重要性排序，用 `&nbsp;&nbsp;` 分隔；README 的标签**可以写成 `tags` 的变体**（措辞更短、更面向用户，允许复合短语，如「消息转发」对应 `tags` 里的「消息」「转发」），不必逐字照抄，但必须是插件真实具备、用户能感知的能力，**不虚构、不夸大**。中文版用中文标签，英文版用英文标签
 
-> 现状：本项目**当前只有中文版 `README.md`**，头部已是上面的居中式表头（无语言切换链接，因为 `README_en.md` 尚未建立）；建立英文版时按本节与 7.2.5 执行，并补上双向语言切换链接。
+> 现状：本项目**当前只有中文版 `README.md`**，头部已是上面的居中式表头（已含 `logo.png`，无语言切换链接，因为 `README_en.md` 尚未建立）；建立英文版时按本节与 7.2.5 执行，并补上双向语言切换链接。
 
 #### 7.2.3 README 四大结构
 
@@ -605,9 +610,10 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 
 **配置板块怎么写（板块三）**：
 
-- 配置少就不分类：**≤ 6 项**直接一张表，不为了对称硬拆小节。
+- **配置表是备查资料，不是配置入口**：用户在 WebUI 插件详情页的设置里直接改配置、改完即时生效，很少专门翻 README 找配置项——所以阈值放低（能折叠就折叠），说明列写短，只讲「这一项控制什么」。
+- 配置少就不分类：**≤ 4 项**直接一张表，不为了对称硬拆小节。
 - 更多就按类别分组：每类一个 `###` 子标题 + 该类一张表，顺序按用户上手顺序（基础 / 常用在前，进阶 / 排障在后）；分类要与 `_conf_schema.json` 的真实结构对得上（顶层 key 与 `object` 分组），不要写出 WebUI 里根本不存在的分组。
-- 某一类本身很长（单类 > 10 行）或属于纯参考内容（逐字段明细、平台对照表、模板变量）时，把该类整表包进 `<details>` 折叠，`<summary>` 自解释（类别名 + 项数）。
+- **单类 ≥ 4 项就折叠**（不必等到单类 > 10 行），或属于纯参考内容（逐字段明细、平台对照表、模板变量）时，把该类整表包进 `<details>` 折叠，`<summary>` 自解释（类别名 + 项数）。
 
 ```markdown
 <details>
@@ -714,7 +720,9 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - [ ] 日志：`logger.info/error/warning` + ❌/⚠️ emoji，新增 / 修改的日志带 `[astrbot_plugin_msg_forward_cc]` 前缀；异常分类记录；无空 catch
 - [ ] CHANGELOG：`[Unreleased]` 已追加分组式条目，**只写相对上一版的变化**、同一变化已合并为一条（无重复条目），条目面向用户（无内部实现细节、无复杂形容），保留了他人的既有记录（含扁平式历史条目）
 - [ ] README：涉及用户可见变更时已同步更新（4 大板块），且面向用户书写（无实现原理与内部细节）
-- [ ] README 配置板块：> 6 项时已按类别分组，长尾表用 `<details>` 折叠且 summary 自解释、关键配置没被藏进折叠
+- [ ] README 配置板块：> 4 项时已按类别分组，单类 ≥ 4 项已用 `<details>` 折叠且 summary 自解释，首次必填的关键配置没被藏进折叠（配置表是备查资料，宁折叠勿铺长）
+- [ ] README 头部：首行是 `<img src="logo.png" alt="插件名" width="160" />`（当前只有中文版，建立英文版时照此补），`alt` 已填，头部元素间无空行
+- [ ] 标签：`metadata.yaml` 的 `tags` 是全量关键词且**一个标签一个概念**（复合词已拆开，未因 README 只显示重点而删减）；README 头部只列插件真正的重点功能（数量不限，可为 `tags` 的变体，但不虚构能力）
 - [ ] README 安装：未新增分步「快速开始 / 安装」；版本与协议端仅在确有明确限制时才写，最低版本能明确时写进 `metadata.yaml` 的 `astrbot_version`
 - [ ] 许可证：本项目按 AGPL 派生关系保留 `LICENSE` 与 README 许可证说明（上游「许可证按需、README 不写许可证」不适用），且不新增其它许可证声明
 - [ ] 视图（改动或新增 `views/` 时，本项目当前无视图）：通信只走 bridge、脚本是外部 `type="module"`、拿 bridge 有兜底、未用 `localStorage` 与 `target="_blank"`、上传自限大小、标题已进 i18n 的 `views.<name>`
