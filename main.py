@@ -10,6 +10,7 @@ import tempfile
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable
+from html import unescape
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -436,6 +437,81 @@ class _ForwardNodes(Nodes):
         return payload
 
 
+# 聊天记录里内嵌的「聊天记录」卡片（QQ 合并转发卡片 XML：serviceID=35 / action=viewMultiMsg）
+_FORWARD_CARD_RESID_RE = re.compile(r'm_resid="([^"]*)"')
+_FORWARD_CARD_FILE_RE = re.compile(r'm_fileName="([^"]*)"')
+_FORWARD_CARD_COUNT_RE = re.compile(r'tSum="(\d+)"')
+_FORWARD_CARD_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S)
+_FORWARD_CARD_TAG_RE = re.compile(r"<[^>]+>")
+
+# 卡片里能带过去的内容只有 QQ 卡片本身显示的预览行（第一条 title 是记录名）
+_FORWARD_CARD_PREVIEW_MAX_LINES = 4
+_FORWARD_CARD_PREVIEW_MAX_CHARS = 80
+
+
+class _ForwardCardRef:
+    """聊天记录里待解析的「聊天记录」卡片占位。
+
+    节点内容是一张聊天记录卡片（XML `action=viewMultiMsg`）时，协议端只给卡片外壳：
+    标题、条数、预览行与两个资源句柄，**不含完整消息内容**。`m_resid` 有值时可以直接当
+    合并转发 resId 再拉一次；为空（记录被二次转发时很常见）时只能拿 `m_fileName` 试一次。
+    两者都取不到说明协议端与机器人账号都读不到这份内容，此时保留卡片的标题、条数与预览
+    行降级为文字占位——预览行是真实消息片段，是这份记录里唯一还能带过去的内容。"""
+
+    __slots__ = ("title", "count", "previews", "file_name", "resid")
+
+    def __init__(
+        self, title: str, count: int, previews: list[str], file_name: str, resid: str
+    ) -> None:
+        self.title = title
+        self.count = count
+        self.previews = previews
+        self.file_name = file_name
+        self.resid = resid
+
+
+def _forward_card_resid(raw: str) -> str:
+    """取「聊天记录」卡片 XML 里的 resId（非空时可直接当合并转发 id 用）。"""
+    match = _FORWARD_CARD_RESID_RE.search(raw or "")
+    return match.group(1).strip() if match else ""
+
+
+def _forward_card_line(raw: str, limit: int = _FORWARD_CARD_PREVIEW_MAX_CHARS) -> str:
+    """把卡片里的一段 `<title>` 归一化为单行文本（去标签、解实体、折叠空白、截断）。"""
+    text = " ".join(unescape(_FORWARD_CARD_TAG_RE.sub("", raw or "")).split())
+    return text[:limit] + "…" if len(text) > limit else text
+
+
+def _forward_card_ref(raw: str) -> _ForwardCardRef:
+    """解析「聊天记录」卡片 XML，返回带标题 / 条数 / 预览行 / 资源句柄的占位。
+
+    卡片里第一个 `<title size="34">` 是记录名，其后的 `<title size="26">` 是 QQ 卡片上
+    显示的预览行（真实消息片段），这两部分即这份记录对协议端可见的全部内容。"""
+    lines = [line for line in (_forward_card_line(t) for t in _FORWARD_CARD_TITLE_RE.findall(raw or "")) if line]
+    title = lines[0][:60] if lines else ""
+    count_match = _FORWARD_CARD_COUNT_RE.search(raw or "")
+    file_match = _FORWARD_CARD_FILE_RE.search(raw or "")
+    return _ForwardCardRef(
+        title=title,
+        count=int(count_match.group(1)) if count_match else 0,
+        previews=lines[1 : _FORWARD_CARD_PREVIEW_MAX_LINES + 1],
+        file_name=file_match.group(1).strip() if file_match else "",
+        resid=_forward_card_resid(raw),
+    )
+
+
+def _forward_card_text(card: _ForwardCardRef) -> str:
+    """把拉不到内容的聊天记录卡片渲染为文字占位（标题 + 条数 + 卡片自带的预览行）。"""
+    text = _FORWARD_PLACEHOLDER
+    if card.title:
+        text += f" {card.title}"
+    if card.count > 0:
+        text += f"（{card.count}条）"
+    if card.previews:
+        text += "\n" + "\n".join(f"· {line}" for line in card.previews)
+    return text
+
+
 def _sole_nested_forward(content: list[BaseMessageComponent]) -> Nodes | None:
     """节点内容只有一条合并转发时返回它。
 
@@ -645,6 +721,46 @@ def _nodes_without_nested(nodes: Nodes, *, card_preview_mode: str = _CARD_PREVIE
         ]
         rebuilt.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
     return _ForwardNodes(rebuilt, card_preview_mode=card_preview_mode)
+
+
+def _forward_card_resolver(
+    event,
+    *,
+    keep_time: bool,
+    depth: int,
+    card_preview_mode: str,
+    avatar_resolver: Callable[[str], Awaitable[dict]] | None,
+) -> Callable[[_ForwardCardRef], Awaitable[Nodes | None]]:
+    """构造「聊天记录卡片 → 真正的嵌套记录」解析器（先 resId，再资源文件名）。
+
+    两种句柄都拉不到时返回 None，由调用方保留卡片的标题与条数降级为文字占位。"""
+
+    async def _resolve(card: _ForwardCardRef) -> Nodes | None:
+        if depth < 0:
+            # 与 forward 段的层数上限保持一致：再展开一层就超出协议端的嵌套层数
+            return None
+        for handle in (card.resid, card.file_name):
+            if not handle:
+                continue
+            nested = await _fetch_forward_nodes(
+                event,
+                handle,
+                keep_time=keep_time,
+                depth=depth,
+                card_preview_mode=card_preview_mode,
+                avatar_resolver=avatar_resolver,
+                log_failure=False,
+            )
+            if nested is not None:
+                return nested
+        logger.debug(
+            f"[astrbot_plugin_msg_forward_cc] 聊天记录卡片内容取不到，保留标题占位："
+            f"{card.title or '(无标题)'}（{card.count}条，"
+            f"resid={card.resid[:12] or '空'}，file={card.file_name or '空'}）"
+        )
+        return None
+
+    return _resolve
 
 
 async def _expand_nested_forwards(
@@ -924,8 +1040,8 @@ def _forward_segment_to_components(seg) -> list:
     """把合并转发节点里的一个 OneBot 消息段转换为 AstrBot 组件。
 
     只重建目标端可安全发送的类型：At 转文本（历史内容里的 @ 不应触发目标群成员
-    解析）、嵌套合并转发与卡片转文本占位（AstrBot 无 Xml 组件，嵌套转发的内容也
-    无法从卡片中取得）。"""
+    解析）；内嵌的「聊天记录」卡片保留为待解析占位（AstrBot 无 Xml 组件，卡片里的
+    内容需要异步层再拉一次）；其它卡片转文本占位。"""
     if not isinstance(seg, dict):
         return []
     seg_type = str(seg.get("type") or "")
@@ -977,7 +1093,8 @@ def _forward_segment_to_components(seg) -> list:
     if seg_type == "xml":
         raw = str(data.get("data") or "")
         if "聊天记录" in raw or "viewMultiMsg" in raw:
-            return [Plain(text=_FORWARD_PLACEHOLDER)]
+            # 卡片只有标题与资源句柄：resid / m_fileName 由异步层再试一次能否拉到内容
+            return [_forward_card_ref(raw)]
         return [Plain(text="[卡片消息]")]
     if seg_type == "forward":
         # 带 resId 的嵌套聊天记录保留 Forward，交给 _expand_nested_forwards 递归展开
@@ -989,6 +1106,29 @@ def _forward_segment_to_components(seg) -> list:
     if seg_type == "mface":
         return [Plain(text="[表情]")]
     return []
+
+
+async def _resolve_forward_cards(
+    content: list,
+    resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None,
+) -> list:
+    """把节点内容里的「聊天记录」卡片占位换成嵌套记录（还原不了时保留标题与条数）。"""
+    resolved = []
+    for comp in content:
+        if not isinstance(comp, _ForwardCardRef):
+            resolved.append(comp)
+            continue
+        nested = None
+        if resolver is not None:
+            try:
+                nested = await resolver(comp)
+            except Exception as e:
+                # 协议端调用异常类型不确定，单张卡片失败不能拖垮整条转发的重建
+                logger.warning(
+                    f"⚠️ [astrbot_plugin_msg_forward_cc] 聊天记录卡片还原失败，保留标题占位：{e}"
+                )
+        resolved.append(nested if nested is not None else Plain(text=_forward_card_text(comp)))
+    return resolved
 
 
 def _forward_file_resolver(
@@ -1026,13 +1166,16 @@ async def _build_forward_nodes(
     keep_time: bool = True,
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     file_url_resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None = None,
+    card_resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None = None,
 ) -> _ForwardNodes | None:
     """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。
 
     keep_time=True 时把每条消息的原始发送时间写进 Node.time，由自定义序列化带给
     目标协议端；否则不携带时间（部分平台会统一显示为转发时的时间）。
     file_url_resolver 非空时用于把节点内只有 file_id 的群文件段换成下载直链
-    （入参为文件占位与节点来源群号），换不到时该文件降级为文字占位。"""
+    （入参为文件占位与节点来源群号），换不到时该文件降级为文字占位；
+    card_resolver 非空时用于把节点内的「聊天记录」卡片还原成真正的嵌套记录
+    （卡片只带标题与资源句柄、不含内容），还原不了时保留标题与条数降级为文字占位。"""
     nodes = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -1061,6 +1204,7 @@ async def _build_forward_nodes(
         for seg in segments:
             content.extend(_forward_segment_to_components(seg))
         content = await _resolve_forward_file_refs(content, file_url_resolver, node_group)
+        content = await _resolve_forward_cards(content, card_resolver)
         if not content:
             continue
         nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or ""), time=node_time))
@@ -1114,6 +1258,7 @@ async def _fetch_forward_nodes(
     depth: int = _FORWARD_MAX_DEPTH,
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
+    log_failure: bool = True,
 ) -> _ForwardNodes | None:
     """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 _ForwardNodes。
 
@@ -1124,7 +1269,8 @@ async def _fetch_forward_nodes(
 
     avatar_resolver 非空时用于按发送者昵称反查真实 QQ 号（见
     `_resolve_forward_sender_uins`），让目标 QQ 端显示每条消息发送者的真实头像；
-    为 None 表示直接沿用协议端返回的发送者信息。"""
+    为 None 表示直接沿用协议端返回的发送者信息；log_failure 为 False 时不打失败告警
+    （卡片兜底重试等「预期可能失败」的调用由调用方自己记日志）。"""
     forward_id = str(forward_id or "").strip()
     if not forward_id:
         return None
@@ -1160,11 +1306,23 @@ async def _fetch_forward_nodes(
         keep_time=keep_time,
         card_preview_mode=card_preview_mode,
         file_url_resolver=_forward_file_resolver(bot, event),
+        card_resolver=_forward_card_resolver(
+            event,
+            keep_time=keep_time,
+            depth=depth - 1,
+            card_preview_mode=card_preview_mode,
+            avatar_resolver=avatar_resolver,
+        ),
     )
     if nodes is None:
-        logger.warning(
-            f"⚠️ [astrbot_plugin_msg_forward_cc] 合并转发内容拉取失败或为空（{forward_id[:24]}…），将降级为文本占位：{last_error}"
-        )
+        if log_failure:
+            logger.warning(
+                f"⚠️ [astrbot_plugin_msg_forward_cc] 合并转发内容拉取失败或为空（{forward_id[:24]}…），将降级为文本占位：{last_error}"
+            )
+        else:
+            logger.debug(
+                f"[astrbot_plugin_msg_forward_cc] 合并转发内容拉取失败或为空（{forward_id[:24]}…）：{last_error}"
+            )
         return None
     logger.info(f"ℹ️ [astrbot_plugin_msg_forward_cc] 已展开合并转发：{len(nodes.nodes)} 条聊天记录")
     return await _expand_nested_forwards(
