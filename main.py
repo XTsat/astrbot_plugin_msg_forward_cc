@@ -399,8 +399,17 @@ _FORWARD_PLACEHOLDER = "[聊天记录]"
 # AstrBot 中可直接发送 Nodes（合并转发）的目标平台适配器类型
 _NODES_TARGET_PLATFORMS = {"aiocqhttp", "satori"}
 
-# 嵌套聊天记录最多再展开的层数（协议端合并转发上限 3 层，留一层余量）
+# 嵌套聊天记录最多再展开的层数默认值（配置 forward_max_depth 可覆盖）。
+# 语义：除最外层记录外还能再展开几层，2 = 合计 3 层。
+# QQ 系协议端（NapCat / SnowLuma）发送时只接受 3 层嵌套，填更大值会让整条转发被
+# 拒绝（forward nesting depth exceeds 3），故默认取 2；其它平台能接受更多层时可调大。
+# 另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层也会退化成 m_resid 为空的
+# 卡片（内容取不到），「再次转发」最多只能恢复 2 层，更深层由 _forward_card_text
+# 渲染成文字占位。
 _FORWARD_MAX_DEPTH = 2
+
+# 配置项 forward_max_depth 的允许上限（防御式钳制，避免异常值构造出超大嵌套）
+_FORWARD_MAX_DEPTH_LIMIT = 10
 
 # 合并转发卡片最多展示的预览行数（QQ 卡片模板上限）与单行正文最大长度
 _FORWARD_PREVIEW_MAX_LINES = 4
@@ -1473,14 +1482,15 @@ async def _expand_forward_components(
     keep_time: bool = True,
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
+    depth: int = _FORWARD_MAX_DEPTH,
 ) -> list:
     """把链中的合并转发组件统一展开为可跨会话发送的 _ForwardNodes。
 
     Forward 仅携带源会话 resId，需拉取内容重建；Node 包成 Nodes 以便统一发送；
     拉取失败时降级为文本占位，绝不透传无效的 forward 段（目标端只会显示坏卡片）。
     keep_time 控制是否保留聊天记录里每条消息的原始发送时间；card_preview_mode
-    控制卡片预览行的展示方式（仅标题 / 来源 + 标题 / 不显示）；avatar_resolver
-    见 `_fetch_forward_nodes`。"""
+    控制卡片预览行的展示方式（仅标题 / 来源 + 标题 / 不显示）；depth 是嵌套记录最多
+    再展开的层数（配置 forward_max_depth）；avatar_resolver 见 `_fetch_forward_nodes`。"""
     if not chain:
         return chain
     expanded = []
@@ -1490,6 +1500,7 @@ async def _expand_forward_components(
                 event,
                 getattr(comp, "id", ""),
                 keep_time=keep_time,
+                depth=depth,
                 card_preview_mode=card_preview_mode,
                 avatar_resolver=avatar_resolver,
             )
@@ -4100,6 +4111,19 @@ class MsgForward(star.Star):
         title=仅显示卡片标题；off=统一显示「[卡片消息]」；非法值回退 source。"""
         return _normalize_card_preview_mode(self.config.get("forward_card_preview", "source"))
 
+    def _forward_max_depth(self) -> int:
+        """聊天记录嵌套最多再展开几层（配置 forward_max_depth，默认 2）。
+
+        值即「除最外层记录外还能再展开几层」，所以 2 对应合计 3 层。QQ 系协议端发送时
+        只接受 3 层嵌套，填更大值会让整条转发被协议端拒绝（forward nesting depth
+        exceeds 3）；其它平台能接受更多层时可以调大。非法值回退默认值并钳制到 0~10。"""
+        val = self.config.get("forward_max_depth", _FORWARD_MAX_DEPTH)
+        try:
+            depth = int(val)
+        except (TypeError, ValueError):
+            return _FORWARD_MAX_DEPTH
+        return max(0, min(depth, _FORWARD_MAX_DEPTH_LIMIT))
+
     def _forward_avatar_enabled(self) -> bool:
         """转发聊天记录时是否按发送者昵称反查真实 QQ 号（用于显示真实头像）。
 
@@ -4603,6 +4627,7 @@ class MsgForward(star.Star):
                 keep_time=keep_forward_time,
                 card_preview_mode=card_preview_mode,
                 avatar_resolver=avatar_resolver,
+                depth=self._forward_max_depth(),
             )
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
