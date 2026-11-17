@@ -81,6 +81,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 - `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`；同时携带 `news` 预览行，避免协议端把嵌套聊天记录显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`（`news` 为 NapCat / SnowLuma 等 OneBot 实现的扩展参数，不支持的实现会忽略）；`card_preview_mode` 字段由配置 `forward_card_preview` 决定，控制预览行的卡片展示方式——`source` 来源 + 标题（默认，保留原始 `prompt` 的来源前缀）/ `title` 仅标题 / `off` 统一「[卡片消息]」
 - `_sole_nested_forward(content)` / `_nodes_without_nested(nodes, card_preview_mode=_CARD_PREVIEW_TITLE)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
 - `_FORWARD_CARD_RESID_RE` / `_FORWARD_CARD_FILE_RE` / `_FORWARD_CARD_COUNT_RE` / `_FORWARD_CARD_TITLE_RE` / `_FORWARD_CARD_TAG_RE` / `_FORWARD_CARD_PREVIEW_MAX_LINES` / `_FORWARD_CARD_PREVIEW_MAX_CHARS`：从「聊天记录」卡片 XML 里取 resId、资源文件名、条数、标题预览行与去标签用的正则，以及预览行最多保留的条数（4）/ 单行截断长度（80）
+- `_RawXmlCard(BaseMessageComponent)`：原样保留的「聊天记录」卡片（AstrBot 无 Xml 组件，卡片外壳无法用 Json 表达）。覆写 `toDict()` 返回 `{"type": "xml", "data": {"data": <原始 XML>}}`，aiocqhttp 适配器对未知组件正是调它，因此能把卡片原样发出、保住外观与条数。由配置 `forward_rebuild_card` 决定是否启用（默认关闭即走这条路）
 - `_ForwardCardRef` / `_forward_card_ref(raw)` / `_forward_card_resid(raw)` / `_forward_card_line(raw)` / `_forward_card_text(card)`：记录内嵌「聊天记录」卡片（XML `action=viewMultiMsg`）的占位与解析——卡片只有标题 / 条数 / QQ 卡片显示的预览行 / 两个资源句柄，不含完整内容；`_forward_card_line` 把一段 `<title>` 归一化为单行（去标签、解实体、折叠空白、截断）；`_forward_card_text` 在内容取不到时渲染成「`[聊天记录] 标题（N条）` + 最多 4 行 `· 预览行`」——预览行是卡片里唯一的真实消息片段，是这份记录唯一还能带过去的内容
 - `_forward_card_resolver(event, *, keep_time, depth, card_preview_mode, avatar_resolver)`：构造「卡片 → 真正的嵌套记录」解析器（先 `m_resid` 再 `m_fileName` 各试一次 `get_forward_msg`），层数超限（`depth < 0`）或两种句柄都拉不到时返回 None 由调用方降级
 - `_resolve_forward_cards(content, resolver)`：把节点内容里残留的 `_ForwardCardRef` 换成还原出的嵌套记录，还原不了则换成 `_forward_card_text` 文字占位（异常只影响这一张卡片）
@@ -268,6 +269,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
 | [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；**仅当整条记录的发送者 QQ 号已被协议端抹平时才改写**（记录自带不同真实 QQ 号则整条跳过，避免把正确值改错）；发送者不在机器人所在的群 / 昵称重名 / 已改名时改不了，这些消息取不到头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
 | 聊天记录嵌套展开层数 | `forward_max_depth` | int, 2 | 记录里再套的记录最多再展开几层（`2`=合计 3 层）。QQ 系协议端（NapCat / SnowLuma）发送时最多接受 3 层，填更大值会导致整条转发被拒（`forward nesting depth exceeds 3`）；其它平台能接受更多层时可调大，超过 10 会被钳制。另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层会退化成无 `m_resid` 的卡片，再转发最多只能恢复 2 层 |
+| 聊天记录内嵌卡片保留原样 | `forward_rebuild_card` | bool, false | 关闭（默认）时聊天记录里再套的卡片按原样（xml 段）转发，保住卡片外观、标题与条数；开启后尝试拉取内容还原成真正的聊天记录，取不到则降级为「[聊天记录] 标题（N条）」文字。QQ 在二次转发时会把内层记录降级成只有 `m_fileName` 的卡片，此时重建必然只能得到文字，原样转发是更好的选择 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/command/image/face/record/video/file/at/other，默认除 `command`（指令）外全选 |
 | [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
@@ -310,7 +312,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
 - 只读已知字段、丢弃未知字段：`settings = {k: self.config.get(k, v) for k, v in DEFAULT_SETTINGS.items()}`（本项目的配置读取分散在多个专有方法里，规则级字段逐个走下方列出的解析方法，不做整体重写）
-- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_forward_max_depth()`（`forward_max_depth`，钳制 0~10）、`_forward_rebuild_card()`（`forward_rebuild_card`，默认 false = 卡片原样转发）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
 - 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`；内容类型走模块级 `_content_types_for(rule, config)`
 
 ---

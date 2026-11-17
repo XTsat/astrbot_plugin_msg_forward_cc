@@ -21,7 +21,8 @@ from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
 from astrbot.core.message.components import (
-    At, BaseMessageComponent, Plain, Image, Record, Video, File, Face, Forward, Json, Node, Nodes,
+    At, BaseMessageComponent, ComponentType, Plain, Image, Record, Video, File, Face, Forward,
+    Json, Node, Nodes,
 )
 from astrbot.core.message.message_event_result import MessageEventResult
 
@@ -458,6 +459,24 @@ _FORWARD_CARD_PREVIEW_MAX_LINES = 4
 _FORWARD_CARD_PREVIEW_MAX_CHARS = 80
 
 
+class _RawXmlCard(BaseMessageComponent):
+    """原样保留的「聊天记录」卡片（XML 段）。
+
+    AstrBot 没有 Xml 组件，卡片外壳无法用 Json 表达；而重建内容又常常取不到（QQ 在二次
+    转发时会把内层记录降级成只有 `m_fileName` 的卡片）。此时把原始 XML 原样发出去，至少
+    能保住卡片外观、标题与条数——接收方点开能否看到内容取决于服务端是否还留有该记录。
+    覆写 `toDict` 是因为 aiocqhttp 适配器对未知组件正是调它。"""
+
+    type: ComponentType = ComponentType.Unknown
+    raw: str
+
+    def __init__(self, raw: str, **kwargs) -> None:
+        super().__init__(raw=raw, **kwargs)
+
+    def toDict(self) -> dict:
+        return {"type": "xml", "data": {"data": self.raw}}
+
+
 class _ForwardCardRef:
     """聊天记录里待解析的「聊天记录」卡片占位。
 
@@ -783,6 +802,7 @@ async def _expand_nested_forwards(
     depth: int,
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
+    rebuild_card: bool = False,
 ) -> _ForwardNodes:
     """递归展开节点内嵌套的聊天记录；层数超限或拉取失败时降级为文本占位。"""
     if depth <= 0:
@@ -803,6 +823,7 @@ async def _expand_nested_forwards(
                     depth=depth - 1,
                     card_preview_mode=card_preview_mode,
                     avatar_resolver=avatar_resolver,
+                    rebuild_card=rebuild_card,
                 )
                 if nested_id
                 else None
@@ -1062,12 +1083,13 @@ async def _resolve_group_file_url(
     return url if url.startswith(("http://", "https://")) else None
 
 
-def _forward_segment_to_components(seg) -> list:
+def _forward_segment_to_components(seg, *, rebuild_card: bool = False) -> list:
     """把合并转发节点里的一个 OneBot 消息段转换为 AstrBot 组件。
 
     只重建目标端可安全发送的类型：At 转文本（历史内容里的 @ 不应触发目标群成员
-    解析）；内嵌的「聊天记录」卡片保留为待解析占位（AstrBot 无 Xml 组件，卡片里的
-    内容需要异步层再拉一次）；其它卡片转文本占位。"""
+    解析）；内嵌的「聊天记录」卡片默认按原样保留为 xml 段（`rebuild_card=False`），
+    开启后保留为待解析占位、由异步层再拉一次内容（AstrBot 无 Xml 组件）；其它卡片
+    转文本占位。"""
     if not isinstance(seg, dict):
         return []
     seg_type = str(seg.get("type") or "")
@@ -1142,7 +1164,11 @@ def _forward_segment_to_components(seg) -> list:
     if seg_type == "xml":
         raw = str(data.get("data") or "")
         if "聊天记录" in raw or "viewMultiMsg" in raw:
-            # 卡片只有标题与资源句柄：resid / m_fileName 由异步层再试一次能否拉到内容
+            # 默认原样保留卡片外壳：内容往往已被服务端丢弃，重建只能得到文字占位，
+            # 而原样转发至少保住卡片外观、标题与条数
+            if not rebuild_card:
+                return [_RawXmlCard(raw)]
+            # 开启重建：卡片只有标题与资源句柄，resid / m_fileName 由异步层再试一次
             return [_forward_card_ref(raw)]
         return [Plain(text="[卡片消息]")]
     if seg_type == "forward":
@@ -1223,6 +1249,7 @@ async def _build_forward_nodes(
     card_resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None = None,
     depth: int = _FORWARD_MAX_DEPTH,
     event=None,
+    rebuild_card: bool = False,
 ) -> _ForwardNodes | None:
     """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。
 
@@ -1267,7 +1294,7 @@ async def _build_forward_nodes(
             continue
         content = []
         for seg in segments:
-            content.extend(_forward_segment_to_components(seg))
+            content.extend(_forward_segment_to_components(seg, rebuild_card=rebuild_card))
         content = await _resolve_forward_file_refs(content, file_url_resolver, node_group)
         content = await _resolve_forward_cards(content, card_resolver)
         content = await _resolve_forward_inline_refs(
@@ -1279,6 +1306,7 @@ async def _build_forward_nodes(
                 card_preview_mode=card_preview_mode,
                 file_url_resolver=file_url_resolver,
                 card_resolver=card_resolver,
+                rebuild_card=rebuild_card,
             ),
         )
         if not content:
@@ -1295,6 +1323,7 @@ def _forward_inline_resolver(
     card_preview_mode: str,
     file_url_resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None,
     card_resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None,
+    rebuild_card: bool = False,
 ) -> Callable[[_ForwardInlineRef], Awaitable[Nodes | None]]:
     """构造「内联嵌套记录 → 重建后的 Nodes」解析器（层数超限时返回 None 由调用方降级）。
 
@@ -1312,6 +1341,7 @@ def _forward_inline_resolver(
             card_resolver=card_resolver,
             depth=depth - 1,
             event=event,
+            rebuild_card=rebuild_card,
         )
         if nested is None or event is None:
             return nested
@@ -1321,6 +1351,7 @@ def _forward_inline_resolver(
             keep_time=keep_time,
             depth=depth - 1,
             card_preview_mode=card_preview_mode,
+            rebuild_card=rebuild_card,
         )
 
     return _resolve
@@ -1397,6 +1428,7 @@ async def _fetch_forward_nodes(
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
     log_failure: bool = True,
+    rebuild_card: bool = False,
 ) -> _ForwardNodes | None:
     """通过 get_forward_msg 拉取合并转发内容，重建为可重新上传的 _ForwardNodes。
 
@@ -1453,6 +1485,7 @@ async def _fetch_forward_nodes(
         ),
         depth=depth,
         event=event,
+        rebuild_card=rebuild_card,
     )
     if nodes is None:
         if log_failure:
@@ -1472,6 +1505,7 @@ async def _fetch_forward_nodes(
         depth=depth,
         card_preview_mode=card_preview_mode,
         avatar_resolver=avatar_resolver,
+        rebuild_card=rebuild_card,
     )
 
 
@@ -1483,6 +1517,7 @@ async def _expand_forward_components(
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     avatar_resolver: Callable[[str], Awaitable[dict]] | None = None,
     depth: int = _FORWARD_MAX_DEPTH,
+    rebuild_card: bool = False,
 ) -> list:
     """把链中的合并转发组件统一展开为可跨会话发送的 _ForwardNodes。
 
@@ -1503,6 +1538,7 @@ async def _expand_forward_components(
                 depth=depth,
                 card_preview_mode=card_preview_mode,
                 avatar_resolver=avatar_resolver,
+                rebuild_card=rebuild_card,
             )
             expanded.append(nodes if nodes is not None else Plain(text=_FORWARD_PLACEHOLDER))
         elif isinstance(comp, Node):
@@ -4124,6 +4160,17 @@ class MsgForward(star.Star):
             return _FORWARD_MAX_DEPTH
         return max(0, min(depth, _FORWARD_MAX_DEPTH_LIMIT))
 
+    def _forward_rebuild_card(self) -> bool:
+        """是否尝试重建聊天记录里内嵌的卡片（配置 forward_rebuild_card，默认关闭）。
+
+        关闭时卡片按原样（xml 段）转发：QQ 在二次转发时常把内层记录降级成只剩
+        `m_fileName` 的卡片，此时重建只能得到文字占位，原样转发至少保住卡片外观与条数。
+        开启后按老逻辑拉取内容还原成真正的聊天记录，取不到再降级为文字。"""
+        val = self.config.get("forward_rebuild_card", False)
+        if isinstance(val, str):
+            return val.strip().lower() in ("true", "1", "on", "yes")
+        return bool(val)
+
     def _forward_avatar_enabled(self) -> bool:
         """转发聊天记录时是否按发送者昵称反查真实 QQ 号（用于显示真实头像）。
 
@@ -4628,6 +4675,7 @@ class MsgForward(star.Star):
                 card_preview_mode=card_preview_mode,
                 avatar_resolver=avatar_resolver,
                 depth=self._forward_max_depth(),
+                rebuild_card=self._forward_rebuild_card(),
             )
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
