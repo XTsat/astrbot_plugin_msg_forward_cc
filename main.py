@@ -2469,7 +2469,7 @@ class MsgForward(star.Star):
         if isinstance(old_map, dict) and old_map:
             platform_names_raw = [f"{k}={v}" for k, v in old_map.items()]
         else:
-            platform_names_raw = self.config.get("platform_names", []) or []
+            platform_names_raw = self._conf_get("platform_names", []) or []
 
         # 解析为 dict
         platform_map = {}
@@ -2489,7 +2489,7 @@ class MsgForward(star.Star):
             msg_type_human = "未知类型"
 
         # 使用配置中的模板
-        template = self.config.get("header_template", "").strip()
+        template = self._conf_get("header_template", "").strip()
         if template:
             header = template.format(
                 sender_name=sender_name,
@@ -2662,7 +2662,7 @@ class MsgForward(star.Star):
         try:
             target_umo = str(event.unified_msg_origin)
             source_umo = self.store.pop_pending(code)
-            hide_header = self.config.get("default_hide_header", False)
+            hide_header = self._conf_get("default_hide_header", False)
 
             idx = self._add_rule(source_umo, target_umo, hide_header)
             yield event.plain_result(f"✅ 已绑定 #{idx}\n{source_umo} → {target_umo}")
@@ -2720,7 +2720,7 @@ class MsgForward(star.Star):
                 return
             source_umo = build_umo(src_plat, src_id)
             target_umo = build_umo(dst_plat, dst_id)
-            hide_header = self.config.get("default_hide_header", False)
+            hide_header = self._conf_get("default_hide_header", False)
 
             idx = self._add_rule(source_umo, target_umo, hide_header)
             yield event.plain_result(f"✅ 已绑定 #{idx}\n{source_umo} → {target_umo}")
@@ -2880,7 +2880,7 @@ class MsgForward(star.Star):
         args = (args or "").strip()
         # 无参数：查看当前冷却配置
         if not args:
-            default_cd = int(self.config.get("default_cooldown_seconds", 0) or 0)
+            default_cd = int(self._conf_get("default_cooldown_seconds", 0) or 0)
             lines = [f"📋 转发冷却：全局默认 ❄{default_cd}s" if default_cd > 0 else "📋 转发冷却：全局默认 ❄关闭"]
             rules = self.config.get("rules", [])
             has_per_rule = False
@@ -2912,7 +2912,7 @@ class MsgForward(star.Star):
             except ValueError:
                 yield event.plain_result("❌ 用法：/mf cooldown default <秒>（非负整数）")
                 return
-            self.config["default_cooldown_seconds"] = val
+            self._conf_set("default_cooldown_seconds", val)
             self.config.save_config()
             desc = f"❄{val}s" if val > 0 else "❄关闭"
             yield event.plain_result(f"✅ 全局默认冷却已设为 {desc}")
@@ -2927,7 +2927,7 @@ class MsgForward(star.Star):
             except ValueError:
                 yield event.plain_result("❌ 用法：/mf cooldown default <秒> 设全局默认；/mf cooldown <编号> <秒|inherit> 设规则级")
                 return
-            self.config["default_cooldown_seconds"] = val
+            self._conf_set("default_cooldown_seconds", val)
             self.config.save_config()
             desc = f"❄{val}s" if val > 0 else "❄关闭"
             yield event.plain_result(f"✅ 全局默认冷却已设为 {desc}")
@@ -3043,7 +3043,7 @@ class MsgForward(star.Star):
             if types is None:
                 yield event.plain_result(err)
                 return
-            self.config["default_content_types"] = [k for k in CONTENT_TYPES if k in types]
+            self._conf_set("default_content_types", [k for k in CONTENT_TYPES if k in types])
             self.config.save_config()
             yield event.plain_result(f"✅ 全局默认内容类型已设为：{self._content_types_text(types)}")
             return
@@ -3099,8 +3099,8 @@ class MsgForward(star.Star):
     @mf.command("filter")
     async def cmd_filter_list(self, event: AstrMessageEvent):
         """查看当前的过滤配置（含指令处理方式，只读）"""
-        filter_mode = self.config.get("filter_mode", "off")
-        patterns_data = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
+        filter_mode = self._conf_get("filter_mode", "off")
+        patterns_data = MsgForward._unwrap_patterns(self._conf_get("filter_patterns"))
 
         mode_text = {"off": "关闭", "blacklist": "黑名单", "whitelist": "白名单"}.get(filter_mode, filter_mode)
         lines = [f"📋 全局过滤：{mode_text}" + (f"（共 {len(patterns_data)} 条）" if patterns_data else "")]
@@ -3142,7 +3142,7 @@ class MsgForward(star.Star):
             lines.append("（所有规则使用全局过滤配置）")
 
         # 显示冷却配置
-        default_cd = self.config.get("default_cooldown_seconds", 0)
+        default_cd = self._conf_get("default_cooldown_seconds", 0)
         cd_desc = f"{default_cd}s" if int(default_cd) > 0 else "关闭"
         lines.append(f"\n📋 转发冷却：全局默认 ❄{cd_desc}")
         for idx, r in enumerate(rules, start=1):
@@ -3159,8 +3159,8 @@ class MsgForward(star.Star):
                 lines.append(f"  #{idx} | {self._rule_name(r)} | ❄关闭")
 
         # 用户黑白名单摘要（按发送者过滤，详细配置用 /mf sender）
-        g_sender_mode = _sender_filter_mode(self.config.get("sender_filter_mode", "off"))
-        g_sender_entries = _unwrap_sender_entries(self.config.get("sender_filter_list"))
+        g_sender_mode = _sender_filter_mode(self._conf_get("sender_filter_mode", "off"))
+        g_sender_entries = _unwrap_sender_entries(self._conf_get("sender_filter_list"))
         lines.append(
             f"\n👤 用户黑白名单：{_SENDER_FILTER_MODE_TEXT[g_sender_mode]}"
             + (f"（{len(g_sender_entries)} 人）" if g_sender_entries else "")
@@ -3191,8 +3191,8 @@ class MsgForward(star.Star):
 
     def _sender_view_text(self) -> str:
         """生成用户黑白名单配置的展示文本（全局 + 规则级覆盖）。"""
-        g_mode = _sender_filter_mode(self.config.get("sender_filter_mode", "off"))
-        g_entries = _unwrap_sender_entries(self.config.get("sender_filter_list"))
+        g_mode = _sender_filter_mode(self._conf_get("sender_filter_mode", "off"))
+        g_entries = _unwrap_sender_entries(self._conf_get("sender_filter_list"))
         head = f"👤 用户黑白名单（按消息发送者过滤）：全局 {_SENDER_FILTER_MODE_TEXT[g_mode]}"
         lines = [head + (f"｜{len(g_entries)} 人" if g_entries else "")]
         if g_entries:
@@ -3331,10 +3331,10 @@ class MsgForward(star.Star):
     @queue.command("status")
     async def cmd_queue_status(self, event: AstrMessageEvent):
         """查看发送队列状态与配置"""
-        enabled = bool(self.config.get("queue_enabled", False))
-        default_qi = int(self.config.get("default_queue_interval_seconds", 0) or 0)
-        max_size = int(self.config.get("queue_max_size", 0) or 0)
-        retention = int(self.config.get("queue_media_retention_hours", 0) or 0)
+        enabled = bool(self._conf_get("queue_enabled", False))
+        default_qi = int(self._conf_get("default_queue_interval_seconds", 0) or 0)
+        max_size = int(self._conf_get("queue_max_size", 0) or 0)
+        retention = int(self._conf_get("queue_media_retention_hours", 0) or 0)
         if retention <= 0:
             retention = 24
         pending = self._queue_total_size()
@@ -3368,7 +3368,7 @@ class MsgForward(star.Star):
     @queue.command("on")
     async def cmd_queue_on(self, event: AstrMessageEvent):
         """启用发送队列总开关"""
-        self.config["queue_enabled"] = True
+        self._conf_set("queue_enabled", True)
         self.config.save_config()
         yield event.plain_result("✅ 发送队列已启用")
 
@@ -3376,7 +3376,7 @@ class MsgForward(star.Star):
     @queue.command("off")
     async def cmd_queue_off(self, event: AstrMessageEvent):
         """停用发送队列总开关"""
-        self.config["queue_enabled"] = False
+        self._conf_set("queue_enabled", False)
         self.config.save_config()
         yield event.plain_result("✅ 发送队列已停用（规则设置的间隔将不再生效）")
 
@@ -3391,7 +3391,7 @@ class MsgForward(star.Star):
         except ValueError:
             yield event.plain_result("❌ 间隔必须是非负整数（秒），如 /mf queue interval 5")
             return
-        self.config["default_queue_interval_seconds"] = val
+        self._conf_set("default_queue_interval_seconds", val)
         self.config.save_config()
         desc = f"⏳{val}s" if val > 0 else "关闭"
         yield event.plain_result(f"✅ 全局默认队列间隔已设为 {desc}")
@@ -3437,7 +3437,7 @@ class MsgForward(star.Star):
             except ValueError:
                 yield event.plain_result("❌ 用法：/mf queue maxsize default <条数>（非负整数）")
                 return
-            self.config["queue_max_size"] = val
+            self._conf_set("queue_max_size", val)
             self.config.save_config()
             desc = "不限制" if val == 0 else f"{val} 条"
             yield event.plain_result(f"✅ 发送队列总上限已设为 {desc}")
@@ -3455,7 +3455,7 @@ class MsgForward(star.Star):
                     "/mf queue maxsize <编号> <条数|inherit>（规则级）"
                 )
                 return
-            self.config["queue_max_size"] = val
+            self._conf_set("queue_max_size", val)
             self.config.save_config()
             desc = "不限制" if val == 0 else f"{val} 条"
             yield event.plain_result(f"✅ 发送队列总上限已设为 {desc}")
@@ -3500,7 +3500,7 @@ class MsgForward(star.Star):
         except ValueError:
             yield event.plain_result("❌ 保留时长必须是非负整数（小时），如 /mf queue retention 48")
             return
-        self.config["queue_media_retention_hours"] = val
+        self._conf_set("queue_media_retention_hours", val)
         self.config.save_config()
         desc = f"{val} 小时" if val > 0 else "默认 24 小时"
         yield event.plain_result(f"✅ 队列媒体缓存保留时长已设为 {desc}")
@@ -3740,12 +3740,12 @@ class MsgForward(star.Star):
             if val == "false":
                 return False
             # "inherit" 或其他值 → 继承全局
-        return bool(self.config.get("at_nickname_lookup", False))
+        return bool(self._conf_get("at_nickname_lookup", False))
 
     def _at_lookup_ttl(self) -> int:
         """群成员列表缓存有效期（秒），0 表示每次都重新拉取；默认 300 秒。"""
         try:
-            ttl = int(self.config.get("at_nickname_lookup_cache_ttl", 300) or 0)
+            ttl = int(self._conf_get("at_nickname_lookup_cache_ttl", 300) or 0)
         except (TypeError, ValueError):
             ttl = 300
         return max(ttl, 0)
@@ -4049,15 +4049,15 @@ class MsgForward(star.Star):
         if rule:
             fm = rule.get("filter_mode", "inherit")
             if fm == "inherit":
-                fm = self.config.get("filter_mode", "off")
+                fm = self._conf_get("filter_mode", "off")
             rfp = rule.get("filter_patterns")
             if rfp and len(rfp) > 0:
                 fp = rfp
             else:
-                fp = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
+                fp = MsgForward._unwrap_patterns(self._conf_get("filter_patterns"))
         else:
-            fm = self.config.get("filter_mode", "off")
-            fp = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
+            fm = self._conf_get("filter_mode", "off")
+            fp = MsgForward._unwrap_patterns(self._conf_get("filter_patterns"))
 
         if fm == "off":
             return True
@@ -4138,14 +4138,67 @@ class MsgForward(star.Star):
             if val == "false":
                 return False
             # "inherit" 或其他值 → 继承全局
-        return bool(self.config.get("download_media_before_send", False))
+        return bool(self._conf_get("download_media_before_send", False))
+
+    # 配置分组：扁平 key → (分组名, 组内 key)。schema 改为 object 分组后配置变成
+    # 嵌套结构，读写必须走分组路径；此处集中映射，避免散落的 config 访问各写一遍。
+    _CONFIG_GROUPS: dict[str, tuple[str, str]] = {
+        "default_hide_header": ("basic", "default_hide_header"),
+        "header_template": ("basic", "header_template"),
+        "default_content_types": ("basic", "default_content_types"),
+        "forward_keep_time": ("forward", "forward_keep_time"),
+        "forward_node_avatar": ("forward", "forward_node_avatar"),
+        "forward_card_preview": ("forward", "forward_card_preview"),
+        "forward_max_depth": ("forward", "forward_max_depth"),
+        "forward_rebuild_card": ("forward", "forward_rebuild_card"),
+        "filter_mode": ("filter", "filter_mode"),
+        "filter_patterns": ("filter", "filter_patterns"),
+        "sender_filter_mode": ("filter", "sender_filter_mode"),
+        "sender_filter_list": ("filter", "sender_filter_list"),
+        "queue_enabled": ("queue", "queue_enabled"),
+        "default_queue_interval_seconds": ("queue", "default_queue_interval_seconds"),
+        "default_cooldown_seconds": ("queue", "default_cooldown_seconds"),
+        "queue_max_size": ("queue", "queue_max_size"),
+        "queue_media_retention_hours": ("queue", "queue_media_retention_hours"),
+        "download_media_before_send": ("media", "download_media_before_send"),
+        "at_nickname_lookup": ("at", "at_nickname_lookup"),
+        "at_nickname_lookup_cache_ttl": ("at", "at_nickname_lookup_cache_ttl"),
+        "at_passthrough_extra_platforms": ("at", "at_passthrough_extra_platforms"),
+        "platform_names": ("platform", "platform_names"),
+    }
+
+    def _conf_get(self, key: str, default=None):
+        """读取配置项（兼容分组结构与旧扁平结构）。
+
+        schema 使用 object 分组后配置为嵌套 dict；旧配置或迁移未完成时仍是扁平键，
+        两种情况都要能读到，避免升级后配置整体失效。"""
+        group = self._CONFIG_GROUPS.get(key)
+        if group:
+            gname, gkey = group
+            section = self.config.get(gname)
+            if isinstance(section, dict) and gkey in section:
+                return section[gkey]
+        return self.config.get(key, default)
+
+    def _conf_set(self, key: str, value) -> None:
+        """写入配置项（分组结构写入对应分组；旧扁平结构退回顶层写入）。"""
+        group = self._CONFIG_GROUPS.get(key)
+        if group:
+            gname, gkey = group
+            section = self.config.get(gname)
+            if not isinstance(section, dict):
+                section = {}
+                self.config[gname] = section
+            section[gkey] = value
+            return
+        self.config[key] = value
 
     def _card_preview_mode(self) -> str:
         """聊天记录卡片预览模式（配置 forward_card_preview）。
 
         source=显示卡片原本传递的预览文本（保留「[QQ小程序]」等来源前缀，默认）；
         title=仅显示卡片标题；off=统一显示「[卡片消息]」；非法值回退 source。"""
-        return _normalize_card_preview_mode(self.config.get("forward_card_preview", "source"))
+        return _normalize_card_preview_mode(self._conf_get("forward_card_preview", "source"))
 
     def _forward_max_depth(self) -> int:
         """聊天记录嵌套最多再展开几层（配置 forward_max_depth，默认 2）。
@@ -4153,7 +4206,7 @@ class MsgForward(star.Star):
         值即「除最外层记录外还能再展开几层」，所以 2 对应合计 3 层。QQ 系协议端发送时
         只接受 3 层嵌套，填更大值会让整条转发被协议端拒绝（forward nesting depth
         exceeds 3）；其它平台能接受更多层时可以调大。非法值回退默认值并钳制到 0~10。"""
-        val = self.config.get("forward_max_depth", _FORWARD_MAX_DEPTH)
+        val = self._conf_get("forward_max_depth", _FORWARD_MAX_DEPTH)
         try:
             depth = int(val)
         except (TypeError, ValueError):
@@ -4166,7 +4219,7 @@ class MsgForward(star.Star):
         关闭时卡片按原样（xml 段）转发：QQ 在二次转发时常把内层记录降级成只剩
         `m_fileName` 的卡片，此时重建只能得到文字占位，原样转发至少保住卡片外观与条数。
         开启后按老逻辑拉取内容还原成真正的聊天记录，取不到再降级为文字。"""
-        val = self.config.get("forward_rebuild_card", False)
+        val = self._conf_get("forward_rebuild_card", False)
         if isinstance(val, str):
             return val.strip().lower() in ("true", "1", "on", "yes")
         return bool(val)
@@ -4176,7 +4229,7 @@ class MsgForward(star.Star):
 
         配置 forward_node_avatar 默认开启；关闭后直接沿用协议端返回的发送者信息，
         不再为反查额外拉取群成员列表。"""
-        val = self.config.get("forward_node_avatar", True)
+        val = self._conf_get("forward_node_avatar", True)
         if isinstance(val, str):
             return val.strip().lower() not in ("false", "0", "off", "no")
         return bool(val)
@@ -4188,7 +4241,7 @@ class MsgForward(star.Star):
         显式设置为 0 时关闭队列（立即转发），语义与冷却字段一致。"""
         val = rule.get("queue_interval_seconds")
         if val is None:
-            val = self.config.get("default_queue_interval_seconds", 0)
+            val = self._conf_get("default_queue_interval_seconds", 0)
         try:
             return int(val) if val else 0
         except (TypeError, ValueError):
@@ -4201,7 +4254,7 @@ class MsgForward(star.Star):
         显式设置为 0 时关闭本规则冷却，语义与 queue_interval_seconds 一致。"""
         val = rule.get("cooldown_seconds")
         if val is None:
-            val = self.config.get("default_cooldown_seconds", 0)
+            val = self._conf_get("default_cooldown_seconds", 0)
         try:
             return max(int(val) if val else 0, 0)
         except (TypeError, ValueError):
@@ -4214,12 +4267,12 @@ class MsgForward(star.Star):
         后台 worker 也不读冷却表——此时只有队列间隔在限流。
         仅当总开关开启且规则实际处于队列模式（间隔 > 0）时成立；总开关关闭时
         队列间隔被强制置 0，冷却仍正常生效。"""
-        return self._queue_interval_for(rule) > 0 and bool(self.config.get("queue_enabled", False))
+        return self._queue_interval_for(rule) > 0 and bool(self._conf_get("queue_enabled", False))
 
     def _queue_global_max(self) -> int:
         """全局发送队列总上限（所有规则合计积压条数），0=不限制。"""
         try:
-            return max(int(self.config.get("queue_max_size", 0) or 0), 0)
+            return max(int(self._conf_get("queue_max_size", 0) or 0), 0)
         except (TypeError, ValueError):
             return 0
 
@@ -4599,7 +4652,7 @@ class MsgForward(star.Star):
 
     def _cleanup_old_media(self):
         """清理超过保留时间的媒体缓存文件。"""
-        retention_hours = int(self.config.get("queue_media_retention_hours", 0) or 0)
+        retention_hours = int(self._conf_get("queue_media_retention_hours", 0) or 0)
         if retention_hours <= 0:
             retention_hours = 24
         tmp_dir = _get_media_cache_dir()
@@ -4661,7 +4714,7 @@ class MsgForward(star.Star):
             sanitized_chain = await self._resolve_file_urls(event, sanitized_chain)
             # 合并转发（聊天记录）展开：源会话的 forward resId 在目标端无效，
             # 需拉取真实内容重建 Nodes，交给目标平台重新上传（否则显示坏卡片）
-            keep_forward_time = bool(self.config.get("forward_keep_time", True))
+            keep_forward_time = bool(self._conf_get("forward_keep_time", True))
             # 卡片预览：来源 + 标题（默认）/ 仅标题 / 不显示，见 forward_card_preview
             card_preview_mode = self._card_preview_mode()
             # 聊天记录发送者头像：按昵称反查真实 QQ 号（配置关闭时不反查，沿用协议端返回值）
@@ -4709,7 +4762,7 @@ class MsgForward(star.Star):
 
                 # 发送队列间隔：> 0 时消息进入队列，由后台 worker 每隔该秒数发送一条
                 queue_interval = self._queue_interval_for(rule)
-                if queue_interval > 0 and not self.config.get("queue_enabled", False):
+                if queue_interval > 0 and not self._conf_get("queue_enabled", False):
                     queue_interval = 0
                 # 队列模式下冷却检查与写入都会被跳过（队列分支先于冷却检查 continue），冷却实际失效；
                 # 同时配置两者容易误判，按 rule_key 只告警一次

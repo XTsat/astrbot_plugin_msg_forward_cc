@@ -249,7 +249,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 `_conf_schema.json` 是**扁平字典**：顶层 key 就是配置项 key，值是该配置项的 schema 节点——没有 `fields` 数组、没有 `schemaVersion` 之类的自造外壳（AstrBot 直接把整个 JSON 当「key → 节点」解析，套错外壳等于没有配置项）。常用节点字段：`type`（必填，`string` / `text` / `int` / `float` / `bool` / `object` / `list` / `dict` / `template_list`）、`description`（WebUI 显示的配置名）、`hint`（问号提示）、`default`、`options` + `labels` + `subtitles`（下拉选项）、`slider`（`{"min","max","step"}`，仅 int / float）、`secret`（密钥遮罩）、`invisible`、`items`（`object` / `dict` 的子 schema）、`_special`（用户 / 会话选择器）。配置分组用 `object` 嵌套表达（子 schema 放 `items`），不要发明分组字段。
 
-**全局配置：**
+**全局配置：**（schema 按类别用 `object` 分组：`basic` / `forward` / `filter` / `queue` / `media` / `at` / `platform`，分组顺序即 WebUI 展示顺序，越常用越靠前；`rules` 为顶层 template_list。代码读取统一走 `_conf_get(key)` / `_conf_set(key, value)`，它们按 `_CONFIG_GROUPS` 映射到分组路径，并兼容旧扁平结构）
 
 | 配置项 | key | 类型/默认 | 说明 |
 |------|------|------|------|

@@ -1,10 +1,4 @@
 {
-  "default_hide_header": {
-    "description": "新建转发规则时，默认是否隐藏来源信息头。",
-    "type": "bool",
-    "hint": "开启后，通过 mf bind 新建的规则默认不显示来源信息。可通过 mf hide 随时切换。",
-    "default": false
-  },
   "rules": {
     "description": "转发规则",
     "type": "template_list",
@@ -189,213 +183,268 @@
       }
     }
   },
-  "header_template": {
-    "description": "来源信息头模板",
-    "type": "text",
-    "hint": "可用变量：{sender_name} 发送者昵称、{sender_id} 发送者ID、{platform} 平台名、{msg_type} 消息类型、{conversation_id} 会话ID。留空则使用默认格式。注意：消息头末尾会自动追加换行。",
-    "default": "[转发] {sender_name} ({sender_id})\n来自 {platform} 的 {msg_type}（ID: {conversation_id}）消息"
+  "basic": {
+    "description": "基础设置",
+    "type": "object",
+    "hint": "新建规则时的默认来源信息头与内容类型。",
+    "items": {
+      "default_hide_header": {
+        "description": "新建转发规则时，默认是否隐藏来源信息头。",
+        "type": "bool",
+        "hint": "开启后，通过 mf bind 新建的规则默认不显示来源信息。可通过 mf hide 随时切换。",
+        "default": false
+      },
+      "header_template": {
+        "description": "来源信息头模板",
+        "type": "text",
+        "hint": "可用变量：{sender_name} 发送者昵称、{sender_id} 发送者ID、{platform} 平台名、{msg_type} 消息类型、{conversation_id} 会话ID。留空则使用默认格式。注意：消息头末尾会自动追加换行。",
+        "default": "[转发] {sender_name} ({sender_id})\n来自 {platform} 的 {msg_type}（ID: {conversation_id}）消息"
+      },
+      "default_content_types": {
+        "description": "默认转发的内容类型",
+        "type": "list",
+        "hint": "新建转发规则时默认勾选的内容类型（多选）。除「指令」外默认全选；「指令」默认不勾选，即以唤醒词开头的指令消息默认不转发，需要转发时勾上「指令」。",
+        "default": [
+          "plain",
+          "image",
+          "face",
+          "record",
+          "video",
+          "file",
+          "at",
+          "other"
+        ],
+        "render_type": "checkbox",
+        "options": [
+          "plain",
+          "command",
+          "image",
+          "face",
+          "record",
+          "video",
+          "file",
+          "at",
+          "other"
+        ],
+        "labels": [
+          "文字",
+          "指令",
+          "图片",
+          "表情",
+          "语音",
+          "视频",
+          "文件",
+          "@提及",
+          "其他"
+        ]
+      }
+    }
   },
-  "filter_mode": {
-    "description": "消息过滤模式",
-    "type": "string",
-    "hint": "黑名单=命中则不转发，白名单=命中才转发。",
-    "default": "off",
-    "options": [
-      "off",
-      "blacklist",
-      "whitelist"
-    ],
-    "labels": [
-      "不过滤",
-      "黑名单",
-      "白名单"
-    ]
+  "forward": {
+    "description": "聊天记录转发",
+    "type": "object",
+    "hint": "合并转发（聊天记录）展开时的行为。",
+    "items": {
+      "forward_keep_time": {
+        "description": "转发聊天记录时保留原始发送时间",
+        "type": "bool",
+        "hint": "开启后，聊天记录里每条消息显示原本的发送时间；关闭则显示为转发时的时间。仅在目标平台支持聊天记录（QQ 系）时生效。",
+        "default": true
+      },
+      "forward_node_avatar": {
+        "description": "[增强] 转发聊天记录时获取发送者头像",
+        "type": "bool",
+        "hint": "开启后按发送者昵称从群成员名册反查真实 QQ 号，让聊天记录里能显示头像；昵称比对忽略全半角、空格、Emoji、大小写，纯数字昵称直接当 QQ 号用。只在唯一匹配、且整条记录的发送者 QQ 号已被协议端抹平时才改写：机器人不在来源群、昵称重名或成员改过名时改不了，这些消息就取不到头像（显示为没有头像）。（默认开启）",
+        "default": true
+      },
+      "forward_card_preview": {
+        "description": "聊天记录卡片预览",
+        "type": "string",
+        "hint": "转发聊天记录时，记录里的卡片（小程序 / 分享卡）在预览行里显示什么：来源 + 标题=显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀（默认，与 QQ 原生卡片一致）；仅标题=只显示卡片标题，不显示简介、来源、上传者等其它信息；不显示=统一显示「[卡片消息]」。",
+        "default": "source",
+        "options": [
+          "source",
+          "title",
+          "off"
+        ],
+        "labels": [
+          "来源 + 标题（原样）",
+          "仅标题",
+          "不显示（[卡片消息]）"
+        ]
+      },
+      "forward_max_depth": {
+        "description": "聊天记录嵌套展开层数",
+        "type": "int",
+        "hint": "转发聊天记录时，记录里再套的聊天记录最多再展开几层：0=只展开最外层记录；1=再展开一层；2=再展开两层（默认，合计 3 层）。QQ 系协议端（NapCat / SnowLuma 等）发送时最多接受 3 层嵌套，即填 2 已是上限，填更大值会导致整条转发发送失败（协议端报 forward nesting depth exceeds 3）；其它平台若能接受更多层，可在此调大到对应值。",
+        "default": 2
+      },
+      "forward_rebuild_card": {
+        "description": "重建聊天记录内嵌卡片",
+        "type": "bool",
+        "hint": "关闭（默认）时，聊天记录里再套的「聊天记录」卡片按原样转发，不尝试拉取内容重建——卡片外观与条数原样保留，接收方点开能否看到内容取决于 QQ 服务端是否还留有该记录。开启后，插件会尝试把卡片还原成真正的聊天记录；内容取不到时降级为「[聊天记录] 标题（N条）」加几行预览文字。",
+        "default": false
+      }
+    }
   },
-  "filter_patterns": {
-    "description": "全局过滤规则列表（每行一条）",
-    "type": "text",
-    "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
-    "default": ""
+  "filter": {
+    "description": "过滤与名单",
+    "type": "object",
+    "hint": "按消息内容与发送者过滤，规则级设置可覆盖此处全局值。",
+    "items": {
+      "filter_mode": {
+        "description": "消息过滤模式",
+        "type": "string",
+        "hint": "黑名单=命中则不转发，白名单=命中才转发。",
+        "default": "off",
+        "options": [
+          "off",
+          "blacklist",
+          "whitelist"
+        ],
+        "labels": [
+          "不过滤",
+          "黑名单",
+          "白名单"
+        ]
+      },
+      "filter_patterns": {
+        "description": "全局过滤规则列表（每行一条）",
+        "type": "text",
+        "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
+        "default": ""
+      },
+      "sender_filter_mode": {
+        "description": "用户黑白名单模式",
+        "type": "string",
+        "hint": "按消息发送者 UID 过滤（UID 就是 AstrBot /sid 指令输出里的 UID 行，精确匹配、换昵称也认得出）：黑名单=名单里的 UID 发来的消息不转发；白名单=只转发名单里的 UID 发来的消息。名单在下方「全局用户名单」中填写，名单为空时本项不生效。每条规则可单独覆盖。",
+        "default": "off",
+        "options": [
+          "off",
+          "blacklist",
+          "whitelist"
+        ],
+        "labels": [
+          "不过滤",
+          "黑名单",
+          "白名单"
+        ]
+      },
+      "sender_filter_list": {
+        "description": "全局用户名单（每行一条）",
+        "type": "text",
+        "hint": "每行填一个 UID（精确匹配，即 AstrBot /sid 指令输出里的 UID 行）。同一平台开了多个适配器、需要区分实例时写 BotID:UID 或 平台名:UID（Bot ID 同样见 /sid）。不做昵称 / QQ 号形态的模糊匹配。留空=不按用户过滤。",
+        "default": ""
+      }
+    }
   },
-  "sender_filter_mode": {
-    "description": "用户黑白名单模式",
-    "type": "string",
-    "hint": "按消息发送者 UID 过滤（UID 就是 AstrBot /sid 指令输出里的 UID 行，精确匹配、换昵称也认得出）：黑名单=名单里的 UID 发来的消息不转发；白名单=只转发名单里的 UID 发来的消息。名单在下方「全局用户名单」中填写，名单为空时本项不生效。每条规则可单独覆盖。",
-    "default": "off",
-    "options": [
-      "off",
-      "blacklist",
-      "whitelist"
-    ],
-    "labels": [
-      "不过滤",
-      "黑名单",
-      "白名单"
-    ]
+  "queue": {
+    "description": "发送队列",
+    "type": "object",
+    "hint": "按间隔逐条转发，避免刷屏与协议端限流。",
+    "items": {
+      "queue_enabled": {
+        "description": "启用发送队列",
+        "type": "bool",
+        "hint": "开启后，设置了队列间隔的规则将进入发送队列模式。⚠️ 队列模式下会将图片/视频/文件等媒体缓存到本地临时目录，请确保磁盘空间充足。",
+        "default": false
+      },
+      "default_queue_interval_seconds": {
+        "description": "默认发送队列间隔（秒）",
+        "type": "int",
+        "hint": "新建转发规则时的默认队列间隔。开启后，匹配规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条。0 或关闭则立即转发。每条规则可单独覆盖。",
+        "default": 0
+      },
+      "default_cooldown_seconds": {
+        "description": "默认转发冷却时间（秒）",
+        "type": "int",
+        "hint": "新建转发规则时的默认冷却间隔。转发一次后在该秒数内不再重复转发同一规则。每条规则可单独覆盖。",
+        "default": 0
+      },
+      "queue_max_size": {
+        "description": "发送队列总长度上限",
+        "type": "int",
+        "hint": "全部规则合计的队列积压上限（总长度）。0 或不填则不限制。达到上限后新消息将被丢弃（记录错误日志），队列中的消息不受影响。各规则可在规则内单独设置「发送队列长度（条）」作为本规则的独立上限，两者同时生效。",
+        "default": 0
+      },
+      "queue_media_retention_hours": {
+        "description": "队列媒体缓存保留时间（小时）",
+        "type": "int",
+        "hint": "队列模式下缓存的媒体文件保留多少小时后自动清理。0 或不填则默认 24 小时。重启时也会自动清理所有缓存。",
+        "default": 24
+      }
+    }
   },
-  "sender_filter_list": {
-    "description": "全局用户名单（每行一条）",
-    "type": "text",
-    "hint": "每行填一个 UID（精确匹配，即 AstrBot /sid 指令输出里的 UID 行）。同一平台开了多个适配器、需要区分实例时写 BotID:UID 或 平台名:UID（Bot ID 同样见 /sid）。不做昵称 / QQ 号形态的模糊匹配。留空=不按用户过滤。",
-    "default": ""
+  "media": {
+    "description": "媒体处理",
+    "type": "object",
+    "hint": "跨设备转发时媒体文件的处理方式。",
+    "items": {
+      "download_media_before_send": {
+        "description": "发送媒体前先下载到本地",
+        "type": "bool",
+        "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
+        "default": false
+      }
+    }
   },
-  "default_cooldown_seconds": {
-    "description": "默认转发冷却时间（秒）",
-    "type": "int",
-    "hint": "新建转发规则时的默认冷却间隔。转发一次后在该秒数内不再重复转发同一规则。每条规则可单独覆盖。",
-    "default": 0
+  "at": {
+    "description": "@ 提及",
+    "type": "object",
+    "hint": "默认把 @ 转成文本；开启反查后可精确 @ 目标群成员。",
+    "items": {
+      "at_nickname_lookup": {
+        "description": "[增强] 高级 @：按昵称反查 @ 对象（默认关闭=At 转文本）",
+        "type": "bool",
+        "hint": "默认关闭：@ 一律转成文本 @昵称，最稳妥。开启后转发前拉取目标群成员列表，把 @昵称换成真实成员再精确 @，解决跨群 @ 指不到人；群成员很多时会多一次接口调用、稍慢，仅 QQ 系有效。每条规则可单独覆盖。",
+        "default": false
+      },
+      "at_nickname_lookup_cache_ttl": {
+        "description": "@ 昵称反查的群成员缓存时长（秒）",
+        "type": "int",
+        "hint": "仅在开启「按昵称反查 @ 对象」时生效。同一目标群在该秒数内复用已拉取的成员列表，避免每条消息都拉一次；0=不缓存（每次重新拉取，群大时可能变慢）。默认 300 秒。",
+        "default": 300
+      },
+      "at_passthrough_extra_platforms": {
+        "description": "额外允许 @ 透传的目标平台",
+        "type": "list",
+        "hint": "仅在「高级 @（昵称反查）」开启时生效。默认已包含 QQ 系平台（aiocqhttp / qq_official 等），这些平台会把 At 按 qq 原样透传、由协议端精确解析。若你使用其他自建 QQ 适配器，可在此填写其平台名（每行一个，同 UMO 第一段），让 @ 也按 qq 透传而不是降级为文本。跨平台（微信/Telegram 等）不要填。",
+        "default": []
+      }
+    }
   },
-  "default_queue_interval_seconds": {
-    "description": "默认发送队列间隔（秒）",
-    "type": "int",
-    "hint": "新建转发规则时的默认队列间隔。开启后，匹配规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条。0 或关闭则立即转发。每条规则可单独覆盖。",
-    "default": 0
-  },
-  "queue_enabled": {
-    "description": "启用发送队列",
-    "type": "bool",
-    "hint": "开启后，设置了队列间隔的规则将进入发送队列模式。⚠️ 队列模式下会将图片/视频/文件等媒体缓存到本地临时目录，请确保磁盘空间充足。",
-    "default": false
-  },
-  "queue_media_retention_hours": {
-    "description": "队列媒体缓存保留时间（小时）",
-    "type": "int",
-    "hint": "队列模式下缓存的媒体文件保留多少小时后自动清理。0 或不填则默认 24 小时。重启时也会自动清理所有缓存。",
-    "default": 24
-  },
-  "queue_max_size": {
-    "description": "发送队列总长度上限",
-    "type": "int",
-    "hint": "全部规则合计的队列积压上限（总长度）。0 或不填则不限制。达到上限后新消息将被丢弃（记录错误日志），队列中的消息不受影响。各规则可在规则内单独设置「发送队列长度（条）」作为本规则的独立上限，两者同时生效。",
-    "default": 0
-  },
-  "download_media_before_send": {
-    "description": "发送媒体前先下载到本地",
-    "type": "bool",
-    "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
-    "default": false
-  },
-  "forward_keep_time": {
-    "description": "转发聊天记录时保留原始发送时间",
-    "type": "bool",
-    "hint": "开启后，聊天记录里每条消息显示原本的发送时间；关闭则显示为转发时的时间。仅在目标平台支持聊天记录（QQ 系）时生效。",
-    "default": true
-  },
-  "forward_card_preview": {
-    "description": "聊天记录卡片预览",
-    "type": "string",
-    "hint": "转发聊天记录时，记录里的卡片（小程序 / 分享卡）在预览行里显示什么：来源 + 标题=显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀（默认，与 QQ 原生卡片一致）；仅标题=只显示卡片标题，不显示简介、来源、上传者等其它信息；不显示=统一显示「[卡片消息]」。",
-    "default": "source",
-    "options": [
-      "source",
-      "title",
-      "off"
-    ],
-    "labels": [
-      "来源 + 标题（原样）",
-      "仅标题",
-      "不显示（[卡片消息]）"
-    ]
-  },
-  "forward_node_avatar": {
-    "description": "[增强] 转发聊天记录时获取发送者头像",
-    "type": "bool",
-    "hint": "开启后按发送者昵称从群成员名册反查真实 QQ 号，让聊天记录里能显示头像；昵称比对忽略全半角、空格、Emoji、大小写，纯数字昵称直接当 QQ 号用。只在唯一匹配、且整条记录的发送者 QQ 号已被协议端抹平时才改写：机器人不在来源群、昵称重名或成员改过名时改不了，这些消息就取不到头像（显示为没有头像）。（默认开启）",
-    "default": true
-  },
-  "forward_max_depth": {
-    "description": "聊天记录嵌套展开层数",
-    "type": "int",
-    "hint": "转发聊天记录时，记录里再套的聊天记录最多再展开几层：0=只展开最外层记录；1=再展开一层；2=再展开两层（默认，合计 3 层）。QQ 系协议端（NapCat / SnowLuma 等）发送时最多接受 3 层嵌套，即填 2 已是上限，填更大值会导致整条转发发送失败（协议端报 forward nesting depth exceeds 3）；其它平台若能接受更多层，可在此调大到对应值。",
-    "default": 2
-  },
-  "forward_rebuild_card": {
-    "description": "重建聊天记录内嵌卡片",
-    "type": "bool",
-    "hint": "关闭（默认）时，聊天记录里再套的「聊天记录」卡片按原样转发，不尝试拉取内容重建——卡片外观与条数原样保留，接收方点开能否看到内容取决于 QQ 服务端是否还留有该记录。开启后，插件会尝试把卡片还原成真正的聊天记录；内容取不到时降级为「[聊天记录] 标题（N条）」加几行预览文字。",
-    "default": false
-  },
-  "default_content_types": {
-    "description": "默认转发的内容类型",
-    "type": "list",
-    "hint": "新建转发规则时默认勾选的内容类型（多选）。除「指令」外默认全选；「指令」默认不勾选，即以唤醒词开头的指令消息默认不转发，需要转发时勾上「指令」。",
-    "default": [
-      "plain",
-      "image",
-      "face",
-      "record",
-      "video",
-      "file",
-      "at",
-      "other"
-    ],
-    "render_type": "checkbox",
-    "options": [
-      "plain",
-      "command",
-      "image",
-      "face",
-      "record",
-      "video",
-      "file",
-      "at",
-      "other"
-    ],
-    "labels": [
-      "文字",
-      "指令",
-      "图片",
-      "表情",
-      "语音",
-      "视频",
-      "文件",
-      "@提及",
-      "其他"
-    ]
-  },
-  "at_nickname_lookup": {
-    "description": "[增强] 高级 @：按昵称反查 @ 对象（默认关闭=At 转文本）",
-    "type": "bool",
-    "hint": "默认关闭：@ 一律转成文本 @昵称，最稳妥。开启后转发前拉取目标群成员列表，把 @昵称换成真实成员再精确 @，解决跨群 @ 指不到人；群成员很多时会多一次接口调用、稍慢，仅 QQ 系有效。每条规则可单独覆盖。",
-    "default": false
-  },
-  "at_nickname_lookup_cache_ttl": {
-    "description": "@ 昵称反查的群成员缓存时长（秒）",
-    "type": "int",
-    "hint": "仅在开启「按昵称反查 @ 对象」时生效。同一目标群在该秒数内复用已拉取的成员列表，避免每条消息都拉一次；0=不缓存（每次重新拉取，群大时可能变慢）。默认 300 秒。",
-    "default": 300
-  },
-  "at_passthrough_extra_platforms": {
-    "description": "额外允许 @ 透传的目标平台",
-    "type": "list",
-    "hint": "仅在「高级 @（昵称反查）」开启时生效。默认已包含 QQ 系平台（aiocqhttp / qq_official 等），这些平台会把 At 按 qq 原样透传、由协议端精确解析。若你使用其他自建 QQ 适配器，可在此填写其平台名（每行一个，同 UMO 第一段），让 @ 也按 qq 透传而不是降级为文本。跨平台（微信/Telegram 等）不要填。",
-    "default": []
-  },
-  "platform_names": {
-    "description": "平台名称映射",
-    "type": "list",
-    "hint": "把 {platform} 的原始平台名替换为自定义展示名。每项格式：原始平台名=显示名，例如 aiocqhttp=QQ、telegram=电报。未命中的平台保持原名（原样显示），删空则全部不改写。",
-    "default": [
-      "default=默认",
-      "aiocqhttp=QQ",
-      "qq_official=QQ官方机器人",
-      "qq_official_webhook=QQ官方机器人(Webhook)",
-      "telegram=Telegram",
-      "weixin_oc=个人微信",
-      "wecom=企业微信",
-      "weixin_official_account=微信公众号",
-      "lark=飞书",
-      "dingtalk=钉钉",
-      "discord=Discord",
-      "kook=KOOK",
-      "slack=Slack",
-      "vocechat=VoceChat",
-      "line=LINE",
-      "satori=Satori",
-      "matrix=Matrix",
-      "mattermost=Mattermost",
-      "misskey=Misskey",
-      "wecom_ai_bot=企微AI机器人"
-    ]
+  "platform": {
+    "description": "平台显示",
+    "type": "object",
+    "hint": "把平台标识映射为易读名称。",
+    "items": {
+      "platform_names": {
+        "description": "平台名称映射",
+        "type": "list",
+        "hint": "把 {platform} 的原始平台名替换为自定义展示名。每项格式：原始平台名=显示名，例如 aiocqhttp=QQ、telegram=电报。未命中的平台保持原名（原样显示），删空则全部不改写。",
+        "default": [
+          "default=默认",
+          "aiocqhttp=QQ",
+          "qq_official=QQ官方机器人",
+          "qq_official_webhook=QQ官方机器人(Webhook)",
+          "telegram=Telegram",
+          "weixin_oc=个人微信",
+          "wecom=企业微信",
+          "weixin_official_account=微信公众号",
+          "lark=飞书",
+          "dingtalk=钉钉",
+          "discord=Discord",
+          "kook=KOOK",
+          "slack=Slack",
+          "vocechat=VoceChat",
+          "line=LINE",
+          "satori=Satori",
+          "matrix=Matrix",
+          "mattermost=Mattermost",
+          "misskey=Misskey",
+          "wecom_ai_bot=企微AI机器人"
+        ]
+      }
+    }
   }
 }
