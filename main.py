@@ -712,11 +712,14 @@ async def _node_to_onebot_dict(
 
 
 def _nodes_without_nested(nodes: Nodes, *, card_preview_mode: str = _CARD_PREVIEW_SOURCE) -> _ForwardNodes:
-    """把节点内未展开的嵌套聊天记录降级为文本占位（透传源 resId 只会生成坏卡片）。"""
+    """把节点内未展开的嵌套聊天记录降级为文本占位（透传源 resId 只会生成坏卡片）。
+
+    `Forward` 与 `Nodes` / `Node` 都要降级：层数上限耗尽时节点里残留的正是
+    `Forward(源会话 resId)`，原样序列化会给目标端一个打不开的卡片。"""
     rebuilt = []
     for node in nodes.nodes:
         content = [
-            Plain(text=_FORWARD_PLACEHOLDER) if isinstance(c, Nodes | Node) else c
+            Plain(text=_FORWARD_PLACEHOLDER) if isinstance(c, Nodes | Node | Forward) else c
             for c in node.content or []
         ]
         rebuilt.append(Node(content=content, uin=node.uin, name=node.name, time=node.time))
@@ -988,6 +991,20 @@ def _media_url_in_segment(data: dict) -> str:
     return ""
 
 
+class _ForwardInlineRef:
+    """聊天记录里内联下发的嵌套记录（协议端已把内层节点递归展开在消息段里）。
+
+    NapCat 的 get_forward_msg 有两种下发形式：`forward` 段的 `data.content`，以及更深层
+    记录的 `node` 段。两种都带着真正的内层节点，但段上的 `id` 只是转发内的消息短 ID，
+    拿它再调 get_forward_msg 必然失败——只保留 id 会把这层内容整段丢掉。这里先占位保存
+    原始节点列表，由 `_build_forward_nodes` 在异步层重建为嵌套 Nodes。"""
+
+    __slots__ = ("content",)
+
+    def __init__(self, content: list) -> None:
+        self.content = content
+
+
 class _ForwardFileRef:
     """聊天记录里待解析下载直链的群文件段。
 
@@ -1049,6 +1066,29 @@ def _forward_segment_to_components(seg) -> list:
     if not isinstance(data, dict):
         data = {}
 
+    if seg_type == "node":
+        # NapCat 把更深层的嵌套记录放成 node 段（正文在 data.message / data.content）。
+        # 段本身没有可发送的正文，直接丢弃会让这一层记录整段消失；这里的列表是该节点的
+        # 正文而非节点列表，故按单节点包一层以保留发送者信息。
+        nested_segments = data.get("message")
+        if not isinstance(nested_segments, list):
+            nested_segments = data.get("content")
+        if isinstance(nested_segments, list) and nested_segments:
+            return [
+                _ForwardInlineRef(
+                    [
+                        {
+                            "sender": {
+                                "user_id": data.get("user_id") or data.get("uin") or "",
+                                "nickname": data.get("nickname") or data.get("name") or "",
+                            },
+                            "time": data.get("time"),
+                            "message": nested_segments,
+                        }
+                    ]
+                )
+            ]
+        return [Plain(text=_FORWARD_PLACEHOLDER)]
     if seg_type in ("text", "plain"):
         text = data.get("text")
         return [Plain(text=str(text))] if text else []
@@ -1097,8 +1137,13 @@ def _forward_segment_to_components(seg) -> list:
             return [_forward_card_ref(raw)]
         return [Plain(text="[卡片消息]")]
     if seg_type == "forward":
-        # 带 resId 的嵌套聊天记录保留 Forward，交给 _expand_nested_forwards 递归展开
+        # 嵌套聊天记录优先用协议端随段下发的 content（已递归解析好的内层节点）；只保留
+        # resId 会丢掉这些内容、再去拉一个不可用的短 ID，更深层只能降级成文字。
         nested_id = str(data.get("id") or data.get("res_id") or data.get("forward_id") or "")
+        inline = data.get("content")
+        if isinstance(inline, list) and inline:
+            return [_ForwardInlineRef(inline)]
+        # 只有 resId 时保留 Forward，交给 _expand_nested_forwards 递归展开
         return [Forward(id=nested_id)] if nested_id else [Plain(text=_FORWARD_PLACEHOLDER)]
     if seg_type == "markdown":
         text = str(data.get("content") or data.get("markdown") or "")
@@ -1167,6 +1212,8 @@ async def _build_forward_nodes(
     card_preview_mode: str = _CARD_PREVIEW_SOURCE,
     file_url_resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None = None,
     card_resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None = None,
+    depth: int = _FORWARD_MAX_DEPTH,
+    event=None,
 ) -> _ForwardNodes | None:
     """把 get_forward_msg 返回的节点消息重建为 _ForwardNodes（合并转发组件）。
 
@@ -1175,7 +1222,10 @@ async def _build_forward_nodes(
     file_url_resolver 非空时用于把节点内只有 file_id 的群文件段换成下载直链
     （入参为文件占位与节点来源群号），换不到时该文件降级为文字占位；
     card_resolver 非空时用于把节点内的「聊天记录」卡片还原成真正的嵌套记录
-    （卡片只带标题与资源句柄、不含内容），还原不了时保留标题与条数降级为文字占位。"""
+    （卡片只带标题与资源句柄、不含内容），还原不了时保留标题与条数降级为文字占位；
+    depth 是还能再展开的嵌套层数，协议端随段内联下发的嵌套记录（见
+    `_ForwardInlineRef`）在这一层直接重建，超过层数上限才降级为文字占位；event 非空时
+    用于继续展开内联内容里仍带 resId 的嵌套记录。"""
     nodes = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -1188,11 +1238,17 @@ async def _build_forward_nodes(
         name = sender.get("card") or sender.get("nickname") or msg.get("nickname") or ""
         node_time = _forward_node_time(msg.get("time")) if keep_time else 0
         node_group = str(msg.get("group_id") or "")
-        # 兼容 {"type": "node", "data": {...}} 包裹格式
+        # 兼容 {"type": "node", "data": {...}} 包裹格式（NapCat 的 get_forward_msg 用它）
         node_data = msg.get("data") if msg.get("type") == "node" else None
         if isinstance(node_data, dict):
             node_sender = node_data.get("sender") if isinstance(node_data.get("sender"), dict) else {}
-            segments = node_data.get("content") if isinstance(node_data.get("content"), list) else segments
+            # NapCat 同时给出 content 与 message，其中 content 常为空数组；
+            # 只按「是 list」判断会把真正的正文 message 覆盖成空。
+            for key in ("content", "message"):
+                candidate = node_data.get(key)
+                if isinstance(candidate, list) and candidate:
+                    segments = candidate
+                    break
             uin = node_data.get("user_id") or node_sender.get("user_id") or uin
             name = node_data.get("nickname") or node_sender.get("card") or node_sender.get("nickname") or name
             node_group = node_group or str(node_data.get("group_id") or "")
@@ -1205,10 +1261,83 @@ async def _build_forward_nodes(
             content.extend(_forward_segment_to_components(seg))
         content = await _resolve_forward_file_refs(content, file_url_resolver, node_group)
         content = await _resolve_forward_cards(content, card_resolver)
+        content = await _resolve_forward_inline_refs(
+            content,
+            _forward_inline_resolver(
+                event,
+                keep_time=keep_time,
+                depth=depth,
+                card_preview_mode=card_preview_mode,
+                file_url_resolver=file_url_resolver,
+                card_resolver=card_resolver,
+            ),
+        )
         if not content:
             continue
         nodes.append(Node(content=content, uin=str(uin or "0"), name=str(name or ""), time=node_time))
     return _ForwardNodes(nodes, card_preview_mode=card_preview_mode) if nodes else None
+
+
+def _forward_inline_resolver(
+    event,
+    *,
+    keep_time: bool,
+    depth: int,
+    card_preview_mode: str,
+    file_url_resolver: Callable[[_ForwardFileRef, str], Awaitable[str | None]] | None,
+    card_resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None,
+) -> Callable[[_ForwardInlineRef], Awaitable[Nodes | None]]:
+    """构造「内联嵌套记录 → 重建后的 Nodes」解析器（层数超限时返回 None 由调用方降级）。
+
+    与 `_fetch_forward_nodes` 同一套层数语义：先按剩余层数重建内联节点，再展开其中仍带
+    resId 的嵌套记录，让「协议端已递归下发」与「需要再拉取」两种形式等价。"""
+
+    async def _resolve(ref: _ForwardInlineRef) -> Nodes | None:
+        if depth <= 0:
+            return None
+        nested = await _build_forward_nodes(
+            ref.content,
+            keep_time=keep_time,
+            card_preview_mode=card_preview_mode,
+            file_url_resolver=file_url_resolver,
+            card_resolver=card_resolver,
+            depth=depth - 1,
+            event=event,
+        )
+        if nested is None or event is None:
+            return nested
+        return await _expand_nested_forwards(
+            event,
+            nested,
+            keep_time=keep_time,
+            depth=depth - 1,
+            card_preview_mode=card_preview_mode,
+        )
+
+    return _resolve
+
+
+async def _resolve_forward_inline_refs(
+    content: list,
+    resolver: Callable[[_ForwardInlineRef], Awaitable[Nodes | None]] | None,
+) -> list:
+    """把节点内容里内联下发的嵌套记录换成真正的嵌套 Nodes（还原不了时降级为文字占位）。"""
+    resolved = []
+    for comp in content:
+        if not isinstance(comp, _ForwardInlineRef):
+            resolved.append(comp)
+            continue
+        nested = None
+        if resolver is not None:
+            try:
+                nested = await resolver(comp)
+            except Exception as e:
+                # 协议端返回的节点结构不保证合法，单条嵌套记录失败不能拖垮整条转发的重建
+                logger.warning(
+                    f"⚠️ [astrbot_plugin_msg_forward_cc] 内联聊天记录还原失败，降级为文字占位：{e}"
+                )
+        resolved.append(nested if nested is not None else Plain(text=_FORWARD_PLACEHOLDER))
+    return resolved
 
 
 async def _resolve_forward_file_refs(
@@ -1313,6 +1442,8 @@ async def _fetch_forward_nodes(
             card_preview_mode=card_preview_mode,
             avatar_resolver=avatar_resolver,
         ),
+        depth=depth,
+        event=event,
     )
     if nodes is None:
         if log_failure:
