@@ -5,7 +5,7 @@
 >
 > 适用项目：`astrbot_plugin_msg_forward_cc`（AstrBot 跨平台消息转发插件，Python 单文件）。
 >
-> **模板版本**：v0.1.9（2026-11-04） —— 本行标记本文件对应的 `astrbot-plugin` 模板版本。回填项目内容时**不要改动本行**；只有从上游合并到新版本时才把它更新为合并到的版本。
+> **模板版本**：v0.1.12（2026-11-08） —— 本行标记本文件对应的 `astrbot-plugin` 模板版本。回填项目内容时**不要改动本行**；只有从上游合并到新版本时才把它更新为合并到的版本。
 > **来源**：本文件是 [agent-templates](https://github.com/XTsat/agent-templates) 的 `templates/astrbot-plugin/AGENTS.md` 副本，最新版见该仓库 `main` 分支；已回填本项目的插件名、命令前缀、目录结构、命令表与项目特有约定。
 > 用户说「更新 AGENTS」时按此流程：① 打开来源仓库该模板的 `AGENTS.md`，比对头部「模板版本」与本地是否一致——一致说明已是最新，直接结束，不必逐节比对 → ② 不一致才拉取来源模板最新版（**用 GitHub contents API 或带 cache-buster 的 raw URL**，`raw.githubusercontent.com` 直链有 CDN 缓存，可能拿到旧版）→ ③ 与本地逐节比对 → ④ 合并（保留本项目已回填的插件名、命令前缀、目录结构与项目特有约定）→ ⑤ 展示 diff 与改动清单，等用户确认后再落盘，并把头部「模板版本」同步改为合并到的版本。**禁止整文件覆盖**。
 
@@ -76,7 +76,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 ### 2.4 合并转发（聊天记录）展开（模块级）
 
-- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS` / `_FORWARD_MAX_DEPTH`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`） / 嵌套聊天记录最多再展开的层数（协议端上限 3 层，取 2）
+- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS` / `_FORWARD_MAX_DEPTH` / `_FORWARD_MAX_DEPTH_LIMIT`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`） / 嵌套记录最多再展开的层数默认值（配置 `forward_max_depth` 覆盖，语义为「除最外层外还能再展开几层」，2 = 合计 3 层，即 QQ 系协议端的发送上限） / 该配置的允许上限（10，防御式钳制）
 - `_FORWARD_PREVIEW_MAX_LINES` / `_FORWARD_PREVIEW_MAX_CHARS`：合并转发卡片预览（`news` 扩展参数）最多展示的行数（QQ 卡片模板上限 4 行）/ 单行正文最大长度（超出截断并加省略号）
 - `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`；同时携带 `news` 预览行，避免协议端把嵌套聊天记录显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`（`news` 为 NapCat / SnowLuma 等 OneBot 实现的扩展参数，不支持的实现会忽略）；`card_preview_mode` 字段由配置 `forward_card_preview` 决定，控制预览行的卡片展示方式——`source` 来源 + 标题（默认，保留原始 `prompt` 的来源前缀）/ `title` 仅标题 / `off` 统一「[卡片消息]」
 - `_sole_nested_forward(content)` / `_nodes_without_nested(nodes, card_preview_mode=_CARD_PREVIEW_TITLE)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
@@ -164,6 +164,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 - **Python 3.10+**（AstrBot 4.x 最低要求），现代联合类型写法（`dict | None`、`list[dict]`）
 - **AstrBot API**：`astrbot.api.star`（star, Context, Star, StarTools）、`astrbot.api.event`（filter, AstrMessageEvent）、`astrbot.api`（logger, AstrBotConfig）、`astrbot.core.message.components`（At, Plain, Image, Record, Video, File, Face, Forward, Json, Node, Nodes）、`astrbot.core.message.message_event_result`（MessageEventResult）
 - **依赖管理**：不引入新依赖，纯标准库（json/re/secrets/time/pathlib/string/tempfile/ssl/socket/urllib）+ AstrBot API；`aiohttp` / `certifi` 在 `_download_url_to_local` 内惰性 import（AstrBot 运行时已自带，仅用于兜底媒体下载，import 失败时降级为占位文本，不影响其余功能）；`astrbot.core.astrbot_config` / `astrbot.core.file_token_service` 在文件服务函数内惰性 import
+- **日志库**：唯一来源是 `from astrbot.api import logger`（AstrBot 官方插件文档要求「使用 `astrbot.api` 的 logger，而不是 `logging` 模块」）。**禁止** `import logging` / `logging.getLogger(...)` / `logging.basicConfig(...)`，也禁止 `loguru` 等第三方日志库、禁止把日志库写进 `requirements.txt`。理由见 4.3
 - **禁止引入**：不引入与原功能无关的依赖，非必要不新增 `requirements.txt`
 
 ---
@@ -194,6 +195,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 - 注释只写 non-obvious reason；docstring 用中文说明用途/参数/返回（私有方法用途明显可省略）；禁止残留被注释掉的旧代码与调试输出
 - 代码分区用 `# ---- 分区名 ----` 分隔条
+- **日志来源唯一**：`from astrbot.api import logger`。**禁止** `import logging` / `logging.getLogger(...)`（含「SDK 缺失时退回标准库 logging」这类降级分支），也**禁止** `loguru` 等第三方日志库——AstrBot 官方插件文档原文是「请务必使用 `from astrbot.api import logger` 来获取日志对象，而不是使用 `logging` 模块」。`astrbot.api.logger` 按**调用位置**路由到本插件专属 logger（`astrbot.plugin.<插件名>`），插件内任意模块直接 import 即自动归属，无需自建或层层传递；自建 logger 的名字对不上这条链路，日志没有插件归属、插件详情页的独立日志等级与面板按插件筛选都不生效
 - 日志统一 `logger.info/error/warning`，错误信息带 ❌/⚠️ emoji 前缀；分类记录（ValueError = 非法参数/非法 session，OSError = 文件/IO 错误）；单规则失败不影响其他规则；禁止空 `except: pass`（除非注释说明理由）
 - **新增 / 修改的日志必须带 `[astrbot_plugin_msg_forward_cc]` 前缀**（对齐远端模板）；历史日志未带前缀，不强制回改
 - 精确捕获异常类型（`asyncio.TimeoutError`、`OSError`、`ValueError` 等）；确需 `except Exception` 兜底时在注释里写明理由（历史代码已有此写法，不强制回改）
@@ -265,6 +267,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 转发聊天记录时保留原始发送时间 | `forward_keep_time` | bool, true | 关闭则聊天记录里每条消息显示为转发时的时间 |
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
 | [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；**仅当整条记录的发送者 QQ 号已被协议端抹平时才改写**（记录自带不同真实 QQ 号则整条跳过，避免把正确值改错）；发送者不在机器人所在的群 / 昵称重名 / 已改名时改不了，这些消息取不到头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
+| 聊天记录嵌套展开层数 | `forward_max_depth` | int, 2 | 记录里再套的记录最多再展开几层（`2`=合计 3 层）。QQ 系协议端（NapCat / SnowLuma）发送时最多接受 3 层，填更大值会导致整条转发被拒（`forward nesting depth exceeds 3`）；其它平台能接受更多层时可调大，超过 10 会被钳制。另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层会退化成无 `m_resid` 的卡片，再转发最多只能恢复 2 层 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/command/image/face/record/video/file/at/other，默认除 `command`（指令）外全选 |
 | [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
@@ -452,7 +455,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 ## 7. 文档维护规范（强制，不可省略）
 
-> 本项目的**硬性要求**：任何改动在合并前，必须同步维护 `README.md` 与 `CHANGELOG.md`。未同步文档 = 任务未完成。
+> 本项目的**硬性要求**：任何改动在合并前，必须同步维护 `README.md` 与 `CHANGELOG.md`。未同步文档 = 任务未完成。这里的「同步」= 追加 / 合并 / 删除条目，按改动性质选择：新增改动追加条目，同一变化合并成一条，发版前被撤销的改动删掉其条目（见 7.1 流程）。
 
 ### 7.1 CHANGELOG 维护
 
@@ -460,6 +463,8 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 
 - 日常改动先记在 `## [Unreleased]` 段（顶部固定）。**发版时**再把内容移动到带版本号的新段。
 - **先记后合**：记录阶段同一工作周期内的改动各自独立记入 `[Unreleased]`（同一功能的多处调整也先各记一条，避免遗漏）；提交或发版前的整理阶段统一过一遍，把描述同一件事的多条合并成一条，不相关改动保持独立（判断标准：用户会不会把它当成同一件事）。
+- **「上一版」= 上一次发布**：本文件所说的「上一版」指 `CHANGELOG.md` 中最新的 `## vX.Y.Z` 段，即用户当前实际在用的版本；**不是上一个 commit、也不是 HEAD**。条目只需回答「这个版本和上一版比变了什么」，与中间经历过几次提交无关。
+- **发版前被撤销的改动不留痕**：某改动只在 `[Unreleased]` 里记过、发版前又被移除时，整理阶段**删掉对应条目**即可，不写「新增后又移除」「已取消」「原计划作废」这类叙述——那是开发过程，不是用户能感知的差异。`### 移除` 只用于删除**上一版已发布**过的功能（该情形属破坏性变更，按 SemVer 升 major/minor）。想在中间过程留痕就写 commit message（如 `revert: 移除 X`）和 PR 描述，CHANGELOG 不是 git log。
 - **发版日期**：版本段日期 `(YYYY-MM-DD)` 填**当前日期**（以发版当天的系统时间为准）。
 
 #### 格式
@@ -529,9 +534,18 @@ CHANGELOG 的读者是**插件使用者**（服务器管理员、群成员），
 
 下列位置属于**辅助信息，不是版本源**，不决定版本号：`main.py` 中 `@register` 传入的版本号、`README.md` / `README_en.md` 的版本徽章与正文版本字样、`.astrbot-plugin/i18n` 中的版本文案。**日常提交不动它们；准备发布时必须逐个同步到同一个新版本号**，不得残留旧版本号或自相矛盾的版本字样。也不要新增此类重复版本号——需要展示版本时从 `metadata.yaml` 读取，不手写。
 
-#### 多会话并行开发
+#### 多会话并行开发（并行修改协议，适用于所有共享文件）
 
-**⚠️ 更新 `CHANGELOG.md` 前必须先读取当前文件内容**，识别并保留其他会话已写入的既有条目（含 `[Unreleased]` 下未提交的功能），只追加自己的条目，**严禁整文件覆盖或删除他人记录**。
+**触发条件**：只有出现下列情况才启用本节，否则按普通流程走，**不增加任何额外动作**——① 仓库里存在他人未提交或进行中的改动；② 用户明确要求并行工作；③ 任务板上存在他人 `in_progress` 任务，或与本会话写域重叠。
+
+1. **先划写域**：动手前列出本会话要改的文件，与并行方比对；有重叠就**停下来问用户**，不自行决定谁先写。
+2. **按冲突面选手段**：不同文件 → 直接并行；同模块下不同文件 → 各自分支、收口时合并；同一文件的同一区块 / 版本号 / schema 变更 → 指定**唯一写者**，其余排队等。
+3. **共享单文件先认领**：改动前在任务板置 `in_progress`，或落 `.locks/<文件名>.lock` 写明会话与时间，写完即释放；未认领就改共享文件 = 违规。`.locks/` 只存本地、**不提交**，发版前清理。
+4. **记录类文件只追加**：CHANGELOG / TODO / 注册表 / 路由表这类文件只做定位式追加，**禁止整文件重写**（整文件写回会连带盖掉他人条目）。
+5. **收口单一 owner**：合并由一个会话执行，其他人只产出分支或 patch，不各自往主干合。
+6. **提交前自查**：`git status --short` 确认只碰本会话写域内的文件；看到别人的改动就停下来问，不顺手清理。
+
+**CHANGELOG 专项**（条目写法见上方「流程」与「写作视角」）：更新 `CHANGELOG.md` 前必须先读取当前文件内容，识别并保留其他会话已写入的既有条目（含 `[Unreleased]` 下未提交的内容），只追加自己的条目，**严禁整文件覆盖或删除他人记录**。边界：本条保护的是**仍然有效**的记录；条目已被撤销、或已在本次发版中并入版本段，可以删除或移动，但删除前须能说清「谁被撤销 / 归并到哪」，不得顺手清理看不惯的内容。
 
 ### 7.2 README 维护
 
@@ -663,7 +677,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 
 - 配置项在 README/CHANGELOG 中引用时统一写成「中文名（`key`）」形式：中文名取 `_conf_schema.json` 的 `description`（`hint` 只作问号提示），`key` 用反引号包裹（规则见 5.1）
 - **禁止无意义的换行**：HTML 头部区块内元素间不留空行；正文一段文字保持一行；空行只用于分隔标题、表格、列表、代码块等结构性区块
-- **多会话并行修改**：更新 `README.md` / `README_en.md` 前必须先读取当前文件内容，保留他人内容，只追加/修改自己的部分，严禁整文件覆盖
+- **多会话并行修改**：`README.md` / `README_en.md` 属共享单文件，按 7.1「多会话并行开发（并行修改协议）」执行——先认领，动手前读当前内容，只做定位式修改，不整文件覆盖
 
 ### 7.3 注释规范
 
@@ -722,8 +736,8 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - [ ] 架构：所选风格（单文件 / 分层多文件）与既有代码一致；本项目为单文件，新工具函数放在模块级分区
 - [ ] 注释：只写 non-obvious reason，无残留中间状态、无被注释掉的旧代码
 - [ ] 类型：新增/修改函数完整类型注解，禁止 `Any` 与 `# type: ignore`
-- [ ] 日志：`logger.info/error/warning` + ❌/⚠️ emoji，新增 / 修改的日志带 `[astrbot_plugin_msg_forward_cc]` 前缀；异常分类记录；无空 catch
-- [ ] CHANGELOG：`[Unreleased]` 已追加分组式条目，**只写相对上一版的变化**、同一变化已合并为一条（无重复条目），条目面向用户（无内部实现细节、无复杂形容），保留了他人的既有记录（含扁平式历史条目）
+- [ ] 日志：来源只有 `astrbot.api` 的 logger（无 `import logging` / `logging.getLogger` / 第三方日志库），`logger.info/error/warning` + ❌/⚠️ emoji，新增 / 修改的日志带 `[astrbot_plugin_msg_forward_cc]` 前缀；异常分类记录；无空 catch
+- [ ] CHANGELOG：`[Unreleased]` 已同步（新增则追加、同一变化则合并、发版前被撤销则删除对应条目，不残留相对上一版不成立的内容），分组式条目，**只写相对上一版（上一次发布）的变化**、同一变化已合并为一条（无重复条目），条目面向用户（无内部实现细节、无复杂形容），保留了他人的既有记录（含扁平式历史条目）
 - [ ] README：涉及用户可见变更时已同步更新（4 大板块），且面向用户书写（无实现原理与内部细节）
 - [ ] README 配置板块：> 4 项时已按类别分组，单类 ≥ 4 项已用 `<details>` 折叠且 summary 自解释，首次必填的关键配置没被藏进折叠（配置表是备查资料，宁折叠勿铺长）
 - [ ] README 头部：首行是 `<img src="logo.png" alt="插件名" width="160" />`（当前只有中文版，建立英文版时照此补），`alt` 已填，头部元素间无空行
