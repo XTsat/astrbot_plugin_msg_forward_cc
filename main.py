@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import astrbot.api.star as star
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
@@ -3108,7 +3108,7 @@ class MsgForward(star.Star):
         if filter_mode == "off":
             lines.append("      （关闭，未启用过滤）")
         elif not patterns_data:
-            lines.append(f"      （已启用但未配置过滤规则）")
+            lines.append("      （已启用但未配置过滤规则）")
         else:
             for i, item in enumerate(patterns_data, start=1):
                 tp, val = MsgForward._parse_filter_item(item)
@@ -3651,7 +3651,7 @@ class MsgForward(star.Star):
                             )
                             if ret and "url" in ret:
                                 file_url_map[file_path] = ret["url"]
-                                logger.info(f"ℹ️ 通过 get_group_file_url 获取到文件下载 URL")
+                                logger.info("ℹ️ 通过 get_group_file_url 获取到文件下载 URL")
                 except ImportError:
                     pass
                 except Exception as e:
@@ -4611,7 +4611,7 @@ class MsgForward(star.Star):
                 self._remove_persisted_item(uid)
                 logger.warning(f"⚠️ 队列转发首次失败（{e}），已重新本地化媒体后重试成功")
             except asyncio.TimeoutError:
-                logger.warning(f"⚠️ 队列转发：媒体本地化超时（45s），进入远程 URL 兜底")
+                logger.warning("⚠️ 队列转发：媒体本地化超时（45s），进入远程 URL 兜底")
                 # 第二层降级：远程 URL 媒体
                 if item.get("has_media"):
                     try:
@@ -4625,11 +4625,11 @@ class MsgForward(star.Star):
                         fb_chain = await _prepare_chain_for_media_urls(fb_chain)
                         await self.context.send_message(target, MessageEventResult(chain=fb_chain))
                         self._remove_persisted_item(uid)
-                        logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
+                        logger.warning("⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
                     except Exception as e3:
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
                 else:
-                    logger.error(f"❌ 队列转发失败: 媒体本地化超时且无媒体可兜底")
+                    logger.error("❌ 队列转发失败: 媒体本地化超时且无媒体可兜底")
             except Exception as e2:
                 # 第二层降级：原始兜底，仅处理远程 URL 媒体
                 if item.get("has_media"):
@@ -4644,7 +4644,7 @@ class MsgForward(star.Star):
                         fb_chain = await _prepare_chain_for_media_urls(fb_chain)
                         await self.context.send_message(target, MessageEventResult(chain=fb_chain))
                         self._remove_persisted_item(uid)
-                        logger.warning(f"⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
+                        logger.warning("⚠️ 队列转发二次降级，已通过远程 URL 本地化后重试成功")
                     except Exception as e3:
                         logger.error(f"❌ 队列转发失败（本地化重试后仍失败）: {e3}")
                 else:
@@ -4686,7 +4686,6 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            source_platform = str(event.get_platform_name() or "")
             # 带上 1-based 规则编号（与 /mf list 显示的编号一致），供队列上限日志提示等使用
             rules = [(rid, r) for rid, r in enumerate(self.config.get("rules", []), start=1)
                      if source_umo in MsgForward._umo_list(r, "source_umo")]
@@ -4866,7 +4865,7 @@ class MsgForward(star.Star):
                                         localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
                                         fb_chain = localized if not target_header else [Plain(text=target_header)] + localized
                                         await self.context.send_message(target, event.chain_result(fb_chain))
-                                        logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
+                                        logger.warning("⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
                                         if cooldown_sec > 0:
                                             self._cooldowns[cd_key] = now + cooldown_sec
                                     except Exception as e3:
