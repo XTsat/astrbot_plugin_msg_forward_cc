@@ -468,3 +468,25 @@ class TestConfigGroupMigration:
         """迁移未执行时，读取仍能从旧分组取到值（兜底）。"""
         p = self._plugin({"at": {"at_nickname_lookup": True}})
         assert p._conf_get("at_nickname_lookup", False) is True
+
+
+class TestAtPassthroughPlatforms:
+    """额外 @ 透传平台：配置存在分组里，读取必须走分组否则永远取不到。"""
+
+    def test_builtin_qq_platforms_present(self):
+        import main as m
+
+        assert "aiocqhttp" in m._at_passthrough_platforms(None)
+
+    def test_extra_platform_appended(self):
+        import main as m
+
+        assert "myqq" in m._at_passthrough_platforms(["myqq"])
+
+    def test_read_from_grouped_config(self):
+        """分组配置里的追加平台能被读到（回归：曾直读扁平键导致失效）。"""
+        p = make_plugin({"enhance": {"at_passthrough_extra_platforms": ["myqq"]}})
+        import main as m
+
+        extra = p._conf_get("at_passthrough_extra_platforms", [])
+        assert "myqq" in m._at_passthrough_platforms(extra)

@@ -2265,14 +2265,16 @@ def _schema_default(group: str, key: str, fallback=None):
     return _SCHEMA_DEFAULTS_CACHE.get(f"{group}.{key}", fallback)
 
 
-def _at_passthrough_platforms(config) -> set:
+def _at_passthrough_platforms(extra_platforms=None) -> set:
     """返回允许 At 透传（按 qq 解析）的目标平台集合。
 
     内置 QQ 系平台默认透传；配置 at_passthrough_extra_platforms 可追加
-    （如自建适配器平台名）。追加项只增不减，无法用于关闭内置平台。"""
+    （如自建适配器平台名）。追加项只增不减，无法用于关闭内置平台。
+
+    入参是**已解析的追加项**（由调用方按分组结构读取）：配置改为分组存放后，
+    若在此直读扁平键会永远取不到值，追加平台就静默失效。"""
     platforms = set(_QQ_TARGET_PLATFORMS)
-    if config:
-        platforms |= _parse_platform_set(config.get("at_passthrough_extra_platforms"))
+    platforms |= _parse_platform_set(extra_platforms)
     return platforms
 
 
@@ -5179,7 +5181,9 @@ class MsgForward(star.Star):
                     )
                 return expanded_cache["chain"]
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
-            at_passthrough = _at_passthrough_platforms(self.config)
+            at_passthrough = _at_passthrough_platforms(
+                self._conf_get("at_passthrough_extra_platforms", [])
+            )
             now = time.time()
 
             for rid, rule in rules:
