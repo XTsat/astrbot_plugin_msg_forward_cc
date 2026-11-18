@@ -400,6 +400,10 @@ _FORWARD_PLACEHOLDER = "[聊天记录]"
 # AstrBot 中可直接发送 Nodes（合并转发）的目标平台适配器类型
 _NODES_TARGET_PLATFORMS = {"aiocqhttp", "satori"}
 
+# 支持协议端原生转发（forward_group_single_msg / forward_friend_single_msg）的平台类型。
+# 这两个 action 是 OneBot 11 扩展，satori 等其它适配器没有对应通路。
+_NATIVE_FORWARD_PLATFORMS = {"aiocqhttp"}
+
 # 嵌套聊天记录最多再展开的层数默认值（配置 forward_max_depth 可覆盖）。
 # 语义：除最外层记录外还能再展开几层，2 = 合计 3 层。
 # QQ 系协议端（NapCat / SnowLuma）发送时只接受 3 层嵌套，填更大值会让整条转发被
@@ -1507,6 +1511,48 @@ async def _fetch_forward_nodes(
         avatar_resolver=avatar_resolver,
         rebuild_card=rebuild_card,
     )
+
+
+def _is_single_forward_chain(chain) -> bool:
+    """整条消息是否就是一条合并转发（协议端原生转发的前提）。
+
+    `forward_group_single_msg` / `forward_friend_single_msg` 转发的是**整条消息**，
+    无法只取其中一段；消息里混排了文字 / 图片时原样搬过去会连那些内容一起转，
+    因此只有「链里恰好一个 Forward」时才允许走原生转发。"""
+    return bool(chain) and len(chain) == 1 and isinstance(chain[0], Forward)
+
+
+# 卡片里能唯一标识「这是一条聊天记录卡片」的标记（QQ 的 viewMultiMsg 卡片）
+_FORWARD_CARD_MARKERS = ("viewMultiMsg", "聊天记录")
+
+
+def _segment_is_forward_card(seg) -> bool:
+    """OneBot 消息段是否是一张「聊天记录」卡片（xml viewMultiMsg）。"""
+    if not isinstance(seg, dict) or seg.get("type") != "xml":
+        return False
+    raw = str((seg.get("data") or {}).get("data") or "")
+    return any(marker in raw for marker in _FORWARD_CARD_MARKERS)
+
+
+def _record_has_forward_card(messages) -> bool:
+    """记录（get_forward_msg 的节点列表）里是否含「聊天记录」卡片。
+
+    含卡片的记录不能走原生转发：协议端会把 xml 段原样搬到目标群，而 QQ 客户端
+    不会解析记录里的 xml 段，直接显示成 `[XML消息]`、点不开。重建链路能把卡片
+    按 m_resid 还原成真正的嵌套记录，才能正常点开。"""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        for seg in (msg.get("message") or msg.get("content") or []):
+            if _segment_is_forward_card(seg):
+                return True
+    return False
+
+
+def _native_forward_message_id(event) -> str:
+    """取源消息的 message_id（原生转发靠它定位要转发的消息）；取不到返回空串。"""
+    obj = getattr(event, "message_obj", None)
+    return str(getattr(obj, "message_id", "") or "").strip()
 
 
 async def _expand_forward_components(
@@ -3708,6 +3754,190 @@ class MsgForward(star.Star):
         logger.info(f"ℹ️ [astrbot_plugin_msg_forward_cc] 目标平台不支持合并转发，已降级为文本占位 → {target}")
         return [Plain(text=_FORWARD_PLACEHOLDER) if isinstance(c, (Node, Nodes)) else c for c in chain]
 
+    # ----- 合并转发：协议端原生转发（默认启用，同协议端时优先） -----
+
+    def _native_forward_enabled(self) -> bool:
+        """是否优先尝试协议端原生转发合并转发（配置 forward_native_relay，默认开启）。
+
+        开启时，源消息就是一条合并转发、且目标与源在同一个 QQ 协议端实例上，就先让
+        协议端自己搬这条记录（`forward_group_single_msg` / `forward_friend_single_msg`）：
+        记录内容、发送者身份、嵌套层数、内嵌卡片全部原样保留，省掉「拉取→重建→重传」
+        这一圈，也不会因重建丢头像或把深层记录压成文字。失败、跨平台、跨实例、消息里
+        混排了别的内容时一律回退到重建链路，所以关闭它只影响走不走这条快路径。"""
+        val = self._conf_get("forward_native_relay", True)
+        if isinstance(val, str):
+            return val.strip().lower() not in ("false", "0", "off", "no")
+        return bool(val)
+
+    def _forward_card_auto_rebuild(self) -> bool:
+        """记录里含「聊天记录」卡片时是否自动改走重建（配置 forward_card_auto_rebuild）。
+
+        默认开启：卡片在原生转发下会被原样搬过去，QQ 客户端只显示 `[XML消息]` 且
+        点不开；改走重建能按 `m_resid` 还原成真正可点开的嵌套记录。
+        关闭后一律走原生转发（更快），代价是这类记录的内层卡片在目标端显示成
+        `[XML消息]`。"""
+        val = self._conf_get("forward_card_auto_rebuild", True)
+        if isinstance(val, str):
+            return val.strip().lower() not in ("false", "0", "off", "no")
+        return bool(val)
+
+    def _same_platform_instance(self, event: AstrMessageEvent, target: str) -> bool:
+        """目标会话是否与事件来源在同一个协议端实例上（原生转发的硬前提）。
+
+        原生转发是「让某个协议端去搬一条它自己看得见的消息」，源与目标必须由同一个
+        适配器实例服务；跨账号 / 跨实例 / 跨平台时该消息在目标端不存在，只能重建。"""
+        source_id = str(event.get_platform_id() or "")
+        target_platform = str(target).split(":", 1)[0].strip()
+        if not source_id or not target_platform:
+            return False
+        return source_id == target_platform
+
+    def _native_forward_ready(self, event: AstrMessageEvent, chain, target: str) -> bool:
+        """判断这条消息能否对目标走原生转发（所有前提都满足才返回 True）。
+
+        前提：开关开启 → 整条消息就是一条合并转发 → 目标与源同实例 → 双方都是
+        aiocqhttp → 目标会话类型可解析（群聊 / 私聊）→ 能拿到源消息 message_id。
+        任何一条不满足都返回 False，由调用方回退到重建链路。"""
+        if not self._native_forward_enabled():
+            return False
+        if not _is_single_forward_chain(chain):
+            return False
+        if not self._same_platform_instance(event, target):
+            return False
+        platform_type = self._target_platform_type(target)
+        if platform_type not in _NATIVE_FORWARD_PLATFORMS:
+            return False
+        if not _native_forward_message_id(event):
+            return False
+        parts = str(target).split(":")
+        if len(parts) != 3 or not parts[1] or not parts[2].strip():
+            return False
+        return True
+
+    def _bot_of_platform(self, platform_id: str):
+        """按平台实例 ID 取 OneBot 协议端（队列发送时事件已结束，只能靠实例反查）。"""
+        if not platform_id:
+            return None
+        try:
+            inst = self.context.get_platform_inst(platform_id)
+        except Exception:
+            return None
+        bot = getattr(inst, "bot", None)
+        if bot is not None and hasattr(bot, "call_action"):
+            return bot
+        return None
+
+    async def _record_has_card(self, bot, message_id: str) -> bool:
+        """这条消息对应的合并记录里是否含「聊天记录」卡片（拉不到记录时返回 False）。
+
+        含卡片的记录必须走重建：协议端原生转发会把 xml 段原样搬到目标群，QQ 客户端
+        不解析记录里的 xml，只会显示 `[XML消息]` 且点不开；重建链路能按 m_resid
+        还原成真正的嵌套记录。
+
+        拉不到记录时返回 False（不阻断原生转发）：探测本身不该让快路径失效——
+        真含卡片的记录通常都能拉到（协议端为它保留了 payload），拉不到时多半是
+        记录已失效，那时原生转发也会失败并自动回退。
+
+        配置 `forward_card_auto_rebuild` 关闭时直接返回 False：用户选择一律走原生
+        转发（更快），此时卡片会被原样搬过去、目标端显示成 `[XML消息]`。"""
+        if not self._forward_card_auto_rebuild():
+            return False
+        if bot is None or not message_id:
+            return False
+        # 先由 message_id 取出这条消息的 res_id：get_forward_msg 只认记录 ID，
+        # 直接传 message_id 会失败（SnowLuma 返回「payload is empty」）。
+        forward_id = ""
+        try:
+            detail = _unwrap_onebot_data(
+                await bot.call_action("get_msg", message_id=int(message_id))
+            )
+        except (TypeError, ValueError):
+            # message_id 不是整数（部分协议端用字符串 ID），退回按原值调用
+            try:
+                detail = _unwrap_onebot_data(
+                    await bot.call_action("get_msg", message_id=message_id)
+                )
+            except Exception:
+                detail = {}
+        except Exception:
+            detail = {}
+        for seg in (detail.get("message") or []):
+            if isinstance(seg, dict) and seg.get("type") == "forward":
+                forward_id = str((seg.get("data") or {}).get("id") or "").strip()
+                if forward_id:
+                    break
+        if not forward_id:
+            # 取不到记录 ID 说明不是「可搬运的合并转发」，交给原生转发自己判断
+            return False
+        try:
+            payload = _unwrap_onebot_data(
+                await bot.call_action("get_forward_msg", id=forward_id)
+            )
+        except Exception:
+            return False
+        messages = _forward_messages_of(payload)
+        return _record_has_forward_card(messages) if messages else False
+
+    # 上一次原生转发放弃是否因为「记录里含聊天记录卡片」（调用方据此强制还原卡片）
+    _native_card_blocked: bool = False
+
+    async def _forward_by_message_id(self, bot, message_id: str, target: str) -> bool:
+        """让协议端把 `message_id` 指向的消息原样转发到目标会话；成功返回 True。
+
+        群聊用 `forward_group_single_msg`（参数 group_id），私聊用
+        `forward_friend_single_msg`（参数 user_id）。失败只记 debug：这是快路径，
+        调用方会立刻回退到重建链路，不必刷告警。"""
+        if bot is None or not message_id:
+            return False
+        parts = str(target).split(":")
+        if len(parts) != 3:
+            return False
+        msg_type = parts[1].strip()
+        conversation_id = parts[2].strip()
+        if not conversation_id.isdigit():
+            # 两个 action 的会话参数都是整数 ID，非数字说明 UMO 形态不对，直接放弃
+            logger.debug(
+                f"[astrbot_plugin_msg_forward_cc] 原生转发跳过：目标会话 ID 非数字（{conversation_id!r}）"
+            )
+            return False
+        if msg_type == "GroupMessage":
+            action, params = "forward_group_single_msg", {"group_id": int(conversation_id)}
+        elif msg_type == "FriendMessage":
+            action, params = "forward_friend_single_msg", {"user_id": int(conversation_id)}
+        else:
+            logger.debug(
+                f"[astrbot_plugin_msg_forward_cc] 原生转发跳过：未知会话类型 {msg_type!r}"
+            )
+            return False
+        # 含「聊天记录」卡片的记录不能原样搬运：QQ 客户端不解析记录里的 xml 段，
+        # 只会显示 `[XML消息]` 且点不开；交给重建链路按 m_resid 还原成嵌套记录
+        self._native_card_blocked = False
+        if await self._record_has_card(bot, message_id):
+            self._native_card_blocked = True
+            logger.info(
+                f"ℹ️ [astrbot_plugin_msg_forward_cc] 记录内含聊天记录卡片，"
+                f"改走重建链路以便点开 → {target}"
+            )
+            return False
+        try:
+            await bot.call_action(action, message_id=message_id, **params)
+        except Exception as e:
+            logger.debug(
+                f"[astrbot_plugin_msg_forward_cc] 原生转发失败（{action} → {target}），"
+                f"回退重建链路：{e}"
+            )
+            return False
+        logger.info(
+            f"ℹ️ [astrbot_plugin_msg_forward_cc] 已通过协议端原生转发合并记录 → {target}"
+        )
+        return True
+
+    async def _send_native_forward(self, event: AstrMessageEvent, target: str) -> bool:
+        """即时转发路径的原生转发入口（协议端与 message_id 都来自当前事件）。"""
+        return await self._forward_by_message_id(
+            _onebot_bot_of(event), _native_forward_message_id(event), target
+        )
+
     # ----- @昵称反查 qq（v0.5.0 可选增强，默认关闭） -----
 
     # 群成员列表缓存：group_id → (拉取时间戳, {昵称/群名片: user_id}, {user_id: 昵称},
@@ -4147,6 +4377,8 @@ class MsgForward(star.Star):
         "header_template": ("basic", "header_template"),
         "default_content_types": ("basic", "default_content_types"),
         "forward_keep_time": ("forward", "forward_keep_time"),
+        "forward_native_relay": ("forward", "forward_native_relay"),
+        "forward_card_auto_rebuild": ("forward", "forward_card_auto_rebuild"),
         "forward_node_avatar": ("forward", "forward_node_avatar"),
         "forward_card_preview": ("forward", "forward_card_preview"),
         "forward_max_depth": ("forward", "forward_max_depth"),
@@ -4355,7 +4587,9 @@ class MsgForward(star.Star):
 
     def _enqueue_send(self, target: str, result: MessageEventResult, interval: int,
                       sanitized_chain, header_text: str, has_media: bool,
-                      use_proxy: bool, proxy_url, rule_key: str = "", rule_label: str = ""):
+                      use_proxy: bool, proxy_url, rule_key: str = "", rule_label: str = "",
+                      native_forward: dict | None = None,
+                      card_rebuilt_chain: list | None = None):
         """把一次转发任务加入发送队列，交由后台 worker 按间隔依次发送。
 
         同时保存兜底所需的信息，供发送失败时在 worker 内本地化媒体后重试。
@@ -4392,6 +4626,11 @@ class MsgForward(star.Star):
             "use_proxy": use_proxy,
             "proxy_url": proxy_url,
             "rule_key": rule_key,
+            # 原生转发快路径所需的信息（协议端实例 ID + 源消息 ID）；
+            # 为空表示该条不走快路径，直接按重建链发送
+            "native_forward": native_forward or {},
+            # 记录含卡片时备好的「卡片已还原」链（worker 回退重建时换用）
+            "card_rebuilt_chain": card_rebuilt_chain,
         }
         # 按规则分桶入队（不同规则的桶互不阻塞，各自按自己的间隔调度）
         self._rule_queue(rule_key).put_nowait(item)
@@ -4412,6 +4651,10 @@ class MsgForward(star.Star):
                 "use_proxy": use_proxy,
                 "proxy_url": proxy_url,
                 "rule_key": rule_key,
+                "native_forward": native_forward or {},
+                "card_rebuilt_chain": _serialize_chain(card_rebuilt_chain)
+                if card_rebuilt_chain
+                else [],
             })
             self._save_persisted_queue(persisted)
         except Exception as e:
@@ -4490,6 +4733,12 @@ class MsgForward(star.Star):
                     "use_proxy": bool(it.get("use_proxy", False)),
                     "proxy_url": it.get("proxy_url", None),
                     "rule_key": rk,
+                    "native_forward": it.get("native_forward") or {},
+                    "card_rebuilt_chain": _deserialize_chain(
+                        it.get("card_rebuilt_chain") or [],
+                        card_preview_mode=card_preview_mode,
+                    )
+                    or None,
                 })
                 if rk:
                     self._queue_rule_counts[rk] = self._queue_rule_counts.get(rk, 0) + 1
@@ -4565,6 +4814,92 @@ class MsgForward(star.Star):
                 logger.error(f"❌ 队列 worker 异常，已恢复继续运行: {e!r}")
                 await asyncio.sleep(1)
 
+    async def _card_rebuilt_chain_for_queue(
+        self, event, sanitized_chain, target: str, at_lookup: bool,
+        at_passthrough: set, header_text: str,
+    ) -> list | None:
+        """为队列条目备一份「卡片已还原」的链（记录里没卡片时返回 None）。
+
+        队列 worker 到点后先试原生转发；若因记录含卡片而回退，就用这份链重建，
+        否则卡片会按 xml 原样发出、目标端显示 `[XML消息]` 点不开。
+
+        只有确认记录里确有卡片时才展开——避免给每条队列消息都白做一次完整重建。"""
+        bot = _onebot_bot_of(event)
+        message_id = _native_forward_message_id(event)
+        if bot is None or not message_id:
+            return None
+        try:
+            if not await self._record_has_card(bot, message_id):
+                return None
+        except Exception:
+            return None
+        expanded = await _expand_forward_components(
+            event,
+            sanitized_chain,
+            keep_time=bool(self._conf_get("forward_keep_time", True)),
+            card_preview_mode=self._card_preview_mode(),
+            avatar_resolver=(
+                self._forward_node_name_map if self._forward_avatar_enabled() else None
+            ),
+            depth=self._forward_max_depth(),
+            rebuild_card=True,
+        )
+        chain = expanded
+        if at_lookup:
+            chain = _sanitize_at_chain_for_target(chain, target, at_passthrough)
+            chain = await self._resolve_at_mentions(chain, target)
+        else:
+            chain = _textify_at_chain(chain)
+        chain = self._degrade_forward_for_target(chain, target)
+        return [Plain(text=header_text)] + chain if header_text else chain
+
+    async def _send_queued_native(self, item: dict) -> bool:
+        """队列条目优先尝试协议端原生转发；成功（含来源头）返回 True。
+
+        与即时路径一样：来源头必须先发出去，否则退回重建链，避免来源信息丢失。
+        队列延迟期间记录可能已被撤回、message_id 可能已失效，故失败只记 debug。"""
+        info = item.get("native_forward") or {}
+        if not info:
+            return False
+        if not self._native_forward_enabled():
+            return False
+        platform_id = str(info.get("platform_id", "") or "")
+        message_id = str(info.get("message_id", "") or "")
+        target = item["target"]
+        if not platform_id or not message_id:
+            return False
+        # 目标必须仍在同一协议端实例上（规则可能在排队期间被改到别的实例）
+        if str(target).split(":", 1)[0].strip() != platform_id:
+            return False
+        bot = self._bot_of_platform(platform_id)
+        if bot is None:
+            logger.debug(
+                f"[astrbot_plugin_msg_forward_cc] 队列原生转发跳过：取不到协议端 {platform_id}"
+            )
+            return False
+        header_text = item.get("header_text", "") or ""
+        if header_text:
+            try:
+                await self.context.send_message(
+                    target, MessageEventResult(chain=[Plain(text=header_text)])
+                )
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ [astrbot_plugin_msg_forward_cc] 队列来源头发送失败，"
+                    f"改由重建链路一并发送：{e}"
+                )
+                return False
+        if await self._forward_by_message_id(bot, message_id, target):
+            return True
+        if self._native_card_blocked:
+            # 记录里含卡片：重建时必须连带把卡片还原成真正的嵌套记录，否则发出去
+            # 仍是 `[XML消息]`。入队时若已备好「卡片已还原」的链就换用它。
+            card_chain = item.get("card_rebuilt_chain")
+            if card_chain:
+                item["result"] = MessageEventResult(chain=card_chain)
+                item["sanitized_chain"] = card_chain
+        return False
+
     async def _send_queued_item(self, item: dict):
         """发送队列中的单条消息，失败时先尝试重新本地化媒体再重试。
 
@@ -4578,6 +4913,12 @@ class MsgForward(star.Star):
         target = item["target"]
         result = item["result"]
         uid = item.get("uid", "")
+        # 原生转发快路径（配置 forward_native_relay）：入队时若记下了协议端实例与源
+        # 消息 ID，就先让协议端搬这条记录。记录可能已被撤回或 message_id 已失效，
+        # 失败按预期处理——直接落到下面的重建链，不额外告警。
+        if await self._send_queued_native(item):
+            self._remove_persisted_item(uid)
+            return
         try:
             # 发送前：为 Video/File 注册文件服务 URL（Image/Record 由 aiocqhttp 转 base64）
             outgoing = await _prepare_chain_for_media_urls(result.chain)
@@ -4711,8 +5052,10 @@ class MsgForward(star.Star):
             sanitized_chain = _sanitize_file_chain_for_forward(sanitized_chain)
             # 为无 URL 的 File 组件尝试从原始 OneBot 消息获取下载 URL（get_group_file_url）
             sanitized_chain = await self._resolve_file_urls(event, sanitized_chain)
-            # 合并转发（聊天记录）展开：源会话的 forward resId 在目标端无效，
-            # 需拉取真实内容重建 Nodes，交给目标平台重新上传（否则显示坏卡片）
+            # 合并转发（聊天记录）：源会话的 forward resId 在目标端无效。默认先把内容
+            # 拉取重建为 Nodes 交给目标端重新上传；但整条消息就是一条记录、且目标与源在
+            # 同一个协议端实例时，优先让协议端自己搬（见 `_send_native_forward`）——
+            # 那条路径不需要重建，故展开结果按需计算，命中快路径时一次拉取都不做。
             keep_forward_time = bool(self._conf_get("forward_keep_time", True))
             # 卡片预览：来源 + 标题（默认）/ 仅标题 / 不显示，见 forward_card_preview
             card_preview_mode = self._card_preview_mode()
@@ -4720,15 +5063,28 @@ class MsgForward(star.Star):
             avatar_resolver = (
                 self._forward_node_name_map if self._forward_avatar_enabled() else None
             )
-            sanitized_chain = await _expand_forward_components(
-                event,
-                sanitized_chain,
-                keep_time=keep_forward_time,
-                card_preview_mode=card_preview_mode,
-                avatar_resolver=avatar_resolver,
-                depth=self._forward_max_depth(),
-                rebuild_card=self._forward_rebuild_card(),
-            )
+            expanded_cache: dict = {}
+
+            async def _expanded_chain(force_rebuild_card: bool = False) -> list:
+                """本次事件的合并转发展开结果（只展开一次，多个规则/目标复用）。
+
+                force_rebuild_card=True 用于「本来能走原生转发、只因记录里含聊天记录卡片
+                才改走重建」的情况：此时必须连带把卡片还原成真正的嵌套记录，否则卡片
+                按原样（xml 段）发出去，目标端仍会显示 `[XML消息]` 且点不开。"""
+                key = "card" if force_rebuild_card else "chain"
+                if key not in expanded_cache:
+                    expanded_cache[key] = await _expand_forward_components(
+                        event,
+                        sanitized_chain,
+                        keep_time=keep_forward_time,
+                        card_preview_mode=card_preview_mode,
+                        avatar_resolver=avatar_resolver,
+                        depth=self._forward_max_depth(),
+                        rebuild_card=(
+                            True if force_rebuild_card else self._forward_rebuild_card()
+                        ),
+                    )
+                return expanded_cache[key]
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
@@ -4749,10 +5105,15 @@ class MsgForward(star.Star):
                 if not self._should_forward_by_sender(event, rule):
                     continue
 
-                # 内容类型筛选：仅保留规则选中的类型（默认全选，但「指令」默认不勾）
+                # 内容类型筛选：仅保留规则选中的类型（默认全选，但「指令」默认不勾）。
+                # 链里没有合并转发时可以就地判定（不触发任何拉取）；有合并转发时必须等
+                # 展开之后再筛——原始链里的一条 Forward 归入「其他」，展开失败后会变成
+                # 「文字」占位，两者命中不同的类型，提前按原始链判定会改变语义。
                 allowed = _content_types_for(rule, self.config)
-                filtered_chain = _filter_chain_by_types(sanitized_chain, allowed, is_command)
-                if not filtered_chain:
+                has_forward = any(isinstance(c, Forward) for c in sanitized_chain)
+                if not has_forward and not _filter_chain_by_types(
+                    sanitized_chain, allowed, is_command
+                ):
                     # 消息不含任何选中类型，跳过该规则（不转发、不占冷却）
                     continue
 
@@ -4775,10 +5136,35 @@ class MsgForward(star.Star):
 
                 # 主消息链：默认透传（正常网络，媒体交给目标端自行处理）；
                 # 开启 download_media_before_send 时，发送前先本地化。
-                if self._should_download_media(rule):
-                    message_chain = await _prepare_chain_for_forward(filtered_chain)
-                else:
-                    message_chain = filtered_chain
+                # 合并转发的展开结果按需计算：命中原生转发快路径时一次都不展开。
+                chain_cache: dict = {}
+                # 原生转发因「记录含卡片」被放弃时置 True：重建链路要连带还原卡片
+                card_chain_cache: dict = {}
+
+                async def _filtered_chain(allowed_types: set = allowed) -> list:
+                    """本规则的转发内容（展开 → 按内容类型筛选），只算一次。
+
+                    顺序与改造前一致：先展开合并转发、再按本规则的内容类型筛选，
+                    否则「只勾了文字」的规则会连聊天记录一起转出去。"""
+                    if "filtered" not in chain_cache:
+                        expanded = await _expanded_chain(
+                            force_rebuild_card=bool(card_chain_cache.get("force"))
+                        )
+                        chain_cache["filtered"] = _filter_chain_by_types(
+                            expanded, allowed_types, is_command
+                        )
+                    return chain_cache["filtered"]
+
+                async def _message_chain(rule: dict = rule) -> list:
+                    """本规则的主消息链（转发内容 + 可选媒体本地化），只算一次。"""
+                    if "chain" not in chain_cache:
+                        filtered = await _filtered_chain()
+                        chain_cache["chain"] = (
+                            await _prepare_chain_for_forward(filtered)
+                            if self._should_download_media(rule)
+                            else filtered
+                        )
+                    return chain_cache["chain"]
 
                 # 来源头：仅当「文字」在选中类型中才前置（hide_header 时始终不前置）。
                 # 只转发图片/视频等纯媒体时，消息里不含任何文字，来源头也不附带。
@@ -4786,8 +5172,16 @@ class MsgForward(star.Star):
                 if _should_attach_header(rule, allowed):
                     header_text = self._format_origin_header(event, source_umo) + "\n\n\u200b"
 
-                # 是否含媒体组件（含合并转发节点内的媒体，决定失败时是否值得本地化后重试）
-                has_media = _chain_has_media(filtered_chain)
+                # 是否含媒体组件（含合并转发节点内的媒体，决定失败时是否值得本地化后重试）。
+                # 节点内媒体要展开后才看得见，故按需计算，命中原生转发时不触发展开。
+                has_media_cache: dict = {}
+
+                async def _has_media() -> bool:
+                    # 用本地化**之前**的链判断：媒体本地化失败会被替换成占位文本，
+                    # 拿本地化后的链判断会把「本来有媒体」误判成没有，从而跳过兜底重试
+                    if "value" not in has_media_cache:
+                        has_media_cache["value"] = _chain_has_media(await _filtered_chain())
+                    return has_media_cache["value"]
                 # 规则级代理三态：use_proxy 关→直连；开且 proxy_url 空→系统代理；开且非空→该地址
                 use_proxy = bool(rule.get("use_proxy", False))
                 proxy_url = (rule.get("proxy_url") or "").strip() or None
@@ -4797,6 +5191,66 @@ class MsgForward(star.Star):
 
                 # 逐目标发送：一个目标失败不影响其他目标（冷却按 源|目标 对记录）
                 for target in targets:
+                    cd_key = f"{source_umo}|{target}"
+                    # 原生转发快路径：整条消息就是一条合并转发，且目标与源在同一个协议端
+                    # 实例上——让协议端自己搬这条记录，不拉取、不重建，内容 / 发送者身份 /
+                    # 嵌套层数 / 内嵌卡片全部原样保留。队列模式改为入队时记下协议端实例与
+                    # 源消息 ID，由 worker 到点后先试一次（记录可能已撤回，失败即回退）。
+                    header_sent = False
+                    # 判断对象必须是**原始**消息链：原生转发转的是整条源消息，若原消息
+                    # 还带文字 / 图片，内容类型筛选后即使只剩一条 Forward 也不能走这条路，
+                    # 否则会把没选中的内容一起转过去。同理，规则没勾「其他」（聊天记录
+                    # 归入的类型）时也不能走——那条路绕过了重建链路的类型筛选。
+                    native_ready = (
+                        "other" in allowed
+                        and _is_single_forward_chain(sanitized_chain)
+                        and self._native_forward_ready(event, sanitized_chain, target)
+                    )
+                    # 队列模式不在这里发：把协议端实例与源消息 ID 记进队列条目，
+                    # 由 worker 到点后先试原生转发、失败再回退重建（记录可能已撤回）
+                    queue_native_info = (
+                        {
+                            "platform_id": str(event.get_platform_id() or ""),
+                            "message_id": _native_forward_message_id(event),
+                        }
+                        if native_ready and queue_interval > 0
+                        else None
+                    )
+                    if native_ready and queue_interval <= 0:
+                        if cooldown_sec > 0 and now < self._cooldowns.get(cd_key, 0):
+                            continue
+                        header_ok = True
+                        if header_text:
+                            # 重建链路里来源头本来就是单独一条消息（aiocqhttp 对 Nodes 逐段
+                            # 发送），这里保持一致：先发头，再让协议端转发记录
+                            try:
+                                await self.context.send_message(
+                                    target, event.chain_result([Plain(text=header_text)])
+                                )
+                                header_sent = True
+                            except Exception as e:
+                                # 头没发出去就不能走原生转发：那条路只发记录本身，
+                                # 没有第二次机会补上来源头，会静默丢掉来源信息
+                                header_ok = False
+                                logger.warning(
+                                    f"⚠️ [astrbot_plugin_msg_forward_cc] 来源头发送失败，"
+                                    f"改由重建链路一并发送：{e}"
+                                )
+                        if header_ok and await self._send_native_forward(event, target):
+                            if cooldown_sec > 0:
+                                self._cooldowns[cd_key] = now + cooldown_sec
+                            continue
+                        # 原生转发失败（或来源头没发出去）→ 落到下面的重建链路。
+                        # 若放弃原因是「记录里含卡片」，重建时必须连带把卡片还原，
+                        # 否则卡片按 xml 原样发出，目标端还是 `[XML消息]` 点不开。
+                        if self._native_card_blocked:
+                            card_chain_cache["force"] = True
+
+                    message_chain = await _message_chain()
+                    if not message_chain:
+                        # 展开后按本规则的内容类型筛完为空：整条消息不含选中类型，
+                        # 跳过该目标（不发送、不占冷却），与改造前一致
+                        continue
                     # 目标级链：at_nickname_lookup 开启（高级 @）→ QQ 系按 qq 透传真实 At，
                     # 并按目标群成员列表反查昵称精确 @；默认关闭 → At 一律转为文本 @昵称
                     # （不发送真实 At 组件，彻底规避协议端 At 解析/群成员查询超时）
@@ -4807,7 +5261,7 @@ class MsgForward(star.Star):
                         base_chain = _textify_at_chain(message_chain)
                     # 目标平台不支持合并转发时降级为文本占位（跨平台目标）
                     base_chain = self._degrade_forward_for_target(base_chain, target)
-                    target_header = header_text
+                    target_header = "" if header_sent else header_text
                     new_chain = base_chain if not target_header else [Plain(text=target_header)] + base_chain
 
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
@@ -4816,18 +5270,25 @@ class MsgForward(star.Star):
                         queue_chain = await _prepare_chain_for_queue(
                             base_chain, use_proxy=use_proxy, proxy_url=proxy_url,
                         )
+                        # 队列条目若带原生转发信息，备一份「卡片已还原」的链：worker
+                        # 到点后发现记录含卡片、回退重建时直接换用，避免发出 `[XML消息]`
+                        card_rebuilt = None
+                        if queue_native_info:
+                            card_rebuilt = await self._card_rebuilt_chain_for_queue(
+                                event, sanitized_chain, target, at_lookup,
+                                at_passthrough, header_text,
+                            )
                         self._enqueue_send(
                             target, event.chain_result(queue_chain), queue_interval,
-                            base_chain, header_text, has_media,
+                            base_chain, header_text, await _has_media(),
                             use_proxy, proxy_url,
                             rule_key=rule_key, rule_label=f"#{rid}",
+                            native_forward=queue_native_info,
+                            card_rebuilt_chain=card_rebuilt,
                         )
                         continue
-                    if cooldown_sec > 0:
-                        cd_key = f"{source_umo}|{target}"
-                        cd_end = self._cooldowns.get(cd_key, 0)
-                        if now < cd_end:
-                            continue
+                    if cooldown_sec > 0 and now < self._cooldowns.get(cd_key, 0):
+                        continue
                     try:
                         await self.context.send_message(target, event.chain_result(new_chain))
                         # 转发成功后设置冷却
@@ -4852,7 +5313,9 @@ class MsgForward(star.Star):
                             # 第一层降级：AstrBot 核心重新本地化所有媒体
                             try:
                                 if fallback_chain is None:
-                                    prepared = await _prepare_chain_for_forward(filtered_chain)
+                                    # 用展开后的链：filtered_chain 里还留着源会话的 Forward，
+                                    # 媒体本地化对它无效
+                                    prepared = await _prepare_chain_for_forward(await _filtered_chain())
                                     fallback_chain = prepared if not target_header else [Plain(text=target_header)] + prepared
                                 await self.context.send_message(target, event.chain_result(fallback_chain))
                                 logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
@@ -4860,9 +5323,9 @@ class MsgForward(star.Star):
                                     self._cooldowns[cd_key] = now + cooldown_sec
                             except Exception as e2:
                                 # 第二层降级：远程 URL 媒体
-                                if has_media:
+                                if await _has_media():
                                     try:
-                                        localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
+                                        localized = await _prepare_chain_fallback(await _filtered_chain(), use_proxy=use_proxy, proxy_url=proxy_url)
                                         fb_chain = localized if not target_header else [Plain(text=target_header)] + localized
                                         await self.context.send_message(target, event.chain_result(fb_chain))
                                         logger.warning("⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
