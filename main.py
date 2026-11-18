@@ -2236,6 +2236,35 @@ def _parse_platform_set(raw) -> set:
     return {str(x).strip().lower() for x in items if str(x).strip()}
 
 
+_SCHEMA_DEFAULTS_CACHE: dict[str, object] | None = None
+
+
+def _schema_default(group: str, key: str, fallback=None):
+    """取某个配置项的 schema 默认值（用于判断配置是否被用户改过）。
+
+    迁移旧分组时不能只看「新分组里有没有这个键」——AstrBot 在插件初始化前
+    就会按 schema 把新分组填成默认值，那个键永远存在。只能对比默认值本身。"""
+    global _SCHEMA_DEFAULTS_CACHE
+    if _SCHEMA_DEFAULTS_CACHE is None:
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+
+            raw = _Path(__file__).with_name("_conf_schema.json").read_text("utf-8")
+            schema = _json.loads(raw)
+            cache: dict[str, object] = {}
+            for gname, gnode in schema.items():
+                items = (gnode or {}).get("items") if isinstance(gnode, dict) else None
+                if isinstance(items, dict):
+                    for k, v in items.items():
+                        if isinstance(v, dict) and "default" in v:
+                            cache[f"{gname}.{k}"] = v["default"]
+            _SCHEMA_DEFAULTS_CACHE = cache
+        except Exception:
+            _SCHEMA_DEFAULTS_CACHE = {}
+    return _SCHEMA_DEFAULTS_CACHE.get(f"{group}.{key}", fallback)
+
+
 def _at_passthrough_platforms(config) -> set:
     """返回允许 At 透传（按 qq 解析）的目标平台集合。
 
@@ -2471,6 +2500,8 @@ class MsgForward(star.Star):
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
+        # 迁移旧分组：media / at / platform 已合并进 enhance
+        self._migrate_config_groups()
 
     def _migrate_legacy_umo_lists(self):
         """把旧版 list 类型存储的 source_umo / target_umo 迁移为每行一条的 text。
@@ -2497,6 +2528,60 @@ class MsgForward(star.Star):
                 logger.info("✅ 已将旧版列表格式的 source_umo/target_umo 迁移为每行一条的文本格式")
         except Exception as e:
             logger.warning(f"⚠️ UMO 字段迁移失败（不影响正常运行）：{e}")
+
+    # 已合并进 enhance 的旧分组 → 其下的配置项
+    _LEGACY_GROUP_MOVES: dict[str, tuple[str, ...]] = {
+        "media": ("download_media_before_send",),
+        "at": (
+            "at_nickname_lookup",
+            "at_nickname_lookup_cache_ttl",
+            "at_passthrough_extra_platforms",
+        ),
+        "platform": ("platform_names",),
+    }
+
+    def _migrate_config_groups(self):
+        """把旧分组 media / at / platform 的配置值搬进 enhance。
+
+        分组合并后配置路径变化，不迁移的话用户这几组的设置会静默回到默认值。
+        **旧分组必须继续留在 schema 里（标记 invisible）**：AstrBot 在插件初始化前
+        就按 schema 裁剪配置，schema 里没有的键会被直接丢弃并写回磁盘——那样这里
+        根本读不到存量值，迁移就无从下手。
+
+        只补 enhance 里还没有的键，避免覆盖用户已在新分组写入的值；搬迁后不删除旧
+        分组（它们已被 AstrBot 按 schema 重建，删除只会每次加载都触发一次保存），
+        旧值随之留作惰性残留，读取始终以 enhance 为准。"""
+        try:
+            enhance = self.config.get("enhance")
+            if not isinstance(enhance, dict):
+                enhance = {}
+            changed = False
+            for old_group, keys in self._LEGACY_GROUP_MOVES.items():
+                section = self.config.get(old_group)
+                if not isinstance(section, dict):
+                    continue
+                for key in keys:
+                    if key not in section:
+                        continue
+                    old_val = section[key]
+                    # 旧值等于旧分组的默认值 → 没有用户意图需要保留
+                    if old_val == _schema_default(old_group, key):
+                        continue
+                    # 新分组已被用户改过 → 以新值为准，不用旧值覆盖。
+                    # 注意比对的是**新分组**的默认值：旧分组的默认值可能与之不同
+                    # （如 platform_names 旧默认空列表、新默认是完整映射表）。
+                    if key in enhance and enhance[key] != _schema_default("enhance", key):
+                        continue
+                    enhance[key] = old_val
+                    changed = True
+            if changed:
+                self.config["enhance"] = enhance
+                self.config.save_config()
+                logger.info(
+                    "✅ 已将旧分组（media / at / platform）的配置迁移到 enhance"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ 配置分组迁移失败（不影响正常运行）：{e}")
 
     def _format_origin_header(self, event: AstrMessageEvent, umo: str) -> str:
         try:
@@ -3377,7 +3462,7 @@ class MsgForward(star.Star):
     @queue.command("status")
     async def cmd_queue_status(self, event: AstrMessageEvent):
         """查看发送队列状态与配置"""
-        enabled = bool(self._conf_get("queue_enabled", False))
+        enabled = bool(self._conf_get("queue_enabled", True))
         default_qi = int(self._conf_get("default_queue_interval_seconds", 0) or 0)
         max_size = int(self._conf_get("queue_max_size", 0) or 0)
         retention = int(self._conf_get("queue_media_retention_hours", 0) or 0)
@@ -3395,7 +3480,19 @@ class MsgForward(star.Star):
             f"  当前积压：{pending} 条",
         ]
         if not enabled:
-            lines.append("  ⚠️ 总开关已停用，即使规则设置了间隔也不会进入队列")
+            # 只在确实有规则设了间隔时才提示，否则开关关着也是正常状态
+            queued_rules = sum(
+                1
+                for r in self.config.get("rules", [])
+                if isinstance(r, dict) and self._queue_interval_for(r) > 0
+            )
+            if queued_rules:
+                lines.append(
+                    f"  ⚠️ 总开关已停用，{queued_rules} 条设置了间隔的规则正在立即转发"
+                    f"（/mf queue on 恢复队列）"
+                )
+            else:
+                lines.append("  ⛔ 总开关已停用，所有规则立即转发")
         if self._queue_paused:
             lines.append("  ⚠️ 队列已暂停，积压消息暂不发送（/mf queue resume 恢复）")
         lines.append("\n📋 各规则队列（间隔 / 长度上限 / 当前积压）：")
@@ -4393,24 +4490,32 @@ class MsgForward(star.Star):
         "default_cooldown_seconds": ("queue", "default_cooldown_seconds"),
         "queue_max_size": ("queue", "queue_max_size"),
         "queue_media_retention_hours": ("queue", "queue_media_retention_hours"),
-        "download_media_before_send": ("media", "download_media_before_send"),
-        "at_nickname_lookup": ("at", "at_nickname_lookup"),
-        "at_nickname_lookup_cache_ttl": ("at", "at_nickname_lookup_cache_ttl"),
-        "at_passthrough_extra_platforms": ("at", "at_passthrough_extra_platforms"),
-        "platform_names": ("platform", "platform_names"),
+        "download_media_before_send": ("enhance", "download_media_before_send"),
+        "at_nickname_lookup": ("enhance", "at_nickname_lookup"),
+        "at_nickname_lookup_cache_ttl": ("enhance", "at_nickname_lookup_cache_ttl"),
+        "at_passthrough_extra_platforms": ("enhance", "at_passthrough_extra_platforms"),
+        "platform_names": ("enhance", "platform_names"),
     }
 
     def _conf_get(self, key: str, default=None):
         """读取配置项（兼容分组结构与旧扁平结构）。
 
         schema 使用 object 分组后配置为嵌套 dict；旧配置或迁移未完成时仍是扁平键，
-        两种情况都要能读到，避免升级后配置整体失效。"""
+        两种情况都要能读到，避免升级后配置整体失效。
+
+        另外兼容「分组被合并」的旧位置（media / at / platform → enhance）：
+        `_migrate_config_groups` 已负责搬迁，这里兜底以防迁移被跳过或保存失败。"""
         group = self._CONFIG_GROUPS.get(key)
         if group:
             gname, gkey = group
             section = self.config.get(gname)
             if isinstance(section, dict) and gkey in section:
                 return section[gkey]
+            for legacy, keys in self._LEGACY_GROUP_MOVES.items():
+                if key in keys:
+                    old_section = self.config.get(legacy)
+                    if isinstance(old_section, dict) and key in old_section:
+                        return old_section[key]
         return self.config.get(key, default)
 
     def _conf_set(self, key: str, value) -> None:
@@ -4489,7 +4594,7 @@ class MsgForward(star.Star):
         后台 worker 也不读冷却表——此时只有队列间隔在限流。
         仅当总开关开启且规则实际处于队列模式（间隔 > 0）时成立；总开关关闭时
         队列间隔被强制置 0，冷却仍正常生效。"""
-        return self._queue_interval_for(rule) > 0 and bool(self._conf_get("queue_enabled", False))
+        return self._queue_interval_for(rule) > 0 and bool(self._conf_get("queue_enabled", True))
 
     def _queue_global_max(self) -> int:
         """全局发送队列总上限（所有规则合计积压条数），0=不限制。"""
@@ -5110,7 +5215,7 @@ class MsgForward(star.Star):
 
                 # 发送队列间隔：> 0 时消息进入队列，由后台 worker 每隔该秒数发送一条
                 queue_interval = self._queue_interval_for(rule)
-                if queue_interval > 0 and not self._conf_get("queue_enabled", False):
+                if queue_interval > 0 and not self._conf_get("queue_enabled", True):
                     queue_interval = 0
                 # 队列模式下冷却检查与写入都会被跳过（队列分支先于冷却检查 continue），冷却实际失效；
                 # 同时配置两者容易误判，按 rule_key 只告警一次

@@ -334,3 +334,137 @@ class TestCardRebuildFollowsSingleSwitch:
         calls = await self._capture_rebuild_flag(False, native_ok=False)
         assert calls, "原生转发失败时应回退到重建"
         assert True not in calls, f"关闭时不应强制 rebuild_card=True，实际 {calls}"
+
+
+class TestQueueMasterSwitchDefault:
+    """发送队列总开关默认开启：规则设了间隔就直接生效。
+
+    默认关闭会让「设了间隔却不生效」成为默认陷阱，故改为默认开启，
+    总开关退居紧急刹车（关闭后所有规则立即转发）。
+    """
+
+    async def test_interval_alone_enters_queue(self, forward_chain):
+        """未显式配置 queue_enabled 时，规则间隔 > 0 即入队。"""
+        bot = FakeBot()
+        p = make_plugin({"rules": [make_rule(queue_interval_seconds=5)]})
+        p._send_queue = asyncio.Queue()
+        p._enqueue_send = lambda *a, **k: p._send_queue.put_nowait((a, k))
+
+        await p.forward_message(FakeEvent(forward_chain, bot))
+        assert p._send_queue.qsize() == 1
+
+    async def test_switch_off_forces_immediate(self):
+        """显式关闭总开关后，即使规则设了间隔也立即转发（发送已发生、未入队）。"""
+        ctx = FakeCtx()
+        p = make_plugin(
+            {
+                "rules": [make_rule(queue_interval_seconds=5)],
+                "queue": {"queue_enabled": False},
+            },
+            ctx=ctx,
+        )
+        p._send_queue = asyncio.Queue()
+        p._enqueue_send = lambda *a, **k: p._send_queue.put_nowait((a, k))
+
+        await p.forward_message(FakeEvent([Plain(text="hi")], FakeBot()))
+
+        assert p._send_queue.qsize() == 0, "总开关关闭时不应入队"
+        assert ctx.sent, "应立即转发"
+
+
+class _SaveableDict(dict):
+    """带 save_config 的配置字典，模拟 AstrBotConfig 的持久化接口。"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.saves = 0
+
+    def save_config(self):
+        self.saves += 1
+
+
+class TestConfigGroupMigration:
+    """media / at / platform 已合并进 enhance，需把旧值搬过去。
+
+    旧分组在 schema 里保留为 invisible——AstrBot 会在插件初始化前裁掉
+    schema 未声明的键，删了 schema 就永远读不到存量值。
+    """
+
+    def _plugin(self, conf):
+        return make_plugin(conf)
+
+    def test_moves_legacy_values(self):
+        conf = _SaveableDict(
+            {
+                "media": {"download_media_before_send": True},
+                "at": {
+                    "at_nickname_lookup": True,
+                    "at_nickname_lookup_cache_ttl": 600,
+                    "at_passthrough_extra_platforms": ["myqq"],
+                },
+                "platform": {"platform_names": ["aiocqhttp=扣扣"]},
+            }
+        )
+        self._plugin(conf)._migrate_config_groups()
+
+        e = conf["enhance"]
+        assert e["download_media_before_send"] is True
+        assert e["at_nickname_lookup"] is True
+        assert e["at_nickname_lookup_cache_ttl"] == 600
+        assert e["at_passthrough_extra_platforms"] == ["myqq"]
+        assert e["platform_names"] == ["aiocqhttp=扣扣"]
+        assert conf.saves == 1
+
+    def test_does_not_overwrite_new_value(self):
+        """新分组被改过（非默认值）时，不用旧分组的值覆盖用户当前设置。"""
+        conf = _SaveableDict(
+            {
+                "enhance": {"at_nickname_lookup_cache_ttl": 900},
+                "at": {"at_nickname_lookup_cache_ttl": 600},
+            }
+        )
+        self._plugin(conf)._migrate_config_groups()
+
+        assert conf["enhance"]["at_nickname_lookup_cache_ttl"] == 900
+
+    def test_legacy_wins_when_new_is_default(self):
+        """新分组仍是默认值（AstrBot 自动填充）时，采用旧分组的用户设置。
+
+        默认值无法区分「用户显式设为默认」与「AstrBot 铺的默认」，此时优先
+        保留旧分组里那个明显被改过的值，避免升级丢配置。"""
+        conf = _SaveableDict(
+            {
+                "enhance": {"at_nickname_lookup_cache_ttl": 300},
+                "at": {"at_nickname_lookup_cache_ttl": 600},
+            }
+        )
+        self._plugin(conf)._migrate_config_groups()
+
+        assert conf["enhance"]["at_nickname_lookup_cache_ttl"] == 600
+
+    def test_legacy_default_value_not_copied(self):
+        """旧值等于默认值时无需迁移（避免平白写入）。"""
+        conf = _SaveableDict(
+            {"at": {"at_nickname_lookup": False, "at_nickname_lookup_cache_ttl": 300}}
+        )
+        self._plugin(conf)._migrate_config_groups()
+        assert conf.saves == 0
+
+    def test_no_legacy_groups_is_noop(self):
+        conf = _SaveableDict({"enhance": {"at_nickname_lookup": True}})
+        self._plugin(conf)._migrate_config_groups()
+        assert conf.saves == 0
+
+    def test_second_run_is_idempotent(self):
+        """迁移过一遍后再跑不应重复保存。"""
+        conf = _SaveableDict({"at": {"at_nickname_lookup": True}})
+        p = self._plugin(conf)
+        p._migrate_config_groups()
+        saves = conf.saves
+        p._migrate_config_groups()
+        assert conf.saves == saves
+
+    def test_read_falls_back_to_legacy_group(self):
+        """迁移未执行时，读取仍能从旧分组取到值（兜底）。"""
+        p = self._plugin({"at": {"at_nickname_lookup": True}})
+        assert p._conf_get("at_nickname_lookup", False) is True

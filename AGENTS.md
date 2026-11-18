@@ -142,7 +142,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 ### 2.7 插件主体 `MsgForward(star.Star)` 生命周期
 
-- `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）
+- `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）与 `_migrate_config_groups()`（旧分组 `media` / `at` / `platform` 的存量值搬进 `enhance`）
 - `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务
 - `terminate()`：取消 worker 与清理任务
 
@@ -247,9 +247,11 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 新增配置项的固定顺序：先补 `_conf_schema.json`，再在代码里实现读写，最后同步 README 配置表与 CHANGELOG；**schema 里有的项必须在 README 配置表中出现**（漏写 = 文档不全）。
 
+> ⚠️ **改分组名 / 合并分组的硬约束**：AstrBot 在插件 `__init__` **之前**就按 schema 裁剪配置——schema 里没有声明的键会被直接丢弃并写回磁盘。因此**不能**靠「插件启动时读旧分组再迁移」保住存量值（那时旧键已被删）。要改分组，必须先在新 schema 里把旧分组继续声明为 `invisible: true`（如当前 `media` / `at` / `platform`），值才会被保留，插件再在 `_migrate_config_groups()` 里搬到新分组；**确认所有用户升级完毕后**，才能在下个大版本删掉这些隐藏旧分组。迁移判据是「旧值 ≠ 旧分组默认值 且 新分组仍是新分组默认值」——不能只看「新分组有没有这个键」，AstrBot 会把新分组填成默认值。
+
 `_conf_schema.json` 是**扁平字典**：顶层 key 就是配置项 key，值是该配置项的 schema 节点——没有 `fields` 数组、没有 `schemaVersion` 之类的自造外壳（AstrBot 直接把整个 JSON 当「key → 节点」解析，套错外壳等于没有配置项）。常用节点字段：`type`（必填，`string` / `text` / `int` / `float` / `bool` / `object` / `list` / `dict` / `template_list`）、`description`（WebUI 显示的配置名）、`hint`（问号提示）、`default`、`options` + `labels` + `subtitles`（下拉选项）、`slider`（`{"min","max","step"}`，仅 int / float）、`secret`（密钥遮罩）、`invisible`、`items`（`object` / `dict` 的子 schema）、`_special`（用户 / 会话选择器）。配置分组用 `object` 嵌套表达（子 schema 放 `items`），不要发明分组字段。
 
-**全局配置：**（schema 按类别用 `object` 分组：`basic` / `forward` / `filter` / `queue` / `media` / `at` / `platform`，分组顺序即 WebUI 展示顺序，越常用越靠前；`rules` 为顶层 template_list。代码读取统一走 `_conf_get(key)` / `_conf_set(key, value)`，它们按 `_CONFIG_GROUPS` 映射到分组路径，并兼容旧扁平结构）
+**全局配置：**（schema 按类别用 `object` 分组：`basic` / `forward` / `filter` / `queue` / `enhance`，分组顺序即 WebUI 展示顺序，越常用越靠前；`rules` 为顶层 template_list。代码读取统一走 `_conf_get(key)` / `_conf_set(key, value)`，它们按 `_CONFIG_GROUPS` 映射到分组路径，并兼容旧扁平结构与已合并的旧分组（`media` / `at` / `platform` → `enhance`，由 `_migrate_config_groups` 在启动时搬迁））
 
 | 配置项 | key | 类型/默认 | 说明 |
 |------|------|------|------|
@@ -261,7 +263,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 全局用户名单（每行一条） | `sender_filter_list` | text | UID（`/sid` 输出，`event.get_sender_id()` 精确匹配）或 `BotID:UID` / `平台名:UID`；留空=不按用户过滤 |
 | 默认转发冷却时间（秒） | `default_cooldown_seconds` | int, 0 | 规则未显式设置时继承 |
 | 默认发送队列间隔（秒） | `default_queue_interval_seconds` | int, 0 | 规则未显式设置时继承 |
-| 启用发送队列 | `queue_enabled` | bool, false | 总开关，关闭时规则间隔不生效 |
+| 发送队列总开关 | `queue_enabled` | bool, true | 规则设了间隔即入队；关闭后所有规则立即转发（紧急刹车） |
 | 队列媒体缓存保留时间（小时） | `queue_media_retention_hours` | int, 24 | 0=默认 24；重启时自动清理全部缓存 |
 | 发送队列总长度上限 | `queue_max_size` | int, 0 | **全部规则合计**的队列积压上限，0=不限制；与规则级独立上限同时生效（先判总上限、再判规则级） |
 | 发送媒体前先下载到本地 | `download_media_before_send` | bool, false | 跨设备转发提示找不到文件时才开启 |
@@ -274,6 +276,8 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
 | 额外允许 @ 透传的目标平台 | `at_passthrough_extra_platforms` | list | 默认已含 QQ 系（aiocqhttp/qq_official 等），自建 QQ 适配器在此追加 |
 | 平台名称映射 | `platform_names` | list | 每项 `原始平台名=显示名`（如 `aiocqhttp=QQ`），兼容旧版 `platform_name_map` object 格式自动迁移 |
+
+> 分组职责：`queue` 组同时承载**队列与冷却**（两者都是发送节奏控制：队列限速、冷却去重），组名「发送节奏（队列与冷却）」；`enhance` 组收拢次要增强项（媒体先下载 / @ 昵称反查 / @ 透传平台 / 平台名称映射），默认值即可满足多数场景。
 
 **规则模板 `rule`（`rules` 为 template_list，模板键 `__template_key: "rule"`）：**
 

@@ -345,15 +345,15 @@
     }
   },
   "queue": {
-    "description": "发送队列",
+    "description": "发送节奏（队列与冷却）",
     "type": "object",
-    "hint": "按间隔逐条转发，避免刷屏与协议端限流。",
+    "hint": "控制消息发送的节奏：队列用于逐条限速并持久化积压，冷却用于丢弃短时间内的重复消息。两者都作用于单条规则，可按规则覆盖。",
     "items": {
       "queue_enabled": {
-        "description": "启用发送队列",
+        "description": "发送队列总开关（默认开启）",
         "type": "bool",
-        "hint": "开启后，设置了队列间隔的规则进入队列模式；媒体会缓存到本地，注意磁盘空间。",
-        "default": false
+        "hint": "规则设置了队列间隔即按间隔逐条发送。关闭后所有规则立即转发，可作紧急刹车。",
+        "default": true
       },
       "default_queue_interval_seconds": {
         "description": "默认发送队列间隔（秒）",
@@ -381,24 +381,17 @@
       }
     }
   },
-  "media": {
-    "description": "媒体处理",
+  "enhance": {
+    "description": "增强功能",
     "type": "object",
-    "hint": "跨设备转发时媒体文件的处理方式。",
+    "hint": "按需开启的增强项，默认值即可满足大多数场景。",
     "items": {
       "download_media_before_send": {
         "description": "发送媒体前先下载到本地",
         "type": "bool",
         "hint": "正常不用开，跨设备转发提示找不到文件时再启用。",
         "default": false
-      }
-    }
-  },
-  "at": {
-    "description": "@ 提及",
-    "type": "object",
-    "hint": "默认把 @ 转成文本；开启反查后可精确 @ 目标群成员。",
-    "items": {
+      },
       "at_nickname_lookup": {
         "description": "[增强] 高级 @：按昵称反查 @ 对象（默认关闭=At 转文本）",
         "type": "bool",
@@ -416,14 +409,7 @@
         "type": "list",
         "hint": "自建 QQ 适配器在此填平台名（每行一个），让 @ 按 qq 透传；跨平台不要填。",
         "default": []
-      }
-    }
-  },
-  "platform": {
-    "description": "平台显示",
-    "type": "object",
-    "hint": "把平台标识映射为易读名称。",
-    "items": {
+      },
       "platform_names": {
         "description": "平台名称映射",
         "type": "list",
@@ -450,6 +436,55 @@
           "misskey=Misskey",
           "wecom_ai_bot=企微AI机器人"
         ]
+      }
+    }
+  },
+  "media": {
+    "description": "媒体处理（已合并，勿用）",
+    "type": "object",
+    "hint": "已废弃的旧分组，仅用于保留升级前的配置值（自动迁移到「增强功能」后可忽略）",
+    "invisible": true,
+    "items": {
+      "download_media_before_send": {
+        "description": "发送媒体前先下载到本地（已迁移）",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "at": {
+    "description": "@ 提及（已合并，勿用）",
+    "type": "object",
+    "hint": "已废弃的旧分组，仅用于保留升级前的配置值（自动迁移到「增强功能」后可忽略）",
+    "invisible": true,
+    "items": {
+      "at_nickname_lookup": {
+        "description": "按昵称反查 @ 对象（已迁移）",
+        "type": "bool",
+        "default": false
+      },
+      "at_nickname_lookup_cache_ttl": {
+        "description": "群成员缓存时长（已迁移）",
+        "type": "int",
+        "default": 300
+      },
+      "at_passthrough_extra_platforms": {
+        "description": "额外允许 @ 透传的平台（已迁移）",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "platform": {
+    "description": "平台显示（已合并，勿用）",
+    "type": "object",
+    "hint": "已废弃的旧分组，仅用于保留升级前的配置值（自动迁移到「增强功能」后可忽略）",
+    "invisible": true,
+    "items": {
+      "platform_names": {
+        "description": "平台名称映射（已迁移）",
+        "type": "list",
+        "default": []
       }
     }
   }
