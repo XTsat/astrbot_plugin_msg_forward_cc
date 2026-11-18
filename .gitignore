@@ -210,3 +210,7 @@ __marimo__/
 
 # DSH runtime artifacts
 .dsh-vision-router/
+
+# 自动化运行产物（执行契约的报告/日志，不属于插件源码）
+.runs/
+RUN_REPORT.md
