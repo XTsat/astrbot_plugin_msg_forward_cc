@@ -484,7 +484,28 @@
       "platform_names": {
         "description": "平台名称映射（已迁移）",
         "type": "list",
-        "default": []
+        "default": [
+          "default=默认",
+          "aiocqhttp=QQ",
+          "qq_official=QQ官方机器人",
+          "qq_official_webhook=QQ官方机器人(Webhook)",
+          "telegram=Telegram",
+          "weixin_oc=个人微信",
+          "wecom=企业微信",
+          "weixin_official_account=微信公众号",
+          "lark=飞书",
+          "dingtalk=钉钉",
+          "discord=Discord",
+          "kook=KOOK",
+          "slack=Slack",
+          "vocechat=VoceChat",
+          "line=LINE",
+          "satori=Satori",
+          "matrix=Matrix",
+          "mattermost=Mattermost",
+          "misskey=Misskey",
+          "wecom_ai_bot=企微AI机器人"
+        ]
       }
     }
   }
