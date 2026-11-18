@@ -2,7 +2,7 @@
   "rules": {
     "description": "转发规则",
     "type": "template_list",
-    "hint": "定义消息转发规则。每条规则指定消息来源和目标。UMO 格式：平台名:消息类型:会话ID，如 aiocqhttp:GroupMessage:654321 或 aiocqhttp:FriendMessage:114514",
+    "hint": "按「源会话 → 目标会话」转发消息。一条规则可配多个源与多个目标，其余选项可按规则覆盖全局设置。",
     "default": [],
     "templates": {
       "rule": {
@@ -13,7 +13,7 @@
           "enabled": {
             "description": "启用此规则",
             "type": "bool",
-            "hint": "关闭后此规则暂时停用，规则保留但不再转发消息。可通过 /mf toggle 或 WebUI 随时切换。",
+            "hint": "关闭后规则保留但不再转发，可用 /mf toggle 切换。",
             "default": true
           },
           "remark": {
@@ -25,25 +25,25 @@
           "source_umo": {
             "description": "源 UMO 列表",
             "type": "text",
-            "hint": "消息来源会话标识，每行一条，可填多个（任一命中即触发转发）。GroupMessage（群聊）或 FriendMessage（私聊）。例如 aiocqhttp:GroupMessage:123456",
+            "hint": "来源会话，每行一条，可填多个。格式 平台:GroupMessage:群号（私聊用 FriendMessage）。",
             "default": ""
           },
           "target_umo": {
             "description": "目标 UMO 列表",
             "type": "text",
-            "hint": "消息目标会话标识，每行一条，可填多个，消息将转发到列表中的每个会话。GroupMessage（群聊）或 FriendMessage（私聊）。例如 aiocqhttp:GroupMessage:654321",
+            "hint": "目标会话，每行一条，可填多个。格式 平台:GroupMessage:群号（私聊用 FriendMessage）。",
             "default": ""
           },
           "hide_header": {
             "description": "隐藏来源信息头",
             "type": "bool",
-            "hint": "开启后转发时不显示来源信息头，消息直接透传。",
+            "hint": "转发时不显示来源信息头。",
             "default": false
           },
           "filter_mode": {
             "description": "过滤模式",
             "type": "string",
-            "hint": "仅对本规则生效。继承全局=使用全局过滤设置；黑名单=命中则不转发；白名单=命中才转发。",
+            "hint": "仅本规则生效。继承全局 / 黑名单 / 白名单。",
             "default": "inherit",
             "options": [
               "inherit",
@@ -61,13 +61,13 @@
           "filter_patterns": {
             "description": "过滤规则列表",
             "type": "list",
-            "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写），留空继承全局设置。",
+            "hint": "仅本规则生效。每行一条，regex: 前缀为正则；留空继承全局。",
             "default": []
           },
           "sender_filter_mode": {
             "description": "用户黑白名单模式",
             "type": "string",
-            "hint": "仅对本规则生效。继承全局=跟随全局的用户黑白名单设置；黑名单=名单里的 UID 发来的消息不转发；白名单=只转发名单里的 UID 发来的消息。名单为空时不生效。",
+            "hint": "仅本规则生效。继承全局 / 黑名单 / 白名单；名单为空时不生效。",
             "default": "inherit",
             "options": [
               "inherit",
@@ -85,31 +85,31 @@
           "sender_filter_list": {
             "description": "用户名单",
             "type": "text",
-            "hint": "仅对本规则生效。每行一个 UID（精确匹配，即 AstrBot /sid 指令输出里的 UID 行），需要区分适配器实例时写 BotID:UID。留空=继承全局名单。",
+            "hint": "仅本规则生效。每行一个 UID（见 /sid）；留空继承全局名单。",
             "default": ""
           },
           "cooldown_seconds": {
             "description": "转发冷却时间（秒）",
             "type": "int",
-            "hint": "仅对本规则生效。转发一次后在该秒数内不再重复转发。0=关闭本规则冷却；不填（删除该字段）则继承全局默认值。",
+            "hint": "仅本规则生效，转发后该秒数内不重复转发。0=关闭；不填继承全局。",
             "default": 0
           },
           "queue_interval_seconds": {
             "description": "发送队列间隔（秒）",
             "type": "int",
-            "hint": "仅对本规则生效。开启后，匹配本规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条。0=关闭本规则队列（立即转发）；不填（删除该字段）则继承全局默认值。",
+            "hint": "仅本规则生效，每隔该秒数发一条。0=立即转发；不填继承全局。",
             "default": 0
           },
           "queue_max_size": {
             "description": "发送队列长度（条）",
             "type": "int",
-            "hint": "仅对本规则生效。该规则在发送队列中允许积压的最大消息数（一条多目标转发会计入多次）。0 或不填=本规则不限制（仅受全局「发送队列总长度上限」约束）；达到上限后新消息将被丢弃（记录错误日志），队列中已有消息不受影响。",
+            "hint": "仅本规则生效的积压上限，0=不限（仅受全局上限约束）。",
             "default": 0
           },
           "download_media_before_send": {
             "description": "发送媒体前先下载到本地",
             "type": "string",
-            "hint": "仅对本规则生效。继承全局=跟随全局设置，开启/关闭=强制本规则行为。",
+            "hint": "仅本规则生效。继承全局 / 开启 / 关闭。",
             "default": "inherit",
             "options": [
               "inherit",
@@ -125,7 +125,7 @@
           "content_types": {
             "description": "转发的内容类型",
             "type": "list",
-            "hint": "仅对本规则生效。勾选需要转发的内容类型（多选），未勾选的类型会被过滤掉。全部不勾选=继承全局默认；「指令」默认不勾选（指令消息不转发），勾上才转发。",
+            "hint": "仅本规则生效。未勾选的类型会被过滤；全不勾=继承全局；指令默认不转发。",
             "default": [],
             "render_type": "checkbox",
             "options": [
@@ -154,7 +154,7 @@
           "at_nickname_lookup": {
             "description": "[增强] 高级 @：按昵称反查 @ 对象",
             "type": "string",
-            "hint": "仅对本规则生效。inherit=跟随全局；关闭时 @ 转成文本 @昵称（最稳妥）；开启后按目标群成员列表把 @昵称 换成真实成员再精确 @，群大时会多一次接口调用（有缓存），仅 QQ 系有效。",
+            "hint": "仅本规则生效。继承全局 / 开启 / 关闭。",
             "default": "inherit",
             "options": [
               "inherit",
@@ -170,13 +170,13 @@
           "use_proxy": {
             "description": "媒体下载是否走代理",
             "type": "bool",
-            "hint": "仅对本规则生效。关闭则直连；开启后 proxy_url 留空走 AstrBot 自带代理（系统环境变量），填写则走该代理地址。",
+            "hint": "仅本规则生效。开启后留空走 AstrBot 自带代理，填写则走该地址。",
             "default": false
           },
           "proxy_url": {
             "description": "媒体下载代理地址",
             "type": "string",
-            "hint": "仅 use_proxy 开启时生效。留空走 AstrBot 自带代理；填写则走该地址（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）。",
+            "hint": "仅开启代理时生效，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。",
             "default": ""
           }
         }
@@ -191,19 +191,19 @@
       "default_hide_header": {
         "description": "新建转发规则时，默认是否隐藏来源信息头。",
         "type": "bool",
-        "hint": "开启后，通过 mf bind 新建的规则默认不显示来源信息。可通过 mf hide 随时切换。",
+        "hint": "新建规则默认隐藏来源信息头，可随时用 /mf hide 切换。",
         "default": false
       },
       "header_template": {
         "description": "来源信息头模板",
         "type": "text",
-        "hint": "可用变量：{sender_name} 发送者昵称、{sender_id} 发送者ID、{platform} 平台名、{msg_type} 消息类型、{conversation_id} 会话ID。留空则使用默认格式。注意：消息头末尾会自动追加换行。",
+        "hint": "可用变量：{sender_name} {sender_id} {platform} {msg_type} {conversation_id}，留空用默认格式。",
         "default": "[转发] {sender_name} ({sender_id})\n来自 {platform} 的 {msg_type}（ID: {conversation_id}）消息"
       },
       "default_content_types": {
         "description": "默认转发的内容类型",
         "type": "list",
-        "hint": "新建转发规则时默认勾选的内容类型（多选）。除「指令」外默认全选；「指令」默认不勾选，即以唤醒词开头的指令消息默认不转发，需要转发时勾上「指令」。",
+        "hint": "新建规则默认转发的内容类型。指令消息默认不转发，需要时勾「指令」。",
         "default": [
           "plain",
           "image",
@@ -248,31 +248,31 @@
       "forward_keep_time": {
         "description": "转发聊天记录时保留原始发送时间",
         "type": "bool",
-        "hint": "开启后，聊天记录里每条消息显示原本的发送时间；关闭则显示为转发时的时间。仅在目标平台支持聊天记录（QQ 系）时生效。",
+        "hint": "聊天记录显示原本的发送时间；关闭则显示转发时间。",
         "default": true
       },
       "forward_native_relay": {
         "description": "优先用协议端原生转发合并记录",
         "type": "bool",
-        "hint": "开启（默认）时，整条消息就是一条聊天记录、规则勾选了「其他」类型、且目标与来源在同一个 QQ 协议端实例上，会直接让协议端把这条记录搬过去：内容、发送者身份、嵌套层数与内嵌卡片全部原样保留，也不占转发耗时。发送队列模式下同样优先尝试（到点时若记录已被撤回或已失效，会自动回退）。失败、跨平台、跨协议端实例或消息里还混排了别的内容时，自动回退到逐条重建转发，不影响最终送达。关闭后一律走重建链路。",
+        "hint": "整条消息就是一条聊天记录时让协议端直接搬运，更快且内容完整；不满足条件会自动回退重建。",
         "default": true
       },
       "forward_card_auto_rebuild": {
         "description": "记录含聊天记录卡片时自动重建",
         "type": "bool",
-        "hint": "开启（默认）时，如果这条聊天记录里还套着一张「聊天记录」卡片，就不走协议端原生转发，改为逐条重建并把这层卡片还原成真正可点开的聊天记录——原生转发会把卡片原样搬过去，QQ 客户端只显示「[XML消息]」且点不开。关闭后一律走原生转发（更快），这类记录的内层卡片在目标端会原样保留（通常显示成「[XML消息]」）。注意：卡片内容能否还原取决于源记录在 QQ 服务端是否还留有 payload，取不到时只能降级为带预览行的文字。",
+        "hint": "记录里还套着卡片时改走重建，内层才能点开；关闭则原样保留（显示成「[XML消息]」）。",
         "default": true
       },
       "forward_node_avatar": {
         "description": "[增强] 转发聊天记录时获取发送者头像",
         "type": "bool",
-        "hint": "开启后按发送者昵称从群成员名册反查真实 QQ 号，让聊天记录里能显示头像；昵称比对忽略全半角、空格、Emoji、大小写，纯数字昵称直接当 QQ 号用。只在唯一匹配、且整条记录的发送者 QQ 号已被协议端抹平时才改写：机器人不在来源群、昵称重名或成员改过名时改不了，这些消息就取不到头像（显示为没有头像）。（默认开启）",
+        "hint": "按昵称反查真实 QQ 号，让记录显示发送者头像；昵称重名或已改名时补不回来。",
         "default": true
       },
       "forward_card_preview": {
         "description": "聊天记录卡片预览",
         "type": "string",
-        "hint": "转发聊天记录时，记录里的卡片（小程序 / 分享卡）在预览行里显示什么：来源 + 标题=显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀（默认，与 QQ 原生卡片一致）；仅标题=只显示卡片标题，不显示简介、来源、上传者等其它信息；不显示=统一显示「[卡片消息]」。",
+        "hint": "卡片在预览行的显示方式。默认「来源 + 标题」，与 QQ 原生一致。",
         "default": "source",
         "options": [
           "source",
@@ -288,7 +288,7 @@
       "forward_max_depth": {
         "description": "聊天记录嵌套展开层数",
         "type": "int",
-        "hint": "转发聊天记录时，记录里再套的聊天记录最多再展开几层：0=只展开最外层记录；1=再展开一层；2=再展开两层（默认，合计 3 层）。QQ 系协议端（NapCat / SnowLuma 等）发送时最多接受 3 层嵌套，即填 2 已是上限，填更大值会导致整条转发发送失败（协议端报 forward nesting depth exceeds 3）；其它平台若能接受更多层，可在此调大到对应值。",
+        "hint": "记录里再套的记录最多再展开几层，2=合计 3 层（QQ 系上限）；再大会导致发送失败。",
         "default": 2
       }
     }
@@ -301,7 +301,7 @@
       "filter_mode": {
         "description": "消息过滤模式",
         "type": "string",
-        "hint": "黑名单=命中则不转发，白名单=命中才转发。",
+        "hint": "黑名单=命中则不转发；白名单=命中才转发。",
         "default": "off",
         "options": [
           "off",
@@ -317,13 +317,13 @@
       "filter_patterns": {
         "description": "全局过滤规则列表（每行一条）",
         "type": "text",
-        "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
+        "hint": "每行一条。regex: 前缀为正则，其余按关键词匹配（不区分大小写）。",
         "default": ""
       },
       "sender_filter_mode": {
         "description": "用户黑白名单模式",
         "type": "string",
-        "hint": "按消息发送者 UID 过滤（UID 就是 AstrBot /sid 指令输出里的 UID 行，精确匹配、换昵称也认得出）：黑名单=名单里的 UID 发来的消息不转发；白名单=只转发名单里的 UID 发来的消息。名单在下方「全局用户名单」中填写，名单为空时本项不生效。每条规则可单独覆盖。",
+        "hint": "按发送者 UID 过滤：黑名单不转发，白名单只转发。名单为空时不生效。",
         "default": "off",
         "options": [
           "off",
@@ -339,7 +339,7 @@
       "sender_filter_list": {
         "description": "全局用户名单（每行一条）",
         "type": "text",
-        "hint": "每行填一个 UID（精确匹配，即 AstrBot /sid 指令输出里的 UID 行）。同一平台开了多个适配器、需要区分实例时写 BotID:UID 或 平台名:UID（Bot ID 同样见 /sid）。不做昵称 / QQ 号形态的模糊匹配。留空=不按用户过滤。",
+        "hint": "每行一个 UID（见 /sid）。多适配器同号时写 BotID:UID；留空不按用户过滤。",
         "default": ""
       }
     }
@@ -352,31 +352,31 @@
       "queue_enabled": {
         "description": "启用发送队列",
         "type": "bool",
-        "hint": "开启后，设置了队列间隔的规则将进入发送队列模式。⚠️ 队列模式下会将图片/视频/文件等媒体缓存到本地临时目录，请确保磁盘空间充足。",
+        "hint": "开启后，设置了队列间隔的规则进入队列模式；媒体会缓存到本地，注意磁盘空间。",
         "default": false
       },
       "default_queue_interval_seconds": {
         "description": "默认发送队列间隔（秒）",
         "type": "int",
-        "hint": "新建转发规则时的默认队列间隔。开启后，匹配规则的消息不立即转发，而是进入发送队列，每隔该秒数转发一条。0 或关闭则立即转发。每条规则可单独覆盖。",
+        "hint": "新建规则的默认队列间隔，每隔该秒数发一条；0=立即转发。",
         "default": 0
       },
       "default_cooldown_seconds": {
         "description": "默认转发冷却时间（秒）",
         "type": "int",
-        "hint": "新建转发规则时的默认冷却间隔。转发一次后在该秒数内不再重复转发同一规则。每条规则可单独覆盖。",
+        "hint": "新建规则的默认冷却秒数，转发后该时间内不重复转发。",
         "default": 0
       },
       "queue_max_size": {
         "description": "发送队列总长度上限",
         "type": "int",
-        "hint": "全部规则合计的队列积压上限（总长度）。0 或不填则不限制。达到上限后新消息将被丢弃（记录错误日志），队列中的消息不受影响。各规则可在规则内单独设置「发送队列长度（条）」作为本规则的独立上限，两者同时生效。",
+        "hint": "全部规则合计的积压上限，超出则丢弃新消息；0=不限制。",
         "default": 0
       },
       "queue_media_retention_hours": {
         "description": "队列媒体缓存保留时间（小时）",
         "type": "int",
-        "hint": "队列模式下缓存的媒体文件保留多少小时后自动清理。0 或不填则默认 24 小时。重启时也会自动清理所有缓存。",
+        "hint": "队列媒体缓存保留小时数，0=默认 24；重启时全部清理。",
         "default": 24
       }
     }
@@ -389,7 +389,7 @@
       "download_media_before_send": {
         "description": "发送媒体前先下载到本地",
         "type": "bool",
-        "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
+        "hint": "正常不用开，跨设备转发提示找不到文件时再启用。",
         "default": false
       }
     }
@@ -402,19 +402,19 @@
       "at_nickname_lookup": {
         "description": "[增强] 高级 @：按昵称反查 @ 对象（默认关闭=At 转文本）",
         "type": "bool",
-        "hint": "默认关闭：@ 一律转成文本 @昵称，最稳妥。开启后转发前拉取目标群成员列表，把 @昵称换成真实成员再精确 @，解决跨群 @ 指不到人；群成员很多时会多一次接口调用、稍慢，仅 QQ 系有效。每条规则可单独覆盖。",
+        "hint": "把 @昵称 反查为真实成员后精确 @，群大时稍慢；仅 QQ 系有效。",
         "default": false
       },
       "at_nickname_lookup_cache_ttl": {
         "description": "@ 昵称反查的群成员缓存时长（秒）",
         "type": "int",
-        "hint": "仅在开启「按昵称反查 @ 对象」时生效。同一目标群在该秒数内复用已拉取的成员列表，避免每条消息都拉一次；0=不缓存（每次重新拉取，群大时可能变慢）。默认 300 秒。",
+        "hint": "群成员列表缓存秒数，0=每次重新拉取。默认 300。",
         "default": 300
       },
       "at_passthrough_extra_platforms": {
         "description": "额外允许 @ 透传的目标平台",
         "type": "list",
-        "hint": "仅在「高级 @（昵称反查）」开启时生效。默认已包含 QQ 系平台（aiocqhttp / qq_official 等），这些平台会把 At 按 qq 原样透传、由协议端精确解析。若你使用其他自建 QQ 适配器，可在此填写其平台名（每行一个，同 UMO 第一段），让 @ 也按 qq 透传而不是降级为文本。跨平台（微信/Telegram 等）不要填。",
+        "hint": "自建 QQ 适配器在此填平台名（每行一个），让 @ 按 qq 透传；跨平台不要填。",
         "default": []
       }
     }
@@ -427,7 +427,7 @@
       "platform_names": {
         "description": "平台名称映射",
         "type": "list",
-        "hint": "把 {platform} 的原始平台名替换为自定义展示名。每项格式：原始平台名=显示名，例如 aiocqhttp=QQ、telegram=电报。未命中的平台保持原名（原样显示），删空则全部不改写。",
+        "hint": "每项「原始平台名=显示名」，如 aiocqhttp=QQ；未命中的保持原名。",
         "default": [
           "default=默认",
           "aiocqhttp=QQ",
