@@ -250,49 +250,22 @@ class TestQueueNativeForward:
         assert sent == []
 
 
-class TestCardBlockedForcesRebuild:
-    """记录含卡片而放弃原生转发时，重建必须连带把卡片还原。
+class TestCardRebuildFollowsSingleSwitch:
+    """卡片是否还原只由 forward_card_auto_rebuild 决定，不做任何强制覆盖。
 
-    这是之前漏掉的：只让原生转发「放弃」，却没打开 rebuild_card，
-    卡片仍按 xml 原样发出，目标端照样显示 [XML消息] 点不开。
+    A 方案：一个开关统一管「含卡片时是否改走重建」与「重建时是否还原卡片」。
+    开着 → 改走重建且还原；关掉 → 走原生转发且卡片原样，插件不得自作主张。
     """
 
-    @staticmethod
-    def _plugin(rebuild_card: bool = False):
-        return make_plugin(
-            {
-                "rules": [make_rule()],
-                "forward": {
-                    "forward_native_relay": True,
-                    "forward_rebuild_card": rebuild_card,
-                },
-            }
-        )
+    CARD_XML = (
+        '<msg action="viewMultiMsg" brief="[聊天记录]" m_resid="x">聊天记录</msg>'
+    )
 
-    async def test_card_blocked_sets_flag(self, forward_chain):
-        bot = FakeBot()
-        p = self._plugin()
-        assert await p._send_native_forward(FakeEvent([], bot=bot, mid="1"), "qq-main:GroupMessage:2") is True
-        # 无卡片时不该置位
-        assert p._native_card_blocked is False
-
-    async def test_card_blocked_rebuild_uses_rebuild_card_true(self, forward_chain):
-        """被卡片拦下而改走重建时，必须用 rebuild_card=True 展开。
-
-        配置里 forward_rebuild_card 保持 false，验证的是「强制」而非「继承配置」。
-        """
-        import main as m
-
-        calls = []
-        original = m._expand_forward_components
-
-        async def fake_expand(*args, **kwargs):
-            calls.append(kwargs.get("rebuild_card"))
-            return list(forward_chain)
+    @classmethod
+    def _card_bot(cls, native_ok: bool = True):
+        """能回应卡片探测的协议端；native_ok=False 让原生转发失败以强制走重建。"""
 
         class CardBot(FakeBot):
-            """get_msg 返回 forward 段；get_forward_msg 返回含卡片的记录。"""
-
             async def call_action(self, action, **params):
                 self.calls.append((action, params))
                 if action == "get_msg":
@@ -301,16 +274,63 @@ class TestCardBlockedForcesRebuild:
                     ]}}
                 if action == "get_forward_msg":
                     return {"data": {"messages": [{"message": [
-                        {"type": "xml", "data": {"data":
-                            '<msg action="viewMultiMsg" m_resid="x">聊天记录</msg>'}}
+                        {"type": "xml", "data": {"data": cls.CARD_XML}}
                     ]}]}}
+                if action.startswith("forward_") and not native_ok:
+                    raise RuntimeError("native forward disabled for test")
                 return {"data": {}}
+
+        return CardBot()
+
+    @staticmethod
+    def _plugin(enabled: bool):
+        return make_plugin(
+            {
+                "rules": [make_rule()],
+                "forward": {
+                    "forward_native_relay": True,
+                    "forward_card_auto_rebuild": enabled,
+                },
+            }
+        )
+
+    async def _capture_rebuild_flag(self, enabled: bool, native_ok: bool = True):
+        """跑一次 forward_message，捕获展开时传入的 rebuild_card。"""
+        import main as m
+
+        calls = []
+        original = m._expand_forward_components
+
+        async def fake_expand(*args, **kwargs):
+            calls.append(kwargs.get("rebuild_card"))
+            return list(args[1]) if len(args) > 1 else []
 
         m._expand_forward_components = fake_expand
         try:
-            p = self._plugin(rebuild_card=False)
-            await p.forward_message(FakeEvent(forward_chain, CardBot()))
+            await self._plugin(enabled).forward_message(
+                FakeEvent([m.Forward(id="x")], self._card_bot(native_ok))
+            )
         finally:
             m._expand_forward_components = original
+        return calls
 
-        assert True in calls, f"应强制 rebuild_card=True，实际 {calls}"
+    async def test_enabled_rebuilds_card(self):
+        """开启时：探测到卡片 → 改走重建 → 以 rebuild_card=True 展开。"""
+        calls = await self._capture_rebuild_flag(True)
+        assert calls, "开启且含卡片时应当触发重建"
+        assert True in calls, f"开启时应以 rebuild_card=True 展开，实际 {calls}"
+
+    async def test_disabled_skips_card_detection(self):
+        """关闭时：不探测卡片，直接走原生转发。"""
+        bot = self._card_bot()
+        p = self._plugin(False)
+        await p.forward_message(FakeEvent([__import__("main").Forward(id="x")], bot))
+        assert "forward_group_single_msg" in bot.actions()
+        # 关掉开关后连探测都不该发
+        assert "get_forward_msg" not in bot.actions()
+
+    async def test_disabled_never_forces_rebuild(self):
+        """关闭时即使被迫走重建（原生失败），也不得强制还原卡片。"""
+        calls = await self._capture_rebuild_flag(False, native_ok=False)
+        assert calls, "原生转发失败时应回退到重建"
+        assert True not in calls, f"关闭时不应强制 rebuild_card=True，实际 {calls}"

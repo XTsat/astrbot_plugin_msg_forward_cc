@@ -3878,7 +3878,9 @@ class MsgForward(star.Star):
         messages = _forward_messages_of(payload)
         return _record_has_forward_card(messages) if messages else False
 
-    # 上一次原生转发放弃是否因为「记录里含聊天记录卡片」（调用方据此强制还原卡片）
+    # 上一次原生转发放弃是否因为「记录里含聊天记录卡片」。
+    # 队列路径据此在回退时换用入队时备好的「卡片已还原」链；
+    # 卡片是否还原本身由 forward_card_auto_rebuild 决定，这里不做强制。
     _native_card_blocked: bool = False
 
     async def _forward_by_message_id(self, bot, message_id: str, target: str) -> bool:
@@ -4382,7 +4384,6 @@ class MsgForward(star.Star):
         "forward_node_avatar": ("forward", "forward_node_avatar"),
         "forward_card_preview": ("forward", "forward_card_preview"),
         "forward_max_depth": ("forward", "forward_max_depth"),
-        "forward_rebuild_card": ("forward", "forward_rebuild_card"),
         "filter_mode": ("filter", "filter_mode"),
         "filter_patterns": ("filter", "filter_patterns"),
         "sender_filter_mode": ("filter", "sender_filter_mode"),
@@ -4444,17 +4445,6 @@ class MsgForward(star.Star):
         except (TypeError, ValueError):
             return _FORWARD_MAX_DEPTH
         return max(0, min(depth, _FORWARD_MAX_DEPTH_LIMIT))
-
-    def _forward_rebuild_card(self) -> bool:
-        """是否尝试重建聊天记录里内嵌的卡片（配置 forward_rebuild_card，默认关闭）。
-
-        关闭时卡片按原样（xml 段）转发：QQ 在二次转发时常把内层记录降级成只剩
-        `m_fileName` 的卡片，此时重建只能得到文字占位，原样转发至少保住卡片外观与条数。
-        开启后按老逻辑拉取内容还原成真正的聊天记录，取不到再降级为文字。"""
-        val = self._conf_get("forward_rebuild_card", False)
-        if isinstance(val, str):
-            return val.strip().lower() in ("true", "1", "on", "yes")
-        return bool(val)
 
     def _forward_avatar_enabled(self) -> bool:
         """转发聊天记录时是否按发送者昵称反查真实 QQ 号（用于显示真实头像）。
@@ -4820,8 +4810,9 @@ class MsgForward(star.Star):
     ) -> list | None:
         """为队列条目备一份「卡片已还原」的链（记录里没卡片时返回 None）。
 
-        队列 worker 到点后先试原生转发；若因记录含卡片而回退，就用这份链重建，
-        否则卡片会按 xml 原样发出、目标端显示 `[XML消息]` 点不开。
+        队列 worker 到点后先试原生转发；若因记录含卡片而回退，就用这份链重建。
+        卡片是否还原跟随配置 `forward_card_auto_rebuild`（关掉时 `_record_has_card`
+        直接返回 False，这里也就不会构建）。
 
         只有确认记录里确有卡片时才展开——避免给每条队列消息都白做一次完整重建。"""
         bot = _onebot_bot_of(event)
@@ -4842,7 +4833,7 @@ class MsgForward(star.Star):
                 self._forward_node_name_map if self._forward_avatar_enabled() else None
             ),
             depth=self._forward_max_depth(),
-            rebuild_card=True,
+            rebuild_card=self._forward_card_auto_rebuild(),
         )
         chain = expanded
         if at_lookup:
@@ -5065,26 +5056,23 @@ class MsgForward(star.Star):
             )
             expanded_cache: dict = {}
 
-            async def _expanded_chain(force_rebuild_card: bool = False) -> list:
+            async def _expanded_chain() -> list:
                 """本次事件的合并转发展开结果（只展开一次，多个规则/目标复用）。
 
-                force_rebuild_card=True 用于「本来能走原生转发、只因记录里含聊天记录卡片
-                才改走重建」的情况：此时必须连带把卡片还原成真正的嵌套记录，否则卡片
-                按原样（xml 段）发出去，目标端仍会显示 `[XML消息]` 且点不开。"""
-                key = "card" if force_rebuild_card else "chain"
-                if key not in expanded_cache:
-                    expanded_cache[key] = await _expand_forward_components(
+                卡片是否还原由配置 `forward_card_auto_rebuild` 统一决定，与
+                「含卡片时是否改走重建」是同一个开关：开着就还原、关掉就原样转发。
+                不在这里做任何强制覆盖——用户关掉开关时，插件不应自作主张。"""
+                if "chain" not in expanded_cache:
+                    expanded_cache["chain"] = await _expand_forward_components(
                         event,
                         sanitized_chain,
                         keep_time=keep_forward_time,
                         card_preview_mode=card_preview_mode,
                         avatar_resolver=avatar_resolver,
                         depth=self._forward_max_depth(),
-                        rebuild_card=(
-                            True if force_rebuild_card else self._forward_rebuild_card()
-                        ),
+                        rebuild_card=self._forward_card_auto_rebuild(),
                     )
-                return expanded_cache[key]
+                return expanded_cache["chain"]
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
@@ -5138,8 +5126,6 @@ class MsgForward(star.Star):
                 # 开启 download_media_before_send 时，发送前先本地化。
                 # 合并转发的展开结果按需计算：命中原生转发快路径时一次都不展开。
                 chain_cache: dict = {}
-                # 原生转发因「记录含卡片」被放弃时置 True：重建链路要连带还原卡片
-                card_chain_cache: dict = {}
 
                 async def _filtered_chain(allowed_types: set = allowed) -> list:
                     """本规则的转发内容（展开 → 按内容类型筛选），只算一次。
@@ -5147,9 +5133,7 @@ class MsgForward(star.Star):
                     顺序与改造前一致：先展开合并转发、再按本规则的内容类型筛选，
                     否则「只勾了文字」的规则会连聊天记录一起转出去。"""
                     if "filtered" not in chain_cache:
-                        expanded = await _expanded_chain(
-                            force_rebuild_card=bool(card_chain_cache.get("force"))
-                        )
+                        expanded = await _expanded_chain()
                         chain_cache["filtered"] = _filter_chain_by_types(
                             expanded, allowed_types, is_command
                         )
@@ -5241,10 +5225,8 @@ class MsgForward(star.Star):
                                 self._cooldowns[cd_key] = now + cooldown_sec
                             continue
                         # 原生转发失败（或来源头没发出去）→ 落到下面的重建链路。
-                        # 若放弃原因是「记录里含卡片」，重建时必须连带把卡片还原，
-                        # 否则卡片按 xml 原样发出，目标端还是 `[XML消息]` 点不开。
-                        if self._native_card_blocked:
-                            card_chain_cache["force"] = True
+                        # 卡片是否还原由 forward_card_auto_rebuild 统一决定，
+                        # 这里不再做任何强制覆盖。
 
                     message_chain = await _message_chain()
                     if not message_chain:
