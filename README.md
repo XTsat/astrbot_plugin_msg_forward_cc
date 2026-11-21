@@ -163,6 +163,35 @@
 | 聊天记录卡片预览（`forward_card_preview`） | string | `source` | `source` 来源 + 标题 / `title` 仅标题 / `off` 统一 `[卡片消息]` |
 | 聊天记录最多保留几层（`forward_total_layers`） | int | `3` | 含最外层在内的总层数：`3` = 你转发的这条 + 里面套的两层。QQ 系协议端（NapCat / SnowLuma）只接受 3 层——超过后 NapCat 会静默丢掉更深的记录、SnowLuma 会让整条转发失败，所以填大于 3 只对非 QQ 平台有意义。填 `1` 表示只保留最外层，里面的记录显示为 `[聊天记录]` 文字 |
 
+<details>
+<summary>为什么 3 是上限，以及层数是怎么算的（技术细节）</summary>
+
+**一、层数怎么算**
+
+配置填的是**总层数**，最外层那条记录本身占 1 层。你转发的那条记录是第 1 层，它里面套的记录是第 2 层，再往里是第 3 层……插件按「总层数 − 1」决定还能往下展开几层：
+
+| 配置值 | 最外层 | 还能再展开 | 结果 |
+| --- | --- | --- | --- |
+| `1` | 保留 | 0 层 | 里面的记录变成 `[聊天记录]` 文字 |
+| `2` | 保留 | 1 层 | 第 3 层及更深变成文字 |
+| `3` | 保留 | 2 层 | 完整保留到第 3 层（QQ 系上限） |
+| `4` 及以上 | 保留 | 3 层以上 | 只有非 QQ 平台能正常收 |
+
+**二、3 层上限从哪来**
+
+这个 3 不是某个协议端随意定的，而是 QQ 合并转发报文（`com.tencent.multimsg`）自身的结构上限。两家主流协议端都把它写死在代码里，但**超限后的表现不同**：
+
+- **NapCat**（`packages/napcat-onebot/action/msg/SendMsg.ts` 的 `uploadForwardedNodesPacket`）：递归参数 `dp` 从 0 开始，循环开头 `if (dp >= 3) { logWarn('转发消息深度超过3层，将停止解析！'); break; }`，每钻一层 `dp + 1`。**超过 3 层静默截断**——消息照常发出，但第 4 层的内容被直接丢弃，发送方看起来是成功的。
+- **SnowLuma**（`runtime/index.mjs` 的 `expandForwardTreeForTarget`）：`const MAX_FORWARD_DEPTH = 3;`，进入函数先判 `if (depth >= MAX_FORWARD_DEPTH) throw new MessageElementValidationError('INVALID_FIELD', 'forward nesting depth exceeds 3')`。**超过 3 层直接报错**，整条转发失败。
+
+同样是「层数超限」，NapCat 用户看到的是「内层记录不见了」，SnowLuma 用户看到的是「消息发不出去」。所以插件必须在发送前就自己钳在 3 以内，不能指望协议端兜底。
+
+**三、还有个隐藏限制**
+
+即使成功发出 3 层，事后**重新拉取**同一份记录时，第 3 层会退化成没有 `m_resid` 的卡片（内容取不到）。也就是说这份记录再被转发一次，最多只能恢复 2 层，更深层会显示成 `[聊天记录] 标题（N条）` 加卡片自带的几行预览。这是 QQ 服务端的回收行为，不是插件丢的。
+
+</details>
+
 </details>
 
 <details>
