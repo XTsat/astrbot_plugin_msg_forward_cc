@@ -685,3 +685,69 @@ class TestForwardModeMigration:
         make_plugin(conf)._migrate_forward_mode()
         assert conf["forward"]["forward_send_mode"] == "rebuild"
         assert conf.saves == 0
+
+
+class TestForwardLayerConfig:
+    """forward_total_layers 是「总层数（含最外层）」，旧键 forward_max_depth 是「再展开层数」。"""
+
+    def test_default_is_three_layers(self):
+        p = make_plugin({})
+        assert p._forward_total_depth() == 3
+        # 内部展开函数把最外层算作第 1 层，故再展开层数比总层数少 1
+        assert p._forward_max_depth() == 2
+
+    def test_reads_total_layers(self):
+        p = make_plugin({"forward": {"forward_total_layers": 5}})
+        assert p._forward_total_depth() == 5
+        assert p._forward_max_depth() == 4
+
+    def test_clamped_to_range(self):
+        assert make_plugin({"forward": {"forward_total_layers": 0}})._forward_total_depth() == 1
+        assert make_plugin({"forward": {"forward_total_layers": -3}})._forward_total_depth() == 1
+        assert make_plugin({"forward": {"forward_total_layers": 99}})._forward_total_depth() == 10
+        assert make_plugin({"forward": {"forward_total_layers": "abc"}})._forward_total_depth() == 3
+
+    def test_legacy_key_alone_does_not_change_reading(self):
+        """旧键不再参与读取：只有它时按新键默认值走（迁移由 _migrate_forward_layers 负责）。"""
+        p = make_plugin({"forward": {"forward_max_depth": 4}})
+        assert p._forward_total_depth() == 3
+
+
+class TestForwardLayerMigration:
+    """旧「再展开层数」→ 新「总层数」，折算为 +1，且不做无谓写入。"""
+
+    def test_legacy_value_migrates_plus_one(self):
+        conf = _SaveableDict({"forward": {"forward_max_depth": 4}})
+        make_plugin(conf)._migrate_forward_layers()
+        assert conf["forward"]["forward_total_layers"] == 5
+        assert conf.saves == 1
+
+    def test_legacy_default_needs_no_migration(self):
+        """旧默认 2 → 新默认 3，值等价，不写配置。"""
+        conf = _SaveableDict({"forward": {"forward_max_depth": 2}})
+        make_plugin(conf)._migrate_forward_layers()
+        assert "forward_total_layers" not in conf["forward"]
+        assert conf.saves == 0
+
+    def test_missing_legacy_is_noop(self):
+        conf = _SaveableDict({"forward": {}})
+        make_plugin(conf)._migrate_forward_layers()
+        assert conf.saves == 0
+
+    def test_explicit_new_value_wins(self):
+        conf = _SaveableDict(
+            {"forward": {"forward_max_depth": 4, "forward_total_layers": 2}}
+        )
+        make_plugin(conf)._migrate_forward_layers()
+        assert conf["forward"]["forward_total_layers"] == 2
+        assert conf.saves == 0
+
+    def test_invalid_legacy_is_ignored(self):
+        conf = _SaveableDict({"forward": {"forward_max_depth": "abc"}})
+        make_plugin(conf)._migrate_forward_layers()
+        assert conf.saves == 0
+
+    def test_clamped_when_legacy_too_large(self):
+        conf = _SaveableDict({"forward": {"forward_max_depth": 42}})
+        make_plugin(conf)._migrate_forward_layers()
+        assert conf["forward"]["forward_total_layers"] == 10

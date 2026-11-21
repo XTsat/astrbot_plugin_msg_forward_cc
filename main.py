@@ -407,17 +407,35 @@ _FORWARD_SEND_MODES = {"auto", "native", "rebuild"}
 # 这两个 action 是 OneBot 11 扩展，satori 等其它适配器没有对应通路。
 _NATIVE_FORWARD_PLATFORMS = {"aiocqhttp"}
 
-# 嵌套聊天记录最多再展开的层数默认值（配置 forward_max_depth 可覆盖）。
-# 语义：除最外层记录外还能再展开几层，2 = 合计 3 层。
-# QQ 系协议端（NapCat / SnowLuma）发送时只接受 3 层嵌套，填更大值会让整条转发被
-# 拒绝（forward nesting depth exceeds 3），故默认取 2；其它平台能接受更多层时可调大。
-# 另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层也会退化成 m_resid 为空的
-# 卡片（内容取不到），「再次转发」最多只能恢复 2 层，更深层由 _forward_card_text
-# 渲染成文字占位。
-_FORWARD_MAX_DEPTH = 2
+# QQ 系协议端对合并转发嵌套层数的硬上限（含最外层记录，合计 3 层）。
+#
+# 这个 3 不是某个协议端随便定的，而是 QQ `com.tencent.multimsg` 报文自身的结构上限，
+# NapCat 与 SnowLuma 都把它写死在代码里，但超限后的表现不同：
+#
+# - NapCat（packages/napcat-onebot/action/msg/SendMsg.ts，uploadForwardedNodesPacket）
+#   `}, dp: number = 0)` 递归解析节点，循环开头 `if (dp >= 3) { logWarn('转发消息深度
+#   超过3层，将停止解析！'); break; }` —— 超过 3 层**静默截断**，第 4 层内容直接丢弃，
+#   消息本身仍会发出。
+#   https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/msg/SendMsg.ts
+#
+# - SnowLuma（runtime/index.mjs，expandForwardTreeForTarget）
+#   `const MAX_FORWARD_DEPTH = 3;` … `if (depth >= MAX_FORWARD_DEPTH) throw new
+#   MessageElementValidationError('INVALID_FIELD', 'forward nesting depth exceeds 3')`
+#   —— 超过 3 层**直接报错**，整条转发失败。
+#
+# 所以插件侧必须自己把层数钳在 3 以内：NapCat 上是静默丢内容，SnowLuma 上是整条发不出去。
+_FORWARD_LAYER_LIMIT = 3
 
-# 配置项 forward_max_depth 的允许上限（防御式钳制，避免异常值构造出超大嵌套）
-_FORWARD_MAX_DEPTH_LIMIT = 10
+# 配置 forward_max_depth 的语义是「最多保留几层（含最外层记录）」，默认 3。
+_FORWARD_TOTAL_DEPTH = 3
+
+# 配置项允许的总层数范围（防御式钳制，避免异常值构造出超大嵌套）
+_FORWARD_TOTAL_DEPTH_MIN = 1
+_FORWARD_TOTAL_DEPTH_LIMIT = 10
+
+# 内部展开函数用的「还能再展开几层」默认值 = 总层数 - 1（最外层已经用掉一层）。
+# 旧版配置的语义正是这个值，故保留同名常量供函数签名使用。
+_FORWARD_MAX_DEPTH = _FORWARD_TOTAL_DEPTH - 1
 
 # 合并转发卡片最多展示的预览行数（QQ 卡片模板上限）与单行正文最大长度
 _FORWARD_PREVIEW_MAX_LINES = 4
@@ -2547,6 +2565,7 @@ class MsgForward(star.Star):
         # 迁移旧分组：media / at / platform 已合并进 enhance
         self._migrate_config_groups()
         self._migrate_forward_mode()
+        self._migrate_forward_layers()
 
     def _migrate_legacy_umo_lists(self):
         """把旧版 list 类型存储的 source_umo / target_umo 迁移为每行一条的 text。
@@ -2658,6 +2677,42 @@ class MsgForward(star.Star):
             )
         except Exception as e:
             logger.warning(f"⚠️ 合并记录发送方式迁移失败（不影响正常运行）：{e}")
+
+    def _migrate_forward_layers(self) -> None:
+        """把旧「再展开层数」的 forward_max_depth 折算成「总层数」forward_total_layers。
+
+        旧语义是「除最外层外还能再展开几层」（默认 2 = 合计 3 层），新语义是总层数
+        （默认 3）。同一个键无法区分两种语义，因此换了键名：旧键保留为 invisible
+        供这里读取，折算规则为「新值 = 旧值 + 1」。
+
+        只在新键仍是默认值 3 且旧键被改过时迁移——用户显式设过新值就以新值为准。
+        旧键等于旧默认值 2 时无需迁移（2 + 1 = 3，正好是新默认值）。"""
+        try:
+            legacy = self._conf_get("forward_max_depth", None)
+            if legacy is None:
+                return
+            try:
+                old_value = int(legacy)
+            except (TypeError, ValueError):
+                return
+            if old_value == _FORWARD_TOTAL_DEPTH - 1:
+                return
+            section = self.config.get("forward")
+            if not isinstance(section, dict):
+                section = {}
+            if "forward_total_layers" in section and section["forward_total_layers"] != _FORWARD_TOTAL_DEPTH:
+                return
+            new_value = max(_FORWARD_TOTAL_DEPTH_MIN, min(old_value + 1, _FORWARD_TOTAL_DEPTH_LIMIT))
+            if section.get("forward_total_layers") == new_value:
+                return
+            section["forward_total_layers"] = new_value
+            self.config["forward"] = section
+            self.config.save_config()
+            logger.info(
+                f"✅ 已将聊天记录层数设置从「再展开 {old_value} 层」迁移为「合计 {new_value} 层」"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 聊天记录层数迁移失败（不影响正常运行）：{e}")
 
     def _format_origin_header(self, event: AstrMessageEvent, umo: str) -> str:
         try:
@@ -4611,6 +4666,7 @@ class MsgForward(star.Star):
         "forward_card_auto_rebuild": ("forward", "forward_card_auto_rebuild"),
         "forward_node_avatar": ("forward", "forward_node_avatar"),
         "forward_card_preview": ("forward", "forward_card_preview"),
+        "forward_total_layers": ("forward", "forward_total_layers"),
         "forward_max_depth": ("forward", "forward_max_depth"),
         "filter_mode": ("filter", "filter_mode"),
         "filter_patterns": ("filter", "filter_patterns"),
@@ -4669,18 +4725,24 @@ class MsgForward(star.Star):
         title=仅显示卡片标题；off=统一显示「[卡片消息]」；非法值回退 source。"""
         return _normalize_card_preview_mode(self._conf_get("forward_card_preview", "source"))
 
-    def _forward_max_depth(self) -> int:
-        """聊天记录嵌套最多再展开几层（配置 forward_max_depth，默认 2）。
+    def _forward_total_depth(self) -> int:
+        """聊天记录最多保留几层（含最外层记录），配置 forward_max_depth，默认 3。
 
-        值即「除最外层记录外还能再展开几层」，所以 2 对应合计 3 层。QQ 系协议端发送时
-        只接受 3 层嵌套，填更大值会让整条转发被协议端拒绝（forward nesting depth
-        exceeds 3）；其它平台能接受更多层时可以调大。非法值回退默认值并钳制到 0~10。"""
-        val = self._conf_get("forward_max_depth", _FORWARD_MAX_DEPTH)
+        配置值是**总层数**：1 = 只保留最外层，内层记录降级为文字占位；3 = 最外层 +
+        两层嵌套，也是 QQ 系协议端的硬上限（见 `_FORWARD_LAYER_LIMIT` 的出处）。
+        非法值回退默认值并钳制到 1~10。"""
+        val = self._conf_get("forward_total_layers", _FORWARD_TOTAL_DEPTH)
         try:
-            depth = int(val)
+            total = int(val)
         except (TypeError, ValueError):
-            return _FORWARD_MAX_DEPTH
-        return max(0, min(depth, _FORWARD_MAX_DEPTH_LIMIT))
+            return _FORWARD_TOTAL_DEPTH
+        return max(_FORWARD_TOTAL_DEPTH_MIN, min(total, _FORWARD_TOTAL_DEPTH_LIMIT))
+
+    def _forward_max_depth(self) -> int:
+        """转成内部展开函数使用的「还能再展开几层」= 总层数 - 1。
+
+        内部函数把最外层记录算作第 1 层，因此再展开层数比总层数少 1。"""
+        return self._forward_total_depth() - 1
 
     def _forward_avatar_enabled(self) -> bool:
         """转发聊天记录时是否按发送者昵称反查真实 QQ 号（用于显示真实头像）。

@@ -76,7 +76,8 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 ### 2.4 合并转发（聊天记录）展开（模块级）
 
-- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS` / `_FORWARD_MAX_DEPTH` / `_FORWARD_MAX_DEPTH_LIMIT`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`） / 嵌套记录最多再展开的层数默认值（配置 `forward_max_depth` 覆盖，语义为「除最外层外还能再展开几层」，2 = 合计 3 层，即 QQ 系协议端的发送上限） / 该配置的允许上限（10，防御式钳制）
+- `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`）
+- `_FORWARD_LAYER_LIMIT`（=3）/ `_FORWARD_TOTAL_DEPTH`（=3）/ `_FORWARD_TOTAL_DEPTH_MIN`（=1）/ `_FORWARD_TOTAL_DEPTH_LIMIT`（=10）/ `_FORWARD_MAX_DEPTH`（=总层数-1）：QQ 系协议端对合并转发嵌套层数的硬上限（**含最外层，合计 3 层**，出处见下方「3 层上限的依据」）/ 配置 `forward_total_layers` 的默认总层数 / 总层数下限 / 总层数上限（防御式钳制）/ 内部展开函数使用的「还能再展开几层」（= 总层数 − 1，因为最外层已占一层）
 - `_FORWARD_PREVIEW_MAX_LINES` / `_FORWARD_PREVIEW_MAX_CHARS`：合并转发卡片预览（`news` 扩展参数）最多展示的行数（QQ 卡片模板上限 4 行）/ 单行正文最大长度（超出截断并加省略号）
 - `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`；同时携带 `news` 预览行，避免协议端把嵌套聊天记录显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`（`news` 为 NapCat / SnowLuma 等 OneBot 实现的扩展参数，不支持的实现会忽略）；`card_preview_mode` 字段由配置 `forward_card_preview` 决定，控制预览行的卡片展示方式——`source` 来源 + 标题（默认，保留原始 `prompt` 的来源前缀）/ `title` 仅标题 / `off` 统一「[卡片消息]」
 - `_sole_nested_forward(content)` / `_nodes_without_nested(nodes, card_preview_mode=_CARD_PREVIEW_TITLE)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
@@ -107,6 +108,12 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 - `_expand_forward_components(event, chain, keep_time=True, card_preview_mode=_CARD_PREVIEW_TITLE, avatar_resolver=None)`：把链中的 `Forward`（仅带源会话 resId）展开为重建的 `_ForwardNodes`、`Node` 包成 `_ForwardNodes`；拉取失败降级为 `[聊天记录]` 文本，绝不透传无效 forward 段；`avatar_resolver` 见 `_fetch_forward_nodes`
 - `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL），并保留节点时间、`_ForwardNodes` 子类与其 `card_preview_mode` 配置（自定义序列化不能被降级成内置 `Nodes`）
 - `_chain_has_media(chain)`：链中是否含媒体组件（含节点内媒体），决定发送失败时是否值得本地化重试
+
+**「3 层上限」的依据（改层数相关逻辑前必读）**：这个 3 不是某个协议端随意定的，而是 QQ `com.tencent.multimsg` 报文自身的结构上限，NapCat 与 SnowLuma 各自写死在代码里，但**超限后的表现不同**：
+- **NapCat**（`packages/napcat-onebot/action/msg/SendMsg.ts` 的 `uploadForwardedNodesPacket`）：签名 `}, dp: number = 0)` 从 0 递归，循环开头 `if (dp >= 3) { logWarn('转发消息深度超过3层，将停止解析！'); break; }`，每钻一层 `dp + 1` → 超过 3 层**静默截断**，第 4 层内容直接丢弃，消息本身仍会发出。
+- **SnowLuma**（`runtime/index.mjs` 的 `expandForwardTreeForTarget`）：`const MAX_FORWARD_DEPTH = 3;` … `if (depth >= MAX_FORWARD_DEPTH) throw new MessageElementValidationError('INVALID_FIELD', 'forward nesting depth exceeds 3')` → 超过 3 层**直接报错**，整条转发失败。
+- 因此插件侧必须自己钳在 3 以内：NapCat 上是静默丢内容（用户以为转发成功但内容缺失），SnowLuma 上是整条发不出去。
+- 另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层也会退化成 `m_resid` 为空的卡片（内容取不到），「再次转发」最多只能恢复 2 层，更深层由 `_forward_card_text` 渲染成文字占位。
 
 ### 2.5 媒体处理工具函数（模块级）
 
@@ -143,7 +150,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 ### 2.7 插件主体 `MsgForward(star.Star)` 生命周期
 
-- `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）、`_migrate_config_groups()`（旧分组 `media` / `at` / `platform` 的存量值搬进 `enhance`）与 `_migrate_forward_mode()`（旧「原生转发 / 卡片重建」两开关折算成三态 `forward_send_mode`）
+- `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）、`_migrate_config_groups()`（旧分组 `media` / `at` / `platform` 的存量值搬进 `enhance`）、`_migrate_forward_mode()`（旧「原生转发 / 卡片重建」两开关折算成三态 `forward_send_mode`）与 `_migrate_forward_layers()`（旧「再展开层数」`forward_max_depth` 折算成「总层数」`forward_total_layers`，+1）
 - `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务
 - `terminate()`：取消 worker 与清理任务
 
@@ -248,7 +255,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 新增配置项的固定顺序：先补 `_conf_schema.json`，再在代码里实现读写，最后同步 README 配置表与 CHANGELOG；**schema 里有的项必须在 README 配置表中出现**（漏写 = 文档不全）。
 
-> ⚠️ **改分组名 / 合并分组的硬约束**：AstrBot 在插件 `__init__` **之前**就按 schema 裁剪配置——schema 里没有声明的键会被直接丢弃并写回磁盘。因此**不能**靠「插件启动时读旧分组再迁移」保住存量值（那时旧键已被删）。要改分组，必须先在新 schema 里把旧分组继续声明为 `invisible: true`（如当前 `media` / `at` / `platform`；合并进 `forward_send_mode` 的旧开关 `forward_native_relay` / `forward_card_auto_rebuild` 同理保留为 invisible），值才会被保留，插件再在 `_migrate_config_groups()` / `_migrate_forward_mode()` 里搬到新位置；**确认所有用户升级完毕后**，才能在下个大版本删掉这些隐藏旧项。迁移判据是「旧值 ≠ 旧分组默认值 且 新分组仍是新分组默认值」——不能只看「新分组有没有这个键」，AstrBot 会把新分组填成默认值。
+> ⚠️ **改分组名 / 合并分组的硬约束**：AstrBot 在插件 `__init__` **之前**就按 schema 裁剪配置——schema 里没有声明的键会被直接丢弃并写回磁盘。因此**不能**靠「插件启动时读旧分组再迁移」保住存量值（那时旧键已被删）。要改分组，必须先在新 schema 里把旧分组继续声明为 `invisible: true`（如当前 `media` / `at` / `platform`；合并进 `forward_send_mode` 的旧开关 `forward_native_relay` / `forward_card_auto_rebuild`、被改成总层数的旧键 `forward_max_depth` 同理保留为 invisible），值才会被保留，插件再在 `_migrate_config_groups()` / `_migrate_forward_mode()` 里搬到新位置；**确认所有用户升级完毕后**，才能在下个大版本删掉这些隐藏旧项。迁移判据是「旧值 ≠ 旧分组默认值 且 新分组仍是新分组默认值」——不能只看「新分组有没有这个键」，AstrBot 会把新分组填成默认值。
 
 `_conf_schema.json` 是**扁平字典**：顶层 key 就是配置项 key，值是该配置项的 schema 节点——没有 `fields` 数组、没有 `schemaVersion` 之类的自造外壳（AstrBot 直接把整个 JSON 当「key → 节点」解析，套错外壳等于没有配置项）。常用节点字段：`type`（必填，`string` / `text` / `int` / `float` / `bool` / `object` / `list` / `dict` / `template_list`）、`description`（WebUI 显示的配置名）、`hint`（问号提示）、`default`、`options` + `labels` + `subtitles`（下拉选项）、`slider`（`{"min","max","step"}`，仅 int / float）、`secret`（密钥遮罩）、`invisible`、`items`（`object` / `dict` 的子 schema）、`_special`（用户 / 会话选择器）。配置分组用 `object` 嵌套表达（子 schema 放 `items`），不要发明分组字段。
 
@@ -272,7 +279,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 合并记录的发送方式 | `forward_send_mode` | string, auto | auto=自动（能原生就原生，含可还原卡片时改走重建还原）/ native=优先原生（不因卡片改走重建）/ rebuild=优先重建（逐条重写，卡片尽量还原）；旧开关 `forward_native_relay` / `forward_card_auto_rebuild` 升级时自动折算 |
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
 | [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；**仅当整条记录的发送者 QQ 号已被协议端抹平时才改写**（记录自带不同真实 QQ 号则整条跳过，避免把正确值改错）；发送者不在机器人所在的群 / 昵称重名 / 已改名时改不了，这些消息取不到头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
-| 聊天记录嵌套展开层数 | `forward_max_depth` | int, 2 | 记录里再套的记录最多再展开几层（`2`=合计 3 层）。QQ 系协议端（NapCat / SnowLuma）发送时最多接受 3 层，填更大值会导致整条转发被拒（`forward nesting depth exceeds 3`）；其它平台能接受更多层时可调大，超过 10 会被钳制。另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层会退化成无 `m_resid` 的卡片，再转发最多只能恢复 2 层 |
+| 聊天记录最多保留几层 | `forward_total_layers` | int, 3 | 含最外层在内的总层数，默认 3（= 转发这条 + 里面套的两层）。QQ 系协议端只接受 3 层：NapCat 超过后静默丢弃更深记录、SnowLuma 直接报错导致整条失败，因此 >3 只对非 QQ 平台有意义；1 = 只保留最外层，内层记录降级为文字占位。内部按「总层数 − 1」传给展开函数 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/command/image/face/record/video/file/at/other，默认除 `command`（指令）外全选 |
 | [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
@@ -317,7 +324,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
 - 只读已知字段、丢弃未知字段：`settings = {k: self.config.get(k, v) for k, v in DEFAULT_SETTINGS.items()}`（本项目的配置读取分散在多个专有方法里，规则级字段逐个走下方列出的解析方法，不做整体重写）
-- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_forward_max_depth()`（`forward_max_depth`，钳制 0~10）、`_forward_send_mode()`（`forward_send_mode`，返回 auto / native / rebuild；键缺失时按旧两开关推导）、`_native_forward_enabled()`（是否为 auto/native）、`_forward_card_auto_rebuild()`（是否为 auto/rebuild，即重建时是否尝试还原卡片）、`_conf_bool()`（布尔配置解析，兼容字符串 false）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_forward_total_depth()`（`forward_total_layers`，总层数含最外层，钳制 1~10）、`_forward_max_depth()`（= 总层数 − 1，内部展开函数用的「还能再展开几层」）、`_forward_send_mode()`（`forward_send_mode`，返回 auto / native / rebuild；键缺失时按旧两开关推导）、`_native_forward_enabled()`（是否为 auto/native）、`_forward_card_auto_rebuild()`（是否为 auto/rebuild，即重建时是否尝试还原卡片）、`_conf_bool()`（布尔配置解析，兼容字符串 false）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
 - 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`；内容类型走模块级 `_content_types_for(rule, config)`
 
 ---
