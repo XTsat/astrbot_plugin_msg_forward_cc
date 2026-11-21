@@ -77,7 +77,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 ### 2.4 合并转发（聊天记录）展开（模块级）
 
 - `_FORWARD_PLACEHOLDER` / `_NODES_TARGET_PLATFORMS`：无法展开或目标平台不支持合并转发时的占位文本 `[聊天记录]` / 可直接发送 `Nodes` 的目标平台适配器类型（`aiocqhttp`、`satori`）
-- `_FORWARD_LAYER_LIMIT`（=3）/ `_FORWARD_TOTAL_DEPTH`（=3）/ `_FORWARD_TOTAL_DEPTH_MIN`（=1）/ `_FORWARD_TOTAL_DEPTH_LIMIT`（=10）/ `_FORWARD_MAX_DEPTH`（=总层数-1）：QQ 系协议端对合并转发嵌套层数的硬上限（**含最外层，合计 3 层**，出处见下方「3 层上限的依据」）/ 配置 `forward_total_layers` 的默认总层数 / 总层数下限 / 总层数上限（防御式钳制）/ 内部展开函数使用的「还能再展开几层」（= 总层数 − 1，因为最外层已占一层）
+- `_FORWARD_LAYER_LIMIT`（=3）/ `_FORWARD_TOTAL_DEPTH`（=3）/ `_FORWARD_TOTAL_DEPTH_MIN`（=1）/ `_FORWARD_TOTAL_DEPTH_LIMIT`（=10）/ `_FORWARD_MAX_DEPTH`（=总层数-1）：插件默认的嵌套层数上限（**含最外层，合计 3 层**；各协议端的实测行为见下方「3 层上限的依据」）/ 配置 `forward_total_layers` 的默认总层数 / 总层数下限 / 总层数上限（防御式钳制）/ 内部展开函数使用的「还能再展开几层」（= 总层数 − 1，因为最外层已占一层）
 - `_FORWARD_PREVIEW_MAX_LINES` / `_FORWARD_PREVIEW_MAX_CHARS`：合并转发卡片预览（`news` 扩展参数）最多展示的行数（QQ 卡片模板上限 4 行）/ 单行正文最大长度（超出截断并加省略号）
 - `_ForwardNodes(Nodes)`：合并转发组件子类，覆写 `to_dict()` 生成目标协议端可直接上传的 payload——AstrBot 内置 `Nodes.to_dict` 不携带节点时间、也不支持节点内嵌套聊天记录，而 aiocqhttp 适配器对 `Nodes` 正是直接调用 `to_dict()`；同时携带 `news` 预览行，避免协议端把嵌套聊天记录显示成 `[消息]`、JSON 卡片显示成 `[JSON消息]`（`news` 为 NapCat / SnowLuma 等 OneBot 实现的扩展参数，不支持的实现会忽略）；`card_preview_mode` 字段由配置 `forward_card_preview` 决定，控制预览行的卡片展示方式——`source` 来源 + 标题（默认，保留原始 `prompt` 的来源前缀）/ `title` 仅标题 / `off` 统一「[卡片消息]」
 - `_sole_nested_forward(content)` / `_nodes_without_nested(nodes, card_preview_mode=_CARD_PREVIEW_TITLE)`：节点内容是否「只有一条合并转发」（协议端只支持纯嵌套 node 数组）/ 把未展开的嵌套记录降级为文本占位
@@ -109,10 +109,11 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 - `_map_chain_components(chain, mapper)`：对链中组件逐个应用异步变换，`Node` / `Nodes` 内容递归处理（节点内媒体同样需要本地化 / 注册 URL），并保留节点时间、`_ForwardNodes` 子类与其 `card_preview_mode` 配置（自定义序列化不能被降级成内置 `Nodes`）
 - `_chain_has_media(chain)`：链中是否含媒体组件（含节点内媒体），决定发送失败时是否值得本地化重试
 
-**「3 层上限」的依据（改层数相关逻辑前必读）**：这个 3 不是某个协议端随意定的，而是 QQ `com.tencent.multimsg` 报文自身的结构上限，NapCat 与 SnowLuma 各自写死在代码里，但**超限后的表现不同**：
+**「3 层上限」的依据（改层数相关逻辑前必读）**：**只陈述各协议端的实测行为，不要断言 3 是（或不是）QQ 服务端的硬性限制——两种情况都没有证据**。以下是各实现的实际代码：
 - **NapCat**（`packages/napcat-onebot/action/msg/SendMsg.ts` 的 `uploadForwardedNodesPacket`）：签名 `}, dp: number = 0)` 从 0 递归，循环开头 `if (dp >= 3) { logWarn('转发消息深度超过3层，将停止解析！'); break; }`，每钻一层 `dp + 1` → 超过 3 层**静默截断**，第 4 层内容直接丢弃，消息本身仍会发出。
 - **SnowLuma**（`runtime/index.mjs` 的 `expandForwardTreeForTarget`）：`const MAX_FORWARD_DEPTH = 3;` … `if (depth >= MAX_FORWARD_DEPTH) throw new MessageElementValidationError('INVALID_FIELD', 'forward nesting depth exceeds 3')` → 超过 3 层**直接报错**，整条转发失败。
-- 因此插件侧必须自己钳在 3 以内：NapCat 上是静默丢内容（用户以为转发成功但内容缺失），SnowLuma 上是整条发不出去。
+- **LLOneBot**（`src/onebot11/transform/message/outgoing.ts` 的 `transformOutgoingSegments`）：递归处理 `node` 段内容（`isInsideForward` 标记已在转发内），**全文没有任何 depth 计数或层数校验**，上限交由 QQ 服务端处理；超过 3 层时的表现取决于服务端。
+- 插件默认按 3 处理：NapCat 上是静默丢内容（用户以为转发成功但内容缺失），SnowLuma 上是整条发不出去，LLOneBot 上不受该层校验影响；需要更深嵌套时可调大配置。
 - 另注意：即使发出 3 层，事后重新拉取同一份记录时第 3 层也会退化成 `m_resid` 为空的卡片（内容取不到），「再次转发」最多只能恢复 2 层，更深层由 `_forward_card_text` 渲染成文字占位。
 
 ### 2.5 媒体处理工具函数（模块级）
@@ -279,7 +280,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 合并记录的发送方式 | `forward_send_mode` | string, auto | auto=自动（能原生就原生，含可还原卡片时改走重建还原）/ native=优先原生（不因卡片改走重建）/ rebuild=优先重建（逐条重写，卡片尽量还原）；旧开关 `forward_native_relay` / `forward_card_auto_rebuild` 升级时自动折算 |
 | 聊天记录卡片预览 | `forward_card_preview` | string, source | source=来源 + 标题（默认，显示卡片原本传递的预览文本，保留「[QQ小程序]」「[分享]」等来源前缀）；title=仅标题（卡片预览行只显示卡片标题）；off=不显示（统一 `[卡片消息]`）；不显示简介 / 上传者 / 跳转链接等其它信息 |
 | [增强] 转发聊天记录时获取发送者头像 | `forward_node_avatar` | bool, true | 按发送者昵称从群成员名册反查真实 QQ 号，让 QQ 端显示聊天记录里每条消息的发送者头像；匹配时先做昵称归一化（全半角 / 空格 / Emoji / 大小写），昵称本身是 QQ 号时直接采用，只采用唯一匹配；**仅当整条记录的发送者 QQ 号已被协议端抹平时才改写**（记录自带不同真实 QQ 号则整条跳过，避免把正确值改错）；发送者不在机器人所在的群 / 昵称重名 / 已改名时改不了，这些消息取不到头像；关闭后直接沿用协议端返回的发送者信息，不再拉取群成员列表 |
-| 聊天记录最多保留几层 | `forward_total_layers` | int, 3 | 含最外层在内的总层数，默认 3（= 转发这条 + 里面套的两层）。QQ 系协议端只接受 3 层：NapCat 超过后静默丢弃更深记录、SnowLuma 直接报错导致整条失败，因此 >3 只对非 QQ 平台有意义；1 = 只保留最外层，内层记录降级为文字占位。内部按「总层数 − 1」传给展开函数 |
+| 聊天记录最多保留几层 | `forward_total_layers` | int, 3 | 含最外层在内的总层数，默认 3（= 转发这条 + 里面套的两层）。协议端对超过 3 层的处理不同：NapCat 静默丢弃更深记录、SnowLuma 直接报错导致整条失败、LLOneBot 不校验层数，因此 >3 的效果取决于目标协议端；1 = 只保留最外层，内层记录降级为文字占位。内部按「总层数 − 1」传给展开函数 |
 | 默认转发的内容类型 | `default_content_types` | list(checkbox) | 键：plain/command/image/face/record/video/file/at/other，默认除 `command`（指令）外全选 |
 | [增强] 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
@@ -693,6 +694,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 
 - **关键配置不进折叠**：首次使用必须填的（必填地址、功能总开关）留在外面；折叠只装「不读也能用」的参考内容。
 - **折叠在 WebUI 会降级**：AstrBot 插件详情页内嵌的 README 会过滤 `details` / `summary` 标签，折叠块在那里变成普通文字、表格照常显示——因此折叠内容必须自洽可读，不能靠折叠藏必要信息。
+- **单个配置项的深度说明可再折叠一层**：某个配置项需要较长原理 / 限制说明（如「聊天记录最多保留几层」的 3 层上限依据）时，在该分组 `<details>` 内部再嵌一层 `<details><summary>…（技术细节）</summary>`，紧跟在它那一行表格之后；`</details>` 必须成对闭合、内层完全落在外层块内。这类内嵌说明同样受 WebUI 降级影响（在那里会展开成普通段落），所以正文必须能独立读懂。
 - 表格列固定「配置项 / 类型 / 默认值 / 说明」；配置项写「中文名（`key`）」（见 5.1），类型全篇统一（写 schema 的 `type`，或写 WebUI 里的中文类型），不要一张表里混用两种写法。
 - 现状：README 配置表已按「基础设置 / 过滤与指令 / 冷却与队列 / 内容与媒体 / 高级 @」五类分组（覆盖 `_conf_schema.json` 全部 21 项），`rules` 字段表（17 项）用 `<details>` 折叠；新增配置项时归入对应分组，不要重新堆回一张长表。
 

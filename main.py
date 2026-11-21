@@ -407,23 +407,26 @@ _FORWARD_SEND_MODES = {"auto", "native", "rebuild"}
 # 这两个 action 是 OneBot 11 扩展，satori 等其它适配器没有对应通路。
 _NATIVE_FORWARD_PLATFORMS = {"aiocqhttp"}
 
-# QQ 系协议端对合并转发嵌套层数的硬上限（含最外层记录，合计 3 层）。
+# 合并转发嵌套层数的默认上限（含最外层记录，合计 3 层）。
 #
-# 这个 3 不是某个协议端随便定的，而是 QQ `com.tencent.multimsg` 报文自身的结构上限，
-# NapCat 与 SnowLuma 都把它写死在代码里，但超限后的表现不同：
+# 下面只记录各协议端的实测行为，不对 QQ 服务端本身能接受几层下结论：
 #
 # - NapCat（packages/napcat-onebot/action/msg/SendMsg.ts，uploadForwardedNodesPacket）
 #   `}, dp: number = 0)` 递归解析节点，循环开头 `if (dp >= 3) { logWarn('转发消息深度
-#   超过3层，将停止解析！'); break; }` —— 超过 3 层**静默截断**，第 4 层内容直接丢弃，
+#   超过3层，将停止解析！'); break; }` —— 超过 3 层时静默截断，第 4 层内容被丢弃，
 #   消息本身仍会发出。
 #   https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/msg/SendMsg.ts
 #
-# - SnowLuma（runtime/index.mjs，expandForwardTreeForTarget）
-#   `const MAX_FORWARD_DEPTH = 3;` … `if (depth >= MAX_FORWARD_DEPTH) throw new
+# - SnowLuma（runtime/index.mjs，parseForwardNodes / expandForwardTreeForTarget）
+#   `var MAX_FORWARD_DEPTH = 3;` … `if (depth >= MAX_FORWARD_DEPTH) throw new
 #   MessageElementValidationError('INVALID_FIELD', 'forward nesting depth exceeds 3')`
-#   —— 超过 3 层**直接报错**，整条转发失败。
+#   —— 发送前本地校验，超过 3 层直接报错，整条转发失败。
 #
-# 所以插件侧必须自己把层数钳在 3 以内：NapCat 上是静默丢内容，SnowLuma 上是整条发不出去。
+# - LLOneBot（src/onebot11/transform/message/outgoing.ts，transformOutgoingSegments）
+#   递归处理 `node` 段内容，不做层数校验，上限交由 QQ 服务端处理。
+#
+# 插件默认按 3 处理，是为了在这些协议端上都能正常发出；需要更深嵌套时可调大配置，
+# 实际能收到几层取决于目标协议端与 QQ 服务端。
 _FORWARD_LAYER_LIMIT = 3
 
 # 配置 forward_max_depth 的语义是「最多保留几层（含最外层记录）」，默认 3。
@@ -4729,7 +4732,7 @@ class MsgForward(star.Star):
         """聊天记录最多保留几层（含最外层记录），配置 forward_max_depth，默认 3。
 
         配置值是**总层数**：1 = 只保留最外层，内层记录降级为文字占位；3 = 最外层 +
-        两层嵌套，也是 QQ 系协议端的硬上限（见 `_FORWARD_LAYER_LIMIT` 的出处）。
+        两层嵌套，也是默认值（各协议端的实际层数处理见 `_FORWARD_LAYER_LIMIT` 的注释）。
         非法值回退默认值并钳制到 1~10。"""
         val = self._conf_get("forward_total_layers", _FORWARD_TOTAL_DEPTH)
         try:

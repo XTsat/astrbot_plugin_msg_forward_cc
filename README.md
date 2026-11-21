@@ -161,7 +161,56 @@
 | 合并记录的发送方式（`forward_send_mode`） | string | `auto` | `auto` 自动：能原生转发就原生（最快，发送者、嵌套层数与卡片最完整），记录里有能还原的聊天记录卡片时改走重建把内层还原；`native` 优先原生：始终先让协议端搬运，不因卡片改走重建（内层卡片可能显示成「[XML消息]」）；`rebuild` 优先重建：逐条重写，跨平台或需要严格按内容类型筛选时用，卡片尽量还原、取不回时原样发卡片。升级后旧的「原生转发 / 卡片重建」开关会自动折算成对应方式 |
 | 转发聊天记录时获取发送者头像（`forward_node_avatar`） | bool | `true` | 让聊天记录显示发送者本人头像；昵称重名、已改名或不在机器人所在群时补不回来 |
 | 聊天记录卡片预览（`forward_card_preview`） | string | `source` | `source` 来源 + 标题 / `title` 仅标题 / `off` 统一 `[卡片消息]` |
-| 聊天记录最多保留几层（`forward_total_layers`） | int | `3` | 含最外层在内的总层数：`3` = 你转发的这条 + 里面套的两层。QQ 系协议端（NapCat / SnowLuma）只接受 3 层——超过后 NapCat 会静默丢掉更深的记录、SnowLuma 会让整条转发失败，所以填大于 3 只对非 QQ 平台有意义。填 `1` 表示只保留最外层，里面的记录显示为 `[聊天记录]` 文字 |
+| 聊天记录最多保留几层（`forward_total_layers`） | int | `3` | 含最外层在内的总层数：`3` = 你转发的这条 + 里面套的两层。协议端对超过 3 层的处理不同——NapCat 会静默丢掉更深的记录、SnowLuma 会让整条转发失败、LLOneBot 不校验层数，所以填大于 3 的效果取决于目标协议端。填 `1` 表示只保留最外层，里面的记录显示为 `[聊天记录]` 文字 |
+
+<details>
+<summary>3 层上限的出处（技术细节）</summary>
+
+各协议端在发送前对嵌套层数的处理方式不同，超限后的结果也不同。以下为实际代码行为。
+
+**NapCat** — `packages/napcat-onebot/action/msg/SendMsg.ts` 的 `uploadForwardedNodesPacket`：
+
+```ts
+}, dp: number = 0) {                      // 从 0 开始递归
+  for (const node of messageNodes) {
+    if (dp >= 3) {
+      logWarn('转发消息深度超过3层，将停止解析！');
+      break;                              // 第 4 层直接丢弃
+    }
+    ...
+    }, dp + 1);                           // 每钻一层 +1
+```
+
+超过 3 层时截断：消息仍会发出，但第 4 层及更深的内容被丢弃，发送方不会收到错误。
+
+**SnowLuma** — `runtime/index.mjs` 的 `expandForwardTreeForTarget`：
+
+```js
+const MAX_FORWARD_DEPTH = 3;
+async function expandForwardTreeForTarget(ref, resId, target, depth) {
+  if (depth >= MAX_FORWARD_DEPTH)
+    throw new MessageElementValidationError(
+      "INVALID_FIELD", `forward nesting depth exceeds ${MAX_FORWARD_DEPTH}`, ...);
+```
+
+超过 3 层时抛错：整条转发失败，消息发不出去。
+
+**LLOneBot** — `src/onebot11/transform/message/outgoing.ts` 的 `transformOutgoingSegments`：
+
+```ts
+case OB11MessageDataType.Node: {
+  const content = segment.data.content ? message2List(segment.data.content) : []
+  const inner = await transformOutgoingSegments(ctx, content, peer, true)
+  ...
+  nodes.push({ ... elements: inner.sendElements ... })
+}
+```
+
+递归处理节点内容，自身不限制层数，层数上限交由 QQ 服务端处理；超过 3 层时的表现取决于服务端。
+
+插件默认按 3 层处理，避免在限制更严格的协议端上整条转发失败；需要更深嵌套时可调大配置。
+
+</details>
 
 </details>
 
