@@ -567,3 +567,121 @@ class TestCardFallbackKeepsRawXml:
         chain = m._deserialize_chain(data)
         assert len(chain) == 1 and isinstance(chain[0], m._RawXmlCard)
         assert chain[0].raw == self.CARD_XML
+
+
+class TestForwardModeSwitch:
+    """三态 forward_send_mode 取代旧的「原生转发 / 卡片重建」两个布尔开关。"""
+
+    CARD_XML = (
+        '<msg action="viewMultiMsg" brief="[聊天记录]" m_resid="x">聊天记录</msg>'
+    )
+
+    def test_default_is_auto(self):
+        p = make_plugin({})
+        assert p._forward_send_mode() == "auto"
+        assert p._native_forward_enabled() is True
+        assert p._forward_card_auto_rebuild() is True
+
+    def test_explicit_modes(self):
+        for mode in ("auto", "native", "rebuild"):
+            p = make_plugin({"forward": {"forward_send_mode": mode}})
+            assert p._forward_send_mode() == mode
+            assert p._native_forward_enabled() is (mode != "rebuild")
+            assert p._forward_card_auto_rebuild() is (mode != "native")
+
+    def test_legacy_native_off_maps_to_rebuild(self):
+        p = make_plugin({"forward": {"forward_native_relay": False}})
+        assert p._forward_send_mode() == "rebuild"
+        assert p._native_forward_enabled() is False
+
+    def test_legacy_card_off_maps_to_native(self):
+        p = make_plugin(
+            {"forward": {"forward_native_relay": True, "forward_card_auto_rebuild": False}}
+        )
+        assert p._forward_send_mode() == "native"
+        assert p._forward_card_auto_rebuild() is False
+
+    async def test_rebuild_mode_never_uses_native(self, forward_chain):
+        bot = FakeBot()
+        p = make_plugin(
+            {"rules": [make_rule()], "forward": {"forward_send_mode": "rebuild"}}
+        )
+        await p.forward_message(FakeEvent(forward_chain, bot))
+        assert native_calls(bot) == []
+        assert p.context.sent, "一律重建时仍应发出消息"
+
+    async def test_native_mode_skips_card_probe(self, forward_chain):
+        """「优先原生」不探测卡片：即使卡片能还原也不改走重建。"""
+
+        class Bot(FakeBot):
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_msg":
+                    return {"data": {"message": [
+                        {"type": "forward", "data": {"id": "fid"}}
+                    ]}}
+                if action == "get_forward_msg":
+                    return {"data": {"messages": [{"message": [
+                        {"type": "xml", "data": {"data": TestForwardModeSwitch.CARD_XML}}
+                    ]}]}}
+                return {"data": {}}
+
+        bot = Bot()
+        p = make_plugin(
+            {"rules": [make_rule()], "forward": {"forward_send_mode": "native"}}
+        )
+        await p.forward_message(FakeEvent(forward_chain, bot))
+        assert "forward_group_single_msg" in bot.actions()
+        assert "get_forward_msg" not in bot.actions()
+
+
+class TestForwardModeMigration:
+    """升级时把旧的两个布尔开关折算成三态，不做无谓写入。"""
+
+    def test_native_off_migrates_to_rebuild(self):
+        conf = _SaveableDict(
+            {
+                "forward": {
+                    "forward_send_mode": "auto",
+                    "forward_native_relay": False,
+                    "forward_card_auto_rebuild": True,
+                }
+            }
+        )
+        make_plugin(conf)._migrate_forward_mode()
+        assert conf["forward"]["forward_send_mode"] == "rebuild"
+        assert conf.saves == 1
+
+    def test_card_off_migrates_to_native(self):
+        conf = _SaveableDict(
+            {
+                "forward": {
+                    "forward_send_mode": "auto",
+                    "forward_native_relay": True,
+                    "forward_card_auto_rebuild": False,
+                }
+            }
+        )
+        make_plugin(conf)._migrate_forward_mode()
+        assert conf["forward"]["forward_send_mode"] == "native"
+        assert conf.saves == 1
+
+    def test_defaults_do_nothing(self):
+        conf = _SaveableDict({"forward": {"forward_send_mode": "auto"}})
+        make_plugin(conf)._migrate_forward_mode()
+        assert conf["forward"]["forward_send_mode"] == "auto"
+        assert conf.saves == 0
+
+    def test_explicit_mode_wins(self):
+        conf = _SaveableDict(
+            {
+                "forward": {
+                    "forward_send_mode": "rebuild",
+                    "forward_native_relay": True,
+                    "forward_card_auto_rebuild": False,
+                }
+            }
+        )
+        make_plugin(conf)._migrate_forward_mode()
+        assert conf["forward"]["forward_send_mode"] == "rebuild"
+        assert conf.saves == 0

@@ -400,6 +400,9 @@ _FORWARD_PLACEHOLDER = "[聊天记录]"
 # AstrBot 中可直接发送 Nodes（合并转发）的目标平台适配器类型
 _NODES_TARGET_PLATFORMS = {"aiocqhttp", "satori"}
 
+# 合并记录的发送方式（配置 forward_send_mode）：自动 / 一律优先原生 / 一律重建
+_FORWARD_SEND_MODES = {"auto", "native", "rebuild"}
+
 # 支持协议端原生转发（forward_group_single_msg / forward_friend_single_msg）的平台类型。
 # 这两个 action 是 OneBot 11 扩展，satori 等其它适配器没有对应通路。
 _NATIVE_FORWARD_PLATFORMS = {"aiocqhttp"}
@@ -2543,6 +2546,7 @@ class MsgForward(star.Star):
         self._migrate_legacy_umo_lists()
         # 迁移旧分组：media / at / platform 已合并进 enhance
         self._migrate_config_groups()
+        self._migrate_forward_mode()
 
     def _migrate_legacy_umo_lists(self):
         """把旧版 list 类型存储的 source_umo / target_umo 迁移为每行一条的 text。
@@ -2623,6 +2627,37 @@ class MsgForward(star.Star):
                 )
         except Exception as e:
             logger.warning(f"⚠️ 配置分组迁移失败（不影响正常运行）：{e}")
+
+    def _migrate_forward_mode(self) -> None:
+        """把旧版「原生转发 / 卡片重建」两个布尔开关折算成三态 forward_send_mode。
+
+        只在「新键仍是默认 auto」且旧键被用户改过时迁移：原生关 → rebuild；
+        原生开但卡片重建关 → native；两个都保持默认（都开）则无需迁移。
+        旧键必须继续留在 schema 里（标记 invisible），否则 AstrBot 在插件初始化
+        之前就会把值裁掉，这里读不到用户设置。"""
+        try:
+            current = str(self._conf_get("forward_send_mode", "auto") or "").strip().lower()
+            if current != "auto":
+                return
+            if not self._conf_bool("forward_native_relay", True):
+                new_mode = "rebuild"
+            elif not self._conf_bool("forward_card_auto_rebuild", True):
+                new_mode = "native"
+            else:
+                return
+            section = self.config.get("forward")
+            if not isinstance(section, dict):
+                section = {}
+            if section.get("forward_send_mode") == new_mode:
+                return
+            section["forward_send_mode"] = new_mode
+            self.config["forward"] = section
+            self.config.save_config()
+            logger.info(
+                f"✅ 已将旧的原生转发/卡片重建开关迁移为 forward_send_mode={new_mode}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 合并记录发送方式迁移失败（不影响正常运行）：{e}")
 
     def _format_origin_header(self, event: AstrMessageEvent, umo: str) -> str:
         try:
@@ -3894,30 +3929,50 @@ class MsgForward(star.Star):
 
     # ----- 合并转发：协议端原生转发（默认启用，同协议端时优先） -----
 
+    def _conf_bool(self, key: str, default: bool) -> bool:
+        """读取布尔配置，兼容字符串形式的 false / 0 / off / no。"""
+        val = self._conf_get(key, default)
+        if isinstance(val, str):
+            return val.strip().lower() not in ("false", "0", "off", "no")
+        return bool(val)
+
+    def _forward_send_mode(self) -> str:
+        """合并记录的发送方式（配置 forward_send_mode）：auto / native / rebuild。
+
+        - auto：能原生就原生；记录里有能还原的聊天记录卡片时改走重建，把内层还原成
+          可点开的嵌套记录；
+        - native：一律优先让协议端搬运，不因卡片改走重建（重建兜底时卡片原样 XML）；
+        - rebuild：一律逐条重建，卡片尽量还原、取不回时原样发卡片。
+
+        该键缺失时按旧版两个布尔开关推导，保证升级后行为与旧配置一致：
+        `forward_native_relay=false` → rebuild；原生开但 `forward_card_auto_rebuild=false`
+        → native。"""
+        mode = str(self._conf_get("forward_send_mode", "") or "").strip().lower()
+        if mode in _FORWARD_SEND_MODES:
+            return mode
+        if not self._conf_bool("forward_native_relay", True):
+            return "rebuild"
+        if not self._conf_bool("forward_card_auto_rebuild", True):
+            return "native"
+        return "auto"
+
     def _native_forward_enabled(self) -> bool:
-        """是否优先尝试协议端原生转发合并转发（配置 forward_native_relay，默认开启）。
+        """是否优先尝试协议端原生转发合并转发（发送方式为 auto / native 时开启）。
 
         开启时，源消息就是一条合并转发、且目标与源在同一个 QQ 协议端实例上，就先让
         协议端自己搬这条记录（`forward_group_single_msg` / `forward_friend_single_msg`）：
         记录内容、发送者身份、嵌套层数、内嵌卡片全部原样保留，省掉「拉取→重建→重传」
         这一圈，也不会因重建丢头像或把深层记录压成文字。失败、跨平台、跨实例、消息里
-        混排了别的内容时一律回退到重建链路，所以关闭它只影响走不走这条快路径。"""
-        val = self._conf_get("forward_native_relay", True)
-        if isinstance(val, str):
-            return val.strip().lower() not in ("false", "0", "off", "no")
-        return bool(val)
+        混排了别的内容时一律回退到重建链路，所以它只是一条快路径，不是唯一路径。"""
+        return self._forward_send_mode() in ("auto", "native")
 
     def _forward_card_auto_rebuild(self) -> bool:
-        """记录里含「聊天记录」卡片时是否允许探测并改走重建（配置 forward_card_auto_rebuild）。
+        """重建时是否尝试还原「聊天记录」卡片（auto / rebuild 开启，native 关闭）。
 
-        默认开启：先探测卡片能否按 `m_resid` / `m_fileName` 取回内容——能取回才改走
-        重建并还原成可点开的嵌套记录（原生转发会把卡片原样搬过去，QQ 客户端显示成
-        `[XML消息]` 且点不开）；取不回则保留原生转发，避免重建把卡片降级。
-        关闭后不探测卡片、一律走原生转发（更快），重建时卡片也按原样 XML 发出。"""
-        val = self._conf_get("forward_card_auto_rebuild", True)
-        if isinstance(val, str):
-            return val.strip().lower() not in ("false", "0", "off", "no")
-        return bool(val)
+        auto / rebuild：先探测卡片能否按 `m_resid` / `m_fileName` 取回内容——能取回
+        就还原成可点开的嵌套记录，取不回则改发原样 XML 卡片。
+        native：不探测、不还原，重建兜底时卡片直接原样 XML 发出。"""
+        return self._forward_send_mode() in ("auto", "rebuild")
 
     def _same_platform_instance(self, event: AstrMessageEvent, target: str) -> bool:
         """目标会话是否与事件来源在同一个协议端实例上（原生转发的硬前提）。
@@ -4551,6 +4606,7 @@ class MsgForward(star.Star):
         "header_template": ("basic", "header_template"),
         "default_content_types": ("basic", "default_content_types"),
         "forward_keep_time": ("forward", "forward_keep_time"),
+        "forward_send_mode": ("forward", "forward_send_mode"),
         "forward_native_relay": ("forward", "forward_native_relay"),
         "forward_card_auto_rebuild": ("forward", "forward_card_auto_rebuild"),
         "forward_node_avatar": ("forward", "forward_node_avatar"),
