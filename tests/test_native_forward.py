@@ -204,7 +204,7 @@ class TestRecordWithCard:
         """探测拉不到记录时不该阻断快路径（否则记录失效就永远走不了原生转发）。"""
         bot = FakeBot(fail=True)
         p = make_plugin({})
-        assert await p._record_has_card(bot, "777") is False
+        assert await p._record_card_state(bot, "777") == "none"
 
 
 class TestCardAutoRebuildSwitch:
@@ -245,14 +245,15 @@ class TestCardAutoRebuildSwitch:
         assert p._forward_card_auto_rebuild() is False
 
     async def test_enabled_detects_card(self):
+        """卡片内容能取回 → restorable（值得改走重建还原）。"""
         p = make_plugin({})
-        assert await p._record_has_card(self._bot_with_card(), "1") is True
+        assert await p._record_card_state(self._bot_with_card(), "1") == "restorable"
 
     async def test_disabled_skips_detection(self):
         """关掉后不再探测卡片，一律走原生转发。"""
         p = make_plugin({"forward": {"forward_card_auto_rebuild": False}})
         bot = self._bot_with_card()
-        assert await p._record_has_card(bot, "1") is False
+        assert await p._record_card_state(bot, "1") == "none"
         # 连探测请求都不该发
         assert bot.actions() == []
 
@@ -264,3 +265,76 @@ class TestCardAutoRebuildSwitch:
         )
         assert sent is True
         assert "forward_group_single_msg" in bot.actions()
+
+
+class TestUnresolvableCardKeepsNative:
+    """卡片内容取不回时不拦原生转发。
+
+    重建还原不了这种卡片（例如 SnowLuma 对只剩 m_fileName 的卡片一律 retcode=100），
+    强行重建只会把卡片降级；保留原生转发，卡片和嵌套都还能原样到目标端。
+    """
+
+    CARD_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?><msg serviceID="35" templateID="1" '
+        'action="viewMultiMsg" brief="[聊天记录]" m_fileName="deadbeef" tSum="2">'
+        "<item><title>某群聊天记录</title></item></msg>"
+    )
+
+    @classmethod
+    def _bot(cls):
+        class Bot(FakeBot):
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_msg":
+                    return {"data": {"message": [
+                        {"type": "forward", "data": {"id": "fid"}}
+                    ]}}
+                if action == "get_forward_msg":
+                    if str(params.get("id", "")) == "fid":
+                        return {"data": {"messages": [{"message": [
+                            {"type": "xml", "data": {"data": cls.CARD_XML}}
+                        ]}]}}
+                    # 卡片句柄取不回内容
+                    return {"status": "failed", "retcode": 100, "data": None}
+                return {"data": {}}
+
+        return Bot()
+
+    async def test_state_is_unresolvable(self):
+        assert await make_plugin({})._record_card_state(self._bot(), "777") == "unresolvable"
+
+    async def test_native_forward_not_blocked(self):
+        bot = self._bot()
+        sent = await make_plugin({})._send_native_forward(
+            FakeEvent([], bot=bot, mid="777"), "qq-main:GroupMessage:222"
+        )
+        assert sent is True
+        assert "forward_group_single_msg" in bot.actions()
+
+    async def test_resolvable_card_still_blocks_native(self):
+        """卡片能取回内容时仍然改走重建：原生搬过去会被显示成 [XML消息]。"""
+
+        class Bot(FakeBot):
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_msg":
+                    return {"data": {"message": [
+                        {"type": "forward", "data": {"id": "fid"}}
+                    ]}}
+                if action == "get_forward_msg":
+                    if str(params.get("id", "")) == "fid":
+                        return {"data": {"messages": [{"message": [
+                            {"type": "xml",
+                             "data": {"data": TestUnresolvableCardKeepsNative.CARD_XML}}
+                        ]}]}}
+                    return {"data": {"messages": [{"message": [
+                        {"type": "text", "data": {"text": "inner"}}
+                    ]}]}}
+                return {"data": {}}
+
+        bot = Bot()
+        assert await make_plugin({})._record_card_state(bot, "777") == "restorable"
+        sent = await make_plugin({})._send_native_forward(
+            FakeEvent([], bot=bot, mid="777"), "qq-main:GroupMessage:222"
+        )
+        assert sent is False

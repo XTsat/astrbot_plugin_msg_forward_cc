@@ -490,3 +490,80 @@ class TestAtPassthroughPlatforms:
 
         extra = p._conf_get("at_passthrough_extra_platforms", [])
         assert "myqq" in m._at_passthrough_platforms(extra)
+
+
+class TestCardFallbackKeepsRawXml:
+    """卡片内容取不回时，重建保留原样 XML 卡片，而不是降级成文字占位。
+
+    SnowLuma 对只剩 m_fileName 的卡片一律 retcode=100；旧行为会把它变成
+    「[聊天记录] 标题（N条）· 预览行」文字，卡片外观与点开都丢了。
+    """
+
+    CARD_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?><msg serviceID="35" templateID="1" '
+        'action="viewMultiMsg" brief="[聊天记录]" m_fileName="deadbeef" tSum="2">'
+        "<item><title>某群聊天记录</title></item></msg>"
+    )
+
+    @classmethod
+    def _bot(cls):
+        class Bot(FakeBot):
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_forward_msg":
+                    if str(params.get("id", "")) == "fid":
+                        return {"data": {"messages": [{"message": [
+                            {"type": "xml", "data": {"data": cls.CARD_XML}}
+                        ]}]}}
+                    return {"status": "failed", "retcode": 100, "data": None}
+                return {"data": {}}
+
+        return Bot()
+
+    async def test_rebuild_keeps_raw_xml_card(self):
+        import main as m
+
+        ev = FakeEvent([m.Forward(id="fid")], self._bot())
+        chain = await m._expand_forward_components(
+            ev, [m.Forward(id="fid")], keep_time=True, depth=2, rebuild_card=True
+        )
+        content = chain[0].nodes[0].content
+        raw = [c for c in content if isinstance(c, m._RawXmlCard)]
+        assert raw and raw[0].raw == self.CARD_XML
+        assert not any(
+            isinstance(c, Plain) and "[聊天记录]" in str(c.text) for c in content
+        ), "取不回内容时不应再降级成文字占位"
+
+    async def test_resolvable_card_becomes_nested_nodes(self):
+        import main as m
+
+        class Bot(FakeBot):
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_forward_msg":
+                    if str(params.get("id", "")) == "fid":
+                        return {"data": {"messages": [{"message": [
+                            {"type": "xml", "data": {"data": TestCardFallbackKeepsRawXml.CARD_XML}}
+                        ]}]}}
+                    # 卡片 resid / fileName 能取到内层记录
+                    return {"data": {"messages": [{"message": [
+                        {"type": "text", "data": {"text": "内层消息"}}
+                    ]}]}}
+                return {"data": {}}
+
+        ev = FakeEvent([m.Forward(id="fid")], Bot())
+        chain = await m._expand_forward_components(
+            ev, [m.Forward(id="fid")], keep_time=True, depth=2, rebuild_card=True
+        )
+        content = chain[0].nodes[0].content
+        assert any(isinstance(c, m.Nodes) for c in content)
+        assert not any(isinstance(c, m._RawXmlCard) for c in content)
+
+    def test_raw_xml_card_survives_queue_serialization(self):
+        import main as m
+
+        data = m._serialize_chain([m._RawXmlCard(self.CARD_XML)])
+        assert data and data[0]["t"] == "raw_xml"
+        chain = m._deserialize_chain(data)
+        assert len(chain) == 1 and isinstance(chain[0], m._RawXmlCard)
+        assert chain[0].raw == self.CARD_XML

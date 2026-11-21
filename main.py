@@ -487,19 +487,27 @@ class _ForwardCardRef:
     节点内容是一张聊天记录卡片（XML `action=viewMultiMsg`）时，协议端只给卡片外壳：
     标题、条数、预览行与两个资源句柄，**不含完整消息内容**。`m_resid` 有值时可以直接当
     合并转发 resId 再拉一次；为空（记录被二次转发时很常见）时只能拿 `m_fileName` 试一次。
-    两者都取不到说明协议端与机器人账号都读不到这份内容，此时保留卡片的标题、条数与预览
-    行降级为文字占位——预览行是真实消息片段，是这份记录里唯一还能带过去的内容。"""
+    两者都取不到说明协议端与机器人账号都读不到这份内容，此时把原始 XML 原样发出去，
+    保住卡片外观、标题与条数（内容能否点开取决于服务端是否还留着这份记录）；只有连原始
+    XML 都没有时才降级为标题 + 预览行的文字占位。"""
 
-    __slots__ = ("title", "count", "previews", "file_name", "resid")
+    __slots__ = ("title", "count", "previews", "file_name", "resid", "raw")
 
     def __init__(
-        self, title: str, count: int, previews: list[str], file_name: str, resid: str
+        self,
+        title: str,
+        count: int,
+        previews: list[str],
+        file_name: str,
+        resid: str,
+        raw: str = "",
     ) -> None:
         self.title = title
         self.count = count
         self.previews = previews
         self.file_name = file_name
         self.resid = resid
+        self.raw = raw
 
 
 def _forward_card_resid(raw: str) -> str:
@@ -529,6 +537,7 @@ def _forward_card_ref(raw: str) -> _ForwardCardRef:
         previews=lines[1 : _FORWARD_CARD_PREVIEW_MAX_LINES + 1],
         file_name=file_match.group(1).strip() if file_match else "",
         resid=_forward_card_resid(raw),
+        raw=raw or "",
     )
 
 
@@ -687,6 +696,8 @@ def _component_preview_text(
         text = _json_card_preview_text(comp, _normalize_card_preview_mode(card_preview_mode))
         return text or "[卡片消息]"
     if isinstance(comp, Nodes | Node | Forward):
+        return _FORWARD_PLACEHOLDER
+    if isinstance(comp, _RawXmlCard):
         return _FORWARD_PLACEHOLDER
     return "[消息]"
 
@@ -1196,7 +1207,10 @@ async def _resolve_forward_cards(
     content: list,
     resolver: Callable[[_ForwardCardRef], Awaitable[Nodes | None]] | None,
 ) -> list:
-    """把节点内容里的「聊天记录」卡片占位换成嵌套记录（还原不了时保留标题与条数）。"""
+    """把节点内容里的「聊天记录」卡片占位换成嵌套记录。
+
+    还原不了时优先把卡片原始 XML 原样发出去（保住外观、标题与条数，与老版本行为一致）；
+    只有连原始 XML 都没有时才降级为文字占位（标题 + 条数 + 卡片自带预览行）。"""
     resolved = []
     for comp in content:
         if not isinstance(comp, _ForwardCardRef):
@@ -1209,9 +1223,18 @@ async def _resolve_forward_cards(
             except Exception as e:
                 # 协议端调用异常类型不确定，单张卡片失败不能拖垮整条转发的重建
                 logger.warning(
-                    f"⚠️ [astrbot_plugin_msg_forward_cc] 聊天记录卡片还原失败，保留标题占位：{e}"
+                    f"⚠️ [astrbot_plugin_msg_forward_cc] 聊天记录卡片还原失败，改为原样发卡片：{e}"
                 )
-        resolved.append(nested if nested is not None else Plain(text=_forward_card_text(comp)))
+        if nested is not None:
+            resolved.append(nested)
+        elif comp.raw:
+            resolved.append(_RawXmlCard(comp.raw))
+            logger.info(
+                f"ℹ️ [astrbot_plugin_msg_forward_cc] 聊天记录卡片内容取不到，改为原样发卡片："
+                f"{comp.title or '(无标题)'}（{comp.count}条）"
+            )
+        else:
+            resolved.append(Plain(text=_forward_card_text(comp)))
     return resolved
 
 
@@ -1535,18 +1558,26 @@ def _segment_is_forward_card(seg) -> bool:
 
 
 def _record_has_forward_card(messages) -> bool:
-    """记录（get_forward_msg 的节点列表）里是否含「聊天记录」卡片。
+    """记录（get_forward_msg 的节点列表）里是否含「聊天记录」卡片。"""
+    return bool(_forward_card_raws(messages))
 
-    含卡片的记录不能走原生转发：协议端会把 xml 段原样搬到目标群，而 QQ 客户端
-    不会解析记录里的 xml 段，直接显示成 `[XML消息]`、点不开。重建链路能把卡片
-    按 m_resid 还原成真正的嵌套记录，才能正常点开。"""
+
+def _forward_card_raws(messages) -> list[str]:
+    """取记录里所有「聊天记录」卡片的原始 XML。
+
+    卡片只有外壳（标题 / 条数 / 预览行 / m_resid / m_fileName），原始 XML 是内容
+    取不回时唯一还能原样发出去、保住卡片外观的东西。"""
+    raws = []
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
         for seg in (msg.get("message") or msg.get("content") or []):
-            if _segment_is_forward_card(seg):
-                return True
-    return False
+            if not _segment_is_forward_card(seg):
+                continue
+            raw = str((seg.get("data") or {}).get("data") or "")
+            if raw:
+                raws.append(raw)
+    return raws
 
 
 def _native_forward_message_id(event) -> str:
@@ -2115,6 +2146,10 @@ def _serialize_chain(chain) -> list:
                 out.append({"t": "face", "id": int(comp.id)})
             elif isinstance(comp, Json):
                 out.append({"t": "json", "data": comp.data})
+            elif isinstance(comp, _RawXmlCard):
+                # 原样 XML 卡片是「内容取不回」时的最终降级，队列持久化必须带上它，
+                # 否则重启后内层记录会直接消失（比文字占位更糟）
+                out.append({"t": "raw_xml", "raw": comp.raw})
             elif isinstance(comp, Nodes):
                 out.append({"t": "nodes", "nodes": [_serialize_node(n) for n in comp.nodes]})
             elif isinstance(comp, Node):
@@ -2152,6 +2187,10 @@ def _deserialize_chain(data: list, *, card_preview_mode: str = _CARD_PREVIEW_SOU
                 chain.append(Face(id=int(item.get("id", 0))))
             elif t == "json":
                 chain.append(Json(data=item.get("data") or {}))
+            elif t == "raw_xml":
+                raw = str(item.get("raw") or "")
+                if raw:
+                    chain.append(_RawXmlCard(raw))
             elif t == "nodes":
                 nodes = [
                     n
@@ -3869,12 +3908,12 @@ class MsgForward(star.Star):
         return bool(val)
 
     def _forward_card_auto_rebuild(self) -> bool:
-        """记录里含「聊天记录」卡片时是否自动改走重建（配置 forward_card_auto_rebuild）。
+        """记录里含「聊天记录」卡片时是否允许探测并改走重建（配置 forward_card_auto_rebuild）。
 
-        默认开启：卡片在原生转发下会被原样搬过去，QQ 客户端只显示 `[XML消息]` 且
-        点不开；改走重建能按 `m_resid` 还原成真正可点开的嵌套记录。
-        关闭后一律走原生转发（更快），代价是这类记录的内层卡片在目标端显示成
-        `[XML消息]`。"""
+        默认开启：先探测卡片能否按 `m_resid` / `m_fileName` 取回内容——能取回才改走
+        重建并还原成可点开的嵌套记录（原生转发会把卡片原样搬过去，QQ 客户端显示成
+        `[XML消息]` 且点不开）；取不回则保留原生转发，避免重建把卡片降级。
+        关闭后不探测卡片、一律走原生转发（更快），重建时卡片也按原样 XML 发出。"""
         val = self._conf_get("forward_card_auto_rebuild", True)
         if isinstance(val, str):
             return val.strip().lower() not in ("false", "0", "off", "no")
@@ -3926,23 +3965,44 @@ class MsgForward(star.Star):
             return bot
         return None
 
-    async def _record_has_card(self, bot, message_id: str) -> bool:
-        """这条消息对应的合并记录里是否含「聊天记录」卡片（拉不到记录时返回 False）。
+    async def _probe_card_restorable(self, bot, raw: str) -> bool:
+        """探测一张「聊天记录」卡片能否按 m_resid / m_fileName 取回内容。
 
-        含卡片的记录必须走重建：协议端原生转发会把 xml 段原样搬到目标群，QQ 客户端
-        不解析记录里的 xml，只会显示 `[XML消息]` 且点不开；重建链路能按 m_resid
-        还原成真正的嵌套记录。
+        取回任意一份内容即可还原成嵌套记录；两者都取不到说明协议端读不到这份卡片
+        （例如 SnowLuma 对只剩 m_fileName 的卡片一律返回 retcode=100），此时不该
+        把卡片降级成文字，应当保留原生转发或原样 XML 卡片。"""
+        if bot is None or not raw:
+            return False
+        card = _forward_card_ref(raw)
+        for handle in (card.resid, card.file_name):
+            if not handle:
+                continue
+            try:
+                payload = _unwrap_onebot_data(
+                    await bot.call_action("get_forward_msg", id=handle)
+                )
+            except Exception:
+                continue
+            if _forward_messages_of(payload):
+                return True
+        return False
 
-        拉不到记录时返回 False（不阻断原生转发）：探测本身不该让快路径失效——
-        真含卡片的记录通常都能拉到（协议端为它保留了 payload），拉不到时多半是
-        记录已失效，那时原生转发也会失败并自动回退。
+    async def _record_card_state(self, bot, message_id: str) -> str:
+        """这条消息对应的合并记录里「聊天记录」卡片的可还原性。
 
-        配置 `forward_card_auto_rebuild` 关闭时直接返回 False：用户选择一律走原生
-        转发（更快），此时卡片会被原样搬过去、目标端显示成 `[XML消息]`。"""
+        返回三态：
+        - "none"：没有卡片，或用户关闭了卡片自动重建（选择一律走原生转发）；
+        - "restorable"：有卡片且每张都能取回内容，交给重建链路还原成嵌套记录
+          （原生转发会把 xml 段搬过去，QQ 客户端显示成 `[XML消息]` 且点不开）；
+        - "unresolvable"：有卡片但至少一张取不回，不拦原生转发——重建同样还原
+          不了，只会把卡片降级（取不回时重建改为原样发 XML 卡片）。
+
+        拉不到记录时返回 "none"（不阻断原生转发）：探测本身不该让快路径失效——
+        真含卡片的记录通常都能拉到，拉不到时多半记录已失效，原生转发也会失败回退。"""
         if not self._forward_card_auto_rebuild():
-            return False
+            return "none"
         if bot is None or not message_id:
-            return False
+            return "none"
         # 先由 message_id 取出这条消息的 res_id：get_forward_msg 只认记录 ID，
         # 直接传 message_id 会失败（SnowLuma 返回「payload is empty」）。
         forward_id = ""
@@ -3967,15 +4027,20 @@ class MsgForward(star.Star):
                     break
         if not forward_id:
             # 取不到记录 ID 说明不是「可搬运的合并转发」，交给原生转发自己判断
-            return False
+            return "none"
         try:
             payload = _unwrap_onebot_data(
                 await bot.call_action("get_forward_msg", id=forward_id)
             )
         except Exception:
-            return False
-        messages = _forward_messages_of(payload)
-        return _record_has_forward_card(messages) if messages else False
+            return "none"
+        raws = _forward_card_raws(_forward_messages_of(payload))
+        if not raws:
+            return "none"
+        for raw in raws:
+            if not await self._probe_card_restorable(bot, raw):
+                return "unresolvable"
+        return "restorable"
 
     # 上一次原生转发放弃是否因为「记录里含聊天记录卡片」。
     # 队列路径据此在回退时换用入队时备好的「卡片已还原」链；
@@ -4012,14 +4077,22 @@ class MsgForward(star.Star):
             return False
         # 含「聊天记录」卡片的记录不能原样搬运：QQ 客户端不解析记录里的 xml 段，
         # 只会显示 `[XML消息]` 且点不开；交给重建链路按 m_resid 还原成嵌套记录
+        # 卡片是否拦原生转发取决于「能不能还原」：能还原才值得重建（原生搬过去会被
+        # QQ 显示成 `[XML消息]` 且点不开）；还原不了时重建只会把卡片降级，宁可保留原生。
         self._native_card_blocked = False
-        if await self._record_has_card(bot, message_id):
+        card_state = await self._record_card_state(bot, message_id)
+        if card_state == "restorable":
             self._native_card_blocked = True
             logger.info(
-                f"ℹ️ [astrbot_plugin_msg_forward_cc] 记录内含聊天记录卡片，"
+                f"ℹ️ [astrbot_plugin_msg_forward_cc] 记录内含可还原的聊天记录卡片，"
                 f"改走重建链路以便点开 → {target}"
             )
             return False
+        if card_state == "unresolvable":
+            logger.info(
+                f"ℹ️ [astrbot_plugin_msg_forward_cc] 记录内含无法还原的聊天记录卡片，"
+                f"保留原生转发以免卡片被降级 → {target}"
+            )
         try:
             await bot.call_action(action, message_id=message_id, **params)
         except Exception as e:
@@ -4915,19 +4988,19 @@ class MsgForward(star.Star):
         self, event, sanitized_chain, target: str, at_lookup: bool,
         at_passthrough: set, header_text: str,
     ) -> list | None:
-        """为队列条目备一份「卡片已还原」的链（记录里没卡片时返回 None）。
+        """为队列条目备一份「卡片已还原」的链（卡片不可还原或没有卡片时返回 None）。
 
-        队列 worker 到点后先试原生转发；若因记录含卡片而回退，就用这份链重建。
-        卡片是否还原跟随配置 `forward_card_auto_rebuild`（关掉时 `_record_has_card`
-        直接返回 False，这里也就不会构建）。
+        队列 worker 到点后先试原生转发；若因记录含「可还原的卡片」而回退，就用这份链
+        重建。只有卡片确实能取回内容时才构建（`_record_card_state` 为 restorable）——
+        取不回的卡片重建也还原不了，那时会保留原生转发或原样发 XML 卡片。
 
-        只有确认记录里确有卡片时才展开——避免给每条队列消息都白做一次完整重建。"""
+        只有确认需要时才展开——避免给每条队列消息都白做一次完整重建。"""
         bot = _onebot_bot_of(event)
         message_id = _native_forward_message_id(event)
         if bot is None or not message_id:
             return None
         try:
-            if not await self._record_has_card(bot, message_id):
+            if await self._record_card_state(bot, message_id) != "restorable":
                 return None
         except Exception:
             return None
