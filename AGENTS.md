@@ -29,7 +29,7 @@
 |------|------|------|
 | `main.py` | ✅ | 插件主体，全部逻辑（单文件风格） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（389 行） |
-| `metadata.yaml` | ✅ | 插件元数据（v0.7.0，支持 19 个平台） |
+| `metadata.yaml` | ✅ | 插件元数据（v0.8.0，支持 19 个平台） |
 | `README.md` | ✅ | 中文文档（功能 / 指令 / 配置 / 其它四大板块，只写用户视角） |
 | `docs/platform-compatibility.md` | ✅ | 平台兼容性测试记录（各平台 × 各消息类型的实测结果），README 只保留一句指向 |
 | `CHANGELOG.md` | ✅ | 变更日志 |
