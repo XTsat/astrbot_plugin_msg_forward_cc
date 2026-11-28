@@ -118,6 +118,8 @@ def make_plugin(conf: dict, ctx: FakeCtx | None = None) -> m.MsgForward:
     p._cooldown_warned = set()
     p._send_queue = None
     p._queue_rule_counts = {}
+    p._forward_order_locks = {}
+    p._forward_order_lock_refs = {}
     return p
 
 

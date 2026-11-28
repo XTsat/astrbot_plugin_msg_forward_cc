@@ -2562,6 +2562,11 @@ class MsgForward(star.Star):
         self._cleanup_task: asyncio.Task | None = None
         # 队列暂停标志：pause 后 worker 停止消费（积压消息暂不发送），resume 恢复
         self._queue_paused: bool = False
+        # 同一来源会话的转发顺序锁（见 forward_message）：AstrBot 为每条事件单独起
+        # task 并发处理，聊天记录展开 / 媒体本地化较慢，后到的消息会先入队、先发送。
+        # 引用计数归零时回收锁对象，避免长期运行下按来源无限增长。
+        self._forward_order_locks: dict[str, asyncio.Lock] = {}
+        self._forward_order_lock_refs: dict[str, int] = {}
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
@@ -5316,7 +5321,7 @@ class MsgForward(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def forward_message(self, event: AstrMessageEvent):
-        """主转发逻辑"""
+        """主转发逻辑（同一来源会话串行处理，保证转发顺序）。"""
         try:
             source_umo = str(event.unified_msg_origin)
             # 带上 1-based 规则编号（与 /mf list 显示的编号一致），供队列上限日志提示等使用
@@ -5324,8 +5329,6 @@ class MsgForward(star.Star):
                      if source_umo in MsgForward._umo_list(r, "source_umo")]
             if not rules:
                 return
-
-            raw_chain = event.get_messages()
             # 指令识别（唤醒词可配置）：指令消息整条归入内容类型「指令」，
             # 命中的规则全都没勾选「指令」时就到此为止，不必再做合并转发展开等重活
             command_name = self._command_name(event)
@@ -5338,6 +5341,59 @@ class MsgForward(star.Star):
             # 用户黑白名单：命中规则的名单全都不放行时到此为止，不必再做合并转发展开等重活
             if all(not self._should_forward_by_sender(event, r) for _, r in rules):
                 return
+            # 顺序保证：AstrBot 为每条消息事件单独创建 task 并发处理
+            # （event_bus.dispatch → create_task(scheduler.execute(event))），而聊天记录
+            # 要点开拉取、媒体要先本地化，比纯文字慢得多——不串行化时后到的消息会先入队 /
+            # 先发送，目标端看到的先后顺序就反了（队列间隔越长越明显）。这里按来源会话
+            # 串行：同一会话的消息严格按到达顺序入队 / 发送，不同来源互不阻塞。以上检查
+            # 都是同步配置判断，先到的任务一定先拿到锁。
+            order_lock = self._forward_order_lock(source_umo)
+            try:
+                async with order_lock:
+                    await self._forward_event(
+                        event, source_umo, rules, command_name, is_command
+                    )
+            finally:
+                self._release_forward_order_lock(source_umo)
+        except Exception as e:
+            logger.error(f"❌ 转发逻辑异常: {e}")
+
+    def _forward_order_lock(self, source_umo: str) -> asyncio.Lock:
+        """取本来源会话的转发顺序锁，并把使用计数 +1（由 `forward_message` 释放）。
+
+        计数在取锁时同步 +1、释放时 -1，归零说明既没有持有者也没有等待者，此时回收
+        锁对象，避免长期运行下按来源无限增长。归零后下一个事件会新建一把锁，顺序保证
+        不受影响——此时不存在需要与它排队的在途事件。"""
+        locks = getattr(self, "_forward_order_locks", None)
+        if locks is None:
+            locks = self._forward_order_locks = {}
+            self._forward_order_lock_refs = {}
+        lock = locks.get(source_umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[source_umo] = lock
+        refs = self._forward_order_lock_refs
+        refs[source_umo] = refs.get(source_umo, 0) + 1
+        return lock
+
+    def _release_forward_order_lock(self, source_umo: str) -> None:
+        """释放顺序锁的使用计数，归零时回收锁对象（见 `_forward_order_lock`）。"""
+        refs = getattr(self, "_forward_order_lock_refs", None)
+        if not refs:
+            return
+        left = refs.get(source_umo, 1) - 1
+        if left > 0:
+            refs[source_umo] = left
+            return
+        refs.pop(source_umo, None)
+        self._forward_order_locks.pop(source_umo, None)
+
+    async def _forward_event(self, event: AstrMessageEvent, source_umo: str,
+                             rules: list[tuple[int, dict]], command_name: str | None,
+                             is_command: bool) -> None:
+        """处理一条事件命中的所有规则（调用方已按来源会话串行化）。"""
+        try:
+            raw_chain = event.get_messages()
             # 清洗无效的 @ 提及（空目标），保留 qq 原样透传，昵称仅作兜底
             sanitized_chain = _sanitize_chain_for_forward(raw_chain)
             # 清洗 File 组件的本地路径：NapCat 读不到源端本地路径，仅保留 URL 走下载

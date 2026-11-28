@@ -151,7 +151,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 ### 2.7 插件主体 `MsgForward(star.Star)` 生命周期
 
-- `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）、`_migrate_config_groups()`（旧分组 `media` / `at` / `platform` 的存量值搬进 `enhance`）、`_migrate_forward_mode()`（旧「原生转发 / 卡片重建」两开关折算成三态 `forward_send_mode`）与 `_migrate_forward_layers()`（旧「再展开层数」`forward_max_depth` 折算成「总层数」`forward_total_layers`，+1）
+- `__init__(self, context, config)`：初始化 data_dir（`StarTools.get_data_dir("msg_forward_cc")`）、`pending_file` / `queue_file`、媒体缓存目录、内存冷却表 `_cooldowns`（key = `source_umo|target_umo` → 结束时间戳）、冷却失效告警去重集合 `_cooldown_warned`、发送队列 `_send_queue`（asyncio.Queue）与按规则积压计数 `_queue_rule_counts`、worker/清理任务句柄、暂停标志 `_queue_paused`、同一来源会话的转发顺序锁 `_forward_order_locks` 与引用计数 `_forward_order_lock_refs`（见 6.5）；随后执行 `_migrate_legacy_umo_lists()`（旧版 list 格式 UMO 字段 → 每行一条 text，修复 WebUI 校验失败，仅在有 list 值时迁移并保存）、`_migrate_config_groups()`（旧分组 `media` / `at` / `platform` 的存量值搬进 `enhance`）、`_migrate_forward_mode()`（旧「原生转发 / 卡片重建」两开关折算成三态 `forward_send_mode`）与 `_migrate_forward_layers()`（旧「再展开层数」`forward_max_depth` 折算成「总层数」`forward_total_layers`，+1）
 - `initialize()`：恢复持久化队列（`_restore_persisted_queue`）→ 启动队列 worker → 启动时清理媒体缓存 → 启动每小时定期清理任务
 - `terminate()`：取消 worker 与清理任务
 
@@ -415,6 +415,8 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 `_rule_key(rule)`：由规则自身 source_umo/target_umo 内容派生的稳定标识（`src=>dst`），用于队列积压按规则归集统计——规则增删/排序/重启恢复后已入队消息仍能正确归属。
 
 ### 6.5 主转发逻辑 `forward_message`（事件监听）
+
+**顺序保证**：AstrBot 的 `event_bus.dispatch` 给每条消息事件单独 `create_task` 并发执行，而聊天记录要先 `get_forward_msg` 拉取、队列模式还要本地化媒体，比纯文字慢得多——不串行化时后到的消息会先入队 / 先发送，目标端看到的顺序就反了（队列间隔越大越明显）。因此 `forward_message` 先做入口判断（无规则 / 指令未勾选 / 用户名单不放行，全是只读配置的同步判断），再按 `source_umo` 取顺序锁，把整条事件交给 `_forward_event(event, source_umo, rules, command_name, is_command)` 处理：同一来源会话的消息严格按到达顺序入队 / 发送，不同来源互不阻塞。锁对象在无人使用（引用计数归零）时回收，避免按来源无限增长。
 
 事件级流程（匹配 source 命中的所有规则前）：
 1. `event.get_messages()` 取原始链
@@ -870,7 +872,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - 绑定流程：`add` 生成码 → 目标会话 `bind`，绑定码一次性（pop 即删），未绑定的码存在 pending.json
 - `bind`/`bindraw` 创建的规则自动带 `__template_key: "rule"`（WebUI 正确渲染模板列表）与 `remark` 编号（`规则 #N`）
 - 冷却表是纯内存的，重启后冷却状态丢失（不持久化）
-- 转发对同一 source 的规则是循环顺序执行，无并发锁；存储层注释「无锁简化」
+- 同一来源会话的转发按到达顺序串行（`_forward_order_locks`，见 6.5）：AstrBot 每条消息事件一个 task，聊天记录展开 / 媒体本地化较慢，不串行化时后到的消息会先入队、先发送。不同来源仍并发处理；存储层注释「无锁简化」（单写者）
 - 媒体转发默认不下载（`download_media_before_send=false`），跨设备转发提示找不到文件时才开启；NapCat 等容器场景读不到源端本地路径时依赖 File URL + 文件服务
 - 队列模式下媒体必须本地化（`_prepare_chain_for_queue` 无条件执行，不受 `download_media_before_send` 影响），防止源端临时文件延迟后被清理；发送前用文件服务实时注册 URL（NapCat 跨容器 + 短效 token 双重问题）
 - 队列持久化恢复（`_restore_persisted_queue`）在 `initialize()` 中执行，恢复后按 `rule_key` 重算规则级积压计数，上限判断保持有效；无法还原的空条目（旧版未序列化合并转发）从 `queue.json` 清除，避免永久残留
