@@ -129,7 +129,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 - `_rebuild_media_component(comp, use_proxy=False, proxy_url=None)`：媒体组件重下载重建（先本地路径、失败再远程 URL），解决跨会话转发源端临时路径不可达（ENOENT）问题；失败降级为 `Plain` 占位文本。Video 会清空 cover
 - `_prepare_chain_for_forward(chain, ...)`：转发前对 Image/Record/Video/File 逐组件本地化（走 AstrBot 核心 download_file）
 - `_prepare_chain_fallback(chain, ...)`：发送失败后的兜底链，仅本地化远程 URL 媒体
-- `_prepare_chain_for_queue(chain, ...)`：入队前媒体本地化到插件自有数据目录（重启/重载不丢）
+- `_prepare_chain_for_queue(chain, ...)`：入队前媒体本地化到插件自有数据目录（重启/重载不丢）；自带 `base64://` / `data:` 的媒体与已经在插件媒体缓存里的文件直接跳过（前者本身就是内容，后者再拷一份没有意义），相关判断在模块级 `_media_component_source` / `_media_is_self_contained`
 - `_get_media_cache_dir()`：队列媒体缓存目录（`astrbot/data/plugin_data/msg_forward_cc/media/`）
 - `_get_file_service_base_url()` / `_file_service_available()` / `_register_file_with_service(local_path, timeout=3600)`：把本地媒体注册到 AstrBot 内置文件服务（读全局 `callback_api_base`），返回 `{base}/api/file/{token}` 可下载 URL；未配置或失败返回 None
 - `_local_media_path_of(comp)`：提取组件本地化文件路径（含 file:// URI 解码、媒体缓存目录相对路径查找）
@@ -275,6 +275,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 | 发送队列总开关 | `queue_enabled` | bool, true | 规则设了间隔即入队；关闭后所有规则立即转发（紧急刹车） |
 | 队列媒体缓存保留时间（小时） | `queue_media_retention_hours` | int, 24 | 0=默认 24；重启时自动清理全部缓存 |
 | 发送队列总长度上限 | `queue_max_size` | int, 0 | **全部规则合计**的队列积压上限，0=不限制；与规则级独立上限同时生效（先判总上限、再判规则级） |
+| 队列媒体本地化 | `queue_localize_media` | string, auto | auto=原生转发的记录入队前不下载（发送时由协议端搬运，用不到重建链），其余媒体只拷贝可能失效的本地临时路径 / 远程 URL，自带 base64 与已在缓存的跳过；always=全部本地化（回退链最稳）；off=不本地化（最快，队列延迟后源文件被清理可能导致发送失败，失败后仍有重下/占位兜底） |
 | 发送媒体前先下载到本地 | `download_media_before_send` | bool, false | 跨设备转发提示找不到文件时才开启 |
 | 转发聊天记录时保留原始发送时间 | `forward_keep_time` | bool, true | 关闭则聊天记录里每条消息显示为转发时的时间 |
 | 合并记录的发送方式 | `forward_send_mode` | string, auto | auto=自动（能原生就原生，含可还原卡片时改走重建还原）/ native=优先原生（不因卡片改走重建）/ rebuild=优先重建（逐条重写，卡片尽量还原）；旧开关 `forward_native_relay` / `forward_card_auto_rebuild` 升级时自动折算 |
@@ -325,7 +326,7 @@ AstrBot 插件有两种主流架构风格——**单文件**（逻辑集中、�
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
 - 只读已知字段、丢弃未知字段：`settings = {k: self.config.get(k, v) for k, v in DEFAULT_SETTINGS.items()}`（本项目的配置读取分散在多个专有方法里，规则级字段逐个走下方列出的解析方法，不做整体重写）
-- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_forward_total_depth()`（`forward_total_layers`，总层数含最外层，钳制 1~10）、`_forward_max_depth()`（= 总层数 − 1，内部展开函数用的「还能再展开几层」）、`_forward_send_mode()`（`forward_send_mode`，返回 auto / native / rebuild；键缺失时按旧两开关推导）、`_native_forward_enabled()`（是否为 auto/native）、`_forward_card_auto_rebuild()`（是否为 auto/rebuild，即重建时是否尝试还原卡片）、`_conf_bool()`（布尔配置解析，兼容字符串 false）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
+- 全局开关类字段也走专有方法：`_card_preview_mode()`（`forward_card_preview`，返回归一化后的模式字符串）、`_forward_avatar_enabled()`（`forward_node_avatar`）、`_forward_total_depth()`（`forward_total_layers`，总层数含最外层，钳制 1~10）、`_forward_max_depth()`（= 总层数 − 1，内部展开函数用的「还能再展开几层」）、`_forward_send_mode()`（`forward_send_mode`，返回 auto / native / rebuild；键缺失时按旧两开关推导）、`_native_forward_enabled()`（是否为 auto/native）、`_forward_card_auto_rebuild()`（是否为 auto/rebuild，即重建时是否尝试还原卡片）、`_queue_localize_mode()`（`queue_localize_media`，返回 auto / always / off，未知值回退 auto；auto 下原生转发条目入队前不本地化）、`_conf_bool()`（布尔配置解析，兼容字符串 false）；唤醒词走模块级 `_global_wake_prefixes()`（只读 AstrBot 全局 `wake_prefix`）
 - 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`；内容类型走模块级 `_content_types_for(rule, config)`
 
 ---
@@ -428,7 +429,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 逐规则流程：
 1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（关键词 / 正则，规则级优先，inherit 继承全局）；`_should_forward_by_sender(event, rule)` 用户黑白名单检查（按发送者，见 6.6）；指令消息不走这里，由下一步的内容类型判定
 2. 内容类型筛选 `_content_types_for` + `_filter_chain_by_types(..., is_command)`（事件级 `_command_name(event)` 识别一次，指令消息整体按 `command` 类型判定）；过滤后为空则跳过（不转发、不占冷却）——指令消息默认就死在这一步
-3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
+3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志。入队前的媒体本地化按 `queue_localize_media` 策略（`_queue_localize_mode`）：auto 下命中原生转发的记录跳过本地化（worker 成功时用不到重建链），其余只拷贝可能失效的媒体；always 全部本地化；off 完全不本地化
 4. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
 5. 主链：默认透传 `sanitized_chain`（媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
 6. 逐目标：At 策略（反查开启且选中 @ 类型 → `_sanitize_at_chain_for_target` + `_resolve_at_mentions` 精确 @；默认 → `_textify_at_chain` 转文本）；`_degrade_forward_for_target` 在目标平台不支持 `Nodes` 时把合并转发降级为 `[聊天记录]` 文本；`_should_attach_header` 判定后前置来源头（末尾 `\n\n\u200b` 零宽空格避免连续换行问题）
@@ -874,7 +875,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 - 冷却表是纯内存的，重启后冷却状态丢失（不持久化）
 - 同一来源会话的转发按到达顺序串行（`_forward_order_locks`，见 6.5）：AstrBot 每条消息事件一个 task，聊天记录展开 / 媒体本地化较慢，不串行化时后到的消息会先入队、先发送。不同来源仍并发处理；存储层注释「无锁简化」（单写者）
 - 媒体转发默认不下载（`download_media_before_send=false`），跨设备转发提示找不到文件时才开启；NapCat 等容器场景读不到源端本地路径时依赖 File URL + 文件服务
-- 队列模式下媒体必须本地化（`_prepare_chain_for_queue` 无条件执行，不受 `download_media_before_send` 影响），防止源端临时文件延迟后被清理；发送前用文件服务实时注册 URL（NapCat 跨容器 + 短效 token 双重问题）
+- 队列模式下媒体默认按需本地化（`_prepare_chain_for_queue` + `queue_localize_media`，不受 `download_media_before_send` 影响）：auto（默认）下原生转发的记录入队前不下载，其余媒体只拷贝可能失效的本地临时路径 / 远程 URL，已在插件缓存或自带 base64 的跳过；设为 always 恢复「全部本地化」，设为 off 则完全不本地化（最快，但队列延迟后源端临时文件被清理 / URL 过期会导致发送失败，失败后仍走重下与占位兜底）。发送前用文件服务实时注册 URL（NapCat 跨容器 + 短效 token 双重问题）
 - 队列持久化恢复（`_restore_persisted_queue`）在 `initialize()` 中执行，恢复后按 `rule_key` 重算规则级积压计数，上限判断保持有效；无法还原的空条目（旧版未序列化合并转发）从 `queue.json` 清除，避免永久残留
 - 合并转发（聊天记录）：`Forward` 组件只携带源会话的 resId，直接透传会在目标端生成打不开的卡片（并露出 `#000000`、`34` 等模板字段），因此必须要么让协议端原生转发、要么拉取内容重建 `Nodes` 再发送；只有 `aiocqhttp` / `satori` 目标能发送 `Nodes`，其他平台降级为文本
 - 合并转发的发送方式（`forward_send_mode`）：auto（默认）/ native / rebuild；auto 与 native 都允许原生快路径，rebuild 强制逐条重建。升级时由 `_migrate_forward_mode()` 把旧的 `forward_native_relay` / `forward_card_auto_rebuild` 折算过来（原生关 → rebuild；原生开 + 卡片重建关 → native；都开 → auto）。原生快路径：整条消息恰好只有一个 `Forward`、规则勾选了「其他」类型（聊天记录归入该类型）、目标 UMO 的平台 ID 与 `event.get_platform_id()` 相同（同一协议端实例）、双方都是 `aiocqhttp`、能取到 `message_obj.message_id`、目标会话 ID 是数字时，直接调 `forward_group_single_msg`（群）或 `forward_friend_single_msg`（私聊）让协议端搬运源消息，完全跳过拉取与重建——记录内容、发送者身份、嵌套层数与内嵌卡片都原样保留。任一前提不满足或 action 抛错就静默回退到重建链路，所以它只是快路径，不是唯一路径。判断「单条记录」用的是**原始**消息链（`sanitized_chain`）而不是内容类型筛选后的链：原生转发搬的是整条源消息，混排了文字 / 图片时即使筛选后只剩一条 `Forward` 也不能走这条路；「其他」类型同理必须显式检查，否则会绕过重建链路的类型筛选。**原生模式下，记录里含「聊天记录」卡片时是否让路，由「能不能还原」决定**（`_forward_card_auto_rebuild()`，即 auto/rebuild 为 true）：`_record_card_state` 先用 `get_msg` 取 `forward.id`、再 `get_forward_msg` 拿到节点，对每张卡片的 `m_resid` / `m_fileName` 各试一次 `get_forward_msg`——全部能取回才返回 `restorable`，此时才放弃原生转发、改走重建并还原卡片（协议端原生转发会把 xml 段原样搬到目标群，QQ 客户端不解析记录里的 xml 段，只显示 `[XML消息]` 且点不开）；任一张取不回就返回 `unresolvable`，**保留原生转发**（重建同样还原不了，只会把卡片降级——SnowLuma 对只剩 `m_fileName` 的卡片一律 `retcode=100`，实测 6/6 取不回）。配置关闭时直接返回 `none`，不探测卡片、一律走原生转发。**注意「放弃原生转发」与「重建时还原卡片」是两件事**：因卡片回退时用 `_native_card_blocked` 标记，展开时 `rebuild_card` 跟随配置（队列路径由入队时备好的 `card_rebuilt_chain` 兜底）。重建时卡片确实取不回，`_resolve_forward_cards` 会把占位换成 `_RawXmlCard` 原样发 XML 卡片（保住外观 / 标题 / 条数），只有原始 XML 为空才退回 `_forward_card_text` 文字占位。注意 `get_forward_msg` **只认记录 ID，不认 message_id**，直接传 message_id 会返回「download forward message payload is empty」。队列模式同样优先尝试：入队时把「协议端实例 ID + 源消息 ID」记进队列条目（`native_forward` 字段，随 `queue.json` 持久化），worker 到点后先试原生转发，记录已被撤回或 `message_id` 失效时静默回退重建（`_send_queued_native`，来源头仍须先发出去，否则回退）。由于展开结果现在按需计算（`_expanded_chain` / `_filtered_chain` / `_message_chain` 三级惰性缓存），命中快路径时 `get_forward_msg` 一次都不会被调用。**内容类型筛选的语义不能变**：原始链里的一条 `Forward` 归「其他」，展开失败后会变成「文字」占位——两者命中不同类型，所以链里有 `Forward` 时必须等展开之后再筛，不能提前按原始链判定（`tests/test_forward_regress.py::TestContentTypeWithForward` 用 6 组「类型 × 展开成败」矩阵锁住这一点）

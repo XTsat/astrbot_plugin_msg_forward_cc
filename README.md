@@ -229,7 +229,7 @@ case OB11MessageDataType.Node: {
 > 过滤分全局与规则两级，规则级留空继承全局。以唤醒词开头的消息归入内容类型「指令」，是否转发由「指令」勾选决定（默认不勾），与过滤模式无关。
 
 <details>
-<summary>发送节奏（队列与冷却）（5 项）</summary>
+<summary>发送节奏（队列与冷却）（6 项）</summary>
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -237,6 +237,7 @@ case OB11MessageDataType.Node: {
 | 默认发送队列间隔（`default_queue_interval_seconds`） | int | `0` | 全局默认队列间隔，0=关闭 |
 | 发送队列总开关（`queue_enabled`） | bool | `true` | 规则设置了队列间隔即按间隔逐条发送；关闭后所有规则立即转发，可作紧急刹车 |
 | 发送队列总长度上限（`queue_max_size`） | int | `0` | 全部规则合计的积压上限，0=不限制 |
+| 队列媒体本地化（`queue_localize_media`） | string | `auto` | auto=原生转发的记录入队前不下载（发送时由协议端搬运），其余只拷贝可能失效的媒体；always=全部本地化；off=不本地化（最快，队列延迟后源文件被清理可能导致发送失败） |
 | 队列媒体缓存保留时间（`queue_media_retention_hours`） | int | `24` | 队列媒体缓存保留小时数，0=默认 24；重启时清空 |
 
 </details>

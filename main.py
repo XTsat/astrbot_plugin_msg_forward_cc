@@ -1902,6 +1902,24 @@ async def _prepare_chain_fallback(chain, use_proxy: bool = False, proxy_url: str
     return await _map_chain_components(chain, _localize)
 
 
+def _media_component_source(comp) -> str:
+    """媒体组件的原始来源字符串（base64 / data URI / URL / 本地路径）。
+
+    取不到返回空串。**不能**读 `File.file`——那是 property，访问会触发同步下载，
+    对 File 只能读 `file_`。"""
+    try:
+        if isinstance(comp, File):
+            return str(getattr(comp, "file_", "") or "")
+        return str(getattr(comp, "file", "") or "")
+    except Exception:
+        return ""
+
+
+def _media_is_self_contained(comp) -> bool:
+    """媒体是否自带内容（base64 / data URI）——入队后不会失效，不必落盘。"""
+    return _media_component_source(comp).startswith(("base64://", "data:"))
+
+
 async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: str | None = None):
     """将消息链中的所有媒体本地化到插件自有临时目录，防止队列延迟后源端文件被清理。
 
@@ -1909,16 +1927,31 @@ async def _prepare_chain_for_queue(chain, use_proxy: bool = False, proxy_url: st
     通常瞬间返回）；失败后回退到远程 URL 下载。所有文件复制到 AstrBot data 目录下的
     msg_forward_cc_media 自有目录（持久化，重启不丢），确保队列延迟后仍可访问。
     合并转发（Nodes）节点内的媒体同样本地化，队列延迟后仍可发送。
-    """
+
+    自带 base64 / data URI 的媒体与已经在插件缓存里的文件直接跳过：前者本身就是内容，
+    后者再拷一份没有意义（重启恢复的条目、重复入队都会走到这里）。"""
     if not chain:
         return chain
     tmp_dir = _get_media_cache_dir()
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    cache_root = tmp_dir.resolve()
+
+    def _in_cache(path: str) -> bool:
+        try:
+            Path(path).resolve().relative_to(cache_root)
+            return True
+        except (OSError, ValueError):
+            return False
 
     async def _localize(comp):
         if not isinstance(comp, (Image, Record, Video, File)):
             return comp
         comp_type = _comp_type_name(comp)
+        if _media_is_self_contained(comp):
+            return comp
+        existing = _local_media_path_of(comp)
+        if existing and _in_cache(existing):
+            return comp
         try:
             # 用 AstrBot 核心获取本地路径（适配器层已缓存，通常很快）
             # 注意：File 组件没有 convert_to_file_path()，等价方法是 get_file()
@@ -3615,6 +3648,7 @@ class MsgForward(star.Star):
             f"  消费状态：{'⏸️ 已暂停' if self._queue_paused else '▶️ 运行中'}",
             f"  默认间隔：{'⏳' + str(default_qi) + 's' if default_qi > 0 else '关闭'}",
             f"  队列总上限：{'无限制' if max_size <= 0 else str(max_size) + ' 条'}",
+            f"  媒体本地化：{self._queue_localize_label()}",
             f"  媒体缓存保留：{retention} 小时",
             f"  当前积压：{pending} 条",
         ]
@@ -4684,6 +4718,7 @@ class MsgForward(star.Star):
         "default_queue_interval_seconds": ("queue", "default_queue_interval_seconds"),
         "default_cooldown_seconds": ("queue", "default_cooldown_seconds"),
         "queue_max_size": ("queue", "queue_max_size"),
+        "queue_localize_media": ("queue", "queue_localize_media"),
         "queue_media_retention_hours": ("queue", "queue_media_retention_hours"),
         "download_media_before_send": ("enhance", "download_media_before_send"),
         "at_nickname_lookup": ("enhance", "at_nickname_lookup"),
@@ -4803,6 +4838,31 @@ class MsgForward(star.Star):
             return max(int(self._conf_get("queue_max_size", 0) or 0), 0)
         except (TypeError, ValueError):
             return 0
+
+    def _queue_localize_mode(self) -> str:
+        """队列媒体本地化策略（配置 queue_localize_media）：auto / always / off。
+
+        auto：原生转发条目入队前不本地化——worker 到点先让协议端搬记录，成功时那份
+        重建链根本用不到；其余媒体只拷贝可能失效的（本地临时路径 / 远程 URL），已在
+        插件缓存里或自带 base64 的跳过。always：全部本地化（旧行为，回退链最稳）。
+        off：完全不本地化（最快）；队列延迟后源端临时文件被清理 / URL 过期时发送可能
+        失败，失败后仍走「重新本地化 → 远程 URL → 占位文本」兜底。未知值回退 auto。"""
+        mode = str(self._conf_get("queue_localize_media", "auto") or "").strip().lower()
+        if mode in ("auto", "always", "off"):
+            return mode
+        if mode in ("false", "no", "0", "none", "never"):
+            return "off"
+        if mode in ("true", "yes", "1"):
+            return "always"
+        return "auto"
+
+    def _queue_localize_label(self) -> str:
+        """队列媒体本地化策略的中文展示（/mf queue status 用）。"""
+        return {
+            "auto": "自动（原生记录不预下载）",
+            "always": "全部本地化",
+            "off": "不本地化",
+        }.get(self._queue_localize_mode(), "自动（原生记录不预下载）")
 
     def _rule_queue_max_size(self, rule: dict) -> int:
         """解析某条规则生效的队列长度上限（条）。
@@ -5605,12 +5665,21 @@ class MsgForward(star.Star):
                     target_header = "" if header_sent else header_text
                     new_chain = base_chain if not target_header else [Plain(text=target_header)] + base_chain
 
-                    # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
+                    # 队列模式：按 queue_localize_media 策略决定入队前是否本地化媒体，
+                    # 再交给后台 worker 按间隔依次转发
                     if queue_interval > 0:
-                        # 队列模式下必须本地化媒体，防止源端临时文件延迟后被清理
-                        queue_chain = await _prepare_chain_for_queue(
-                            base_chain, use_proxy=use_proxy, proxy_url=proxy_url,
-                        )
+                        # 原生转发条目成功时根本用不到这份重建链（worker 先让协议端搬），
+                        # 记录里几十张图在入队前白下载一遍还拖慢同群后续消息；auto/off
+                        # 下直接复用源端链，真回退时再走发送侧的注册 / 重下 / 占位兜底。
+                        localize_mode = self._queue_localize_mode()
+                        if localize_mode == "off" or (
+                            localize_mode == "auto" and queue_native_info
+                        ):
+                            queue_chain = base_chain
+                        else:
+                            queue_chain = await _prepare_chain_for_queue(
+                                base_chain, use_proxy=use_proxy, proxy_url=proxy_url,
+                            )
                         # 队列条目若带原生转发信息，备一份「卡片已还原」的链：worker
                         # 到点后发现记录含卡片、回退重建时直接换用，避免发出 `[XML消息]`
                         card_rebuilt = None

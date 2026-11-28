@@ -395,6 +395,22 @@
         "hint": "全部规则合计的积压上限，超出则丢弃新消息；0=不限制。",
         "default": 0
       },
+      "queue_localize_media": {
+        "description": "队列媒体本地化",
+        "type": "string",
+        "hint": "auto=自动：原生转发的聊天记录入队前不下载（到点由协议端搬运），其余媒体只拷贝可能失效的本地临时文件；always=全部本地化（最稳，但记录里的图片会全部下载一遍）；off=不本地化（最快，队列延迟后源文件被清理可能导致发送失败）。",
+        "default": "auto",
+        "options": [
+          "auto",
+          "always",
+          "off"
+        ],
+        "labels": [
+          "自动（推荐）",
+          "全部本地化",
+          "不本地化"
+        ]
+      },
       "queue_media_retention_hours": {
         "description": "队列媒体缓存保留时间（小时）",
         "type": "int",
